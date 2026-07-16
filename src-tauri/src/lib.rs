@@ -286,6 +286,234 @@ fn provider_add_local(id: String, base_url: String, model: String, key: String) 
     })
 }
 
+// ---- MCP client (Streamable HTTP) ----
+// Remote MCP servers only: JSON-RPC 2.0 over HTTP POST (no stdio). Config persists
+// to ~/.config/tachyon/mcp.json, separate from providers.json.
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct McpServer {
+    name: String,
+    url: String,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct McpConfig {
+    servers: Vec<McpServer>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct McpTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct McpServerTool {
+    server: String,
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+fn mcp_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".config/tachyon/mcp.json")
+}
+
+fn load_mcp() -> McpConfig {
+    std::fs::read_to_string(mcp_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_mcp(cfg: &McpConfig) -> Result<(), String> {
+    let path = mcp_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+fn jsonrpc_request(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+// ponytail: SSE parsing takes the last "data:" line — fine for single-response
+// streams; match on .id + join continuation lines if a real server needs it
+fn parse_rpc_result(body: &str, content_type: &str) -> Result<serde_json::Value, String> {
+    let payload = if content_type.contains("text/event-stream") {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .last()
+            .ok_or("no data line in SSE response")?
+            .trim()
+            .to_string()
+    } else {
+        body.to_string()
+    };
+    let v: serde_json::Value = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+    if let Some(err) = v.get("error") {
+        return Err(err.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| err.to_string()));
+    }
+    v.get("result").cloned().ok_or_else(|| "no result in response".into())
+}
+
+fn parse_tools(result: &serde_json::Value) -> Vec<McpTool> {
+    result
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| McpTool {
+                    name: t.get("name").and_then(|v| v.as_str()).unwrap_or_default().into(),
+                    description: t.get("description").and_then(|v| v.as_str()).unwrap_or_default().into(),
+                    input_schema: match t.get("inputSchema") {
+                        Some(s) if !s.is_null() => s.clone(),
+                        _ => serde_json::json!({}),
+                    },
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+// one POST; returns (body, content_type, mcp-session-id header)
+fn mcp_post(
+    agent: &ureq::Agent,
+    url: &str,
+    session: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<(String, String, Option<String>), String> {
+    let mut req = agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, text/event-stream");
+    if let Some(sid) = session {
+        req = req.set("Mcp-Session-Id", sid);
+    }
+    match req.send_json(body) {
+        Ok(resp) => {
+            let sid = resp.header("mcp-session-id").map(String::from);
+            let ct = resp.header("content-type").unwrap_or("application/json").to_string();
+            let body = resp.into_string().map_err(|e| e.to_string())?;
+            Ok((body, ct, sid))
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(format!("{url} HTTP {code}: {}", truncate_chars(&body, 200)))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// Streamable HTTP handshake: initialize → notifications/initialized → the actual request.
+// ponytail: fresh 3-POST session per call, no session cache — add one if latency matters
+fn mcp_rpc_session(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "tachyon", "version": "0.1" }
+        }),
+    );
+    let (body, ct, session) = mcp_post(&agent, url, None, &init)?;
+    parse_rpc_result(&body, &ct)?; // surface initialize errors early
+    // notification (no id); response ignored, never fatal
+    let _ = mcp_post(
+        &agent,
+        url,
+        session.as_deref(),
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    let (body, ct, _) = mcp_post(&agent, url, session.as_deref(), &jsonrpc_request(2, method, params))?;
+    parse_rpc_result(&body, &ct)
+}
+
+#[tauri::command]
+fn mcp_add(name: String, url: String) -> Result<(), String> {
+    let mut cfg = load_mcp();
+    let s = McpServer { name: name.clone(), url };
+    match cfg.servers.iter_mut().find(|x| x.name == name) {
+        Some(existing) => *existing = s,
+        None => cfg.servers.push(s),
+    }
+    save_mcp(&cfg)
+}
+
+#[tauri::command]
+fn mcp_remove(name: String) -> Result<(), String> {
+    let mut cfg = load_mcp();
+    let before = cfg.servers.len();
+    cfg.servers.retain(|s| s.name != name);
+    if cfg.servers.len() == before {
+        return Err(format!("unknown server: {name}"));
+    }
+    save_mcp(&cfg)
+}
+
+#[tauri::command]
+fn mcp_servers() -> Vec<McpServer> {
+    load_mcp().servers
+}
+
+// (async): blocking HTTP must not run on the main thread
+#[tauri::command(async)]
+fn mcp_list_tools() -> Result<Vec<McpServerTool>, String> {
+    let servers = load_mcp().servers;
+    let mut out = Vec::new();
+    let mut errs = Vec::new();
+    for s in &servers {
+        match mcp_rpc_session(&s.url, "tools/list", serde_json::json!({})) {
+            Ok(result) => out.extend(parse_tools(&result).into_iter().map(|t| McpServerTool {
+                server: s.name.clone(),
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+            })),
+            Err(e) => errs.push(format!("{}: {e}", s.name)), // one bad server doesn't break the list
+        }
+    }
+    if out.is_empty() && !errs.is_empty() && !servers.is_empty() {
+        return Err(errs.join("; "));
+    }
+    Ok(out)
+}
+
+#[tauri::command(async)]
+fn mcp_call(server: String, tool: String, args: serde_json::Value) -> Result<String, String> {
+    let url = load_mcp()
+        .servers
+        .iter()
+        .find(|s| s.name == server)
+        .map(|s| s.url.clone())
+        .ok_or_else(|| format!("unknown server: {server}"))?;
+    let result = mcp_rpc_session(&url, "tools/call", serde_json::json!({ "name": tool, "arguments": args }))?;
+    let text = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let text = if text.is_empty() { result.to_string() } else { text };
+    Ok(truncate_chars(&text, 4000))
+}
+
 #[tauri::command]
 async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String> {
     let pid = *state.shell_pid.lock().unwrap();
@@ -313,7 +541,12 @@ pub fn run() {
             provider_set_key,
             provider_set_model,
             provider_use,
-            provider_add_local
+            provider_add_local,
+            mcp_add,
+            mcp_remove,
+            mcp_servers,
+            mcp_list_tools,
+            mcp_call
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -417,6 +650,53 @@ mod tests {
         s.add_local("ollama".into(), "http://localhost:1234/v1".into(), "qwen".into(), String::new());
         assert_eq!(s.providers.iter().filter(|p| p.id == "ollama").count(), 1);
         assert_eq!(s.active_provider().model, "qwen");
+    }
+
+    #[test]
+    fn jsonrpc_request_shape() {
+        assert_eq!(
+            jsonrpc_request(1, "tools/list", serde_json::json!({})),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
+        );
+    }
+
+    #[test]
+    fn parse_rpc_result_json() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let r = parse_rpc_result(body, "application/json").unwrap();
+        assert_eq!(r, serde_json::json!({"tools":[]}));
+    }
+
+    #[test]
+    fn parse_rpc_result_sse() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let r = parse_rpc_result(body, "text/event-stream").unwrap();
+        assert_eq!(r, serde_json::json!({"tools":[]}));
+        // last data line wins
+        let two = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"n\":1}}\n\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"n\":2}}\n\n";
+        assert_eq!(parse_rpc_result(two, "text/event-stream").unwrap(), serde_json::json!({"n":2}));
+    }
+
+    #[test]
+    fn parse_rpc_result_error() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}"#;
+        let err = parse_rpc_result(body, "application/json").unwrap_err();
+        assert!(err.contains("bad"), "{err}");
+    }
+
+    #[test]
+    fn parse_tools_sample() {
+        let result = serde_json::json!({"tools":[
+            {"name":"echo","description":"Echoes","inputSchema":{"type":"object"}},
+            {"name":"nodesc"}
+        ]});
+        let tools = parse_tools(&result);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "Echoes");
+        assert_eq!(tools[0].input_schema, serde_json::json!({"type":"object"}));
+        assert_eq!(tools[1].description, "");
+        assert_eq!(tools[1].input_schema, serde_json::json!({}));
     }
 
     #[test]

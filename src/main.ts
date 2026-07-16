@@ -62,6 +62,18 @@ interface ProviderState {
   providers: Provider[];
 }
 
+interface McpServer {
+  name: string;
+  url: string;
+}
+
+interface McpServerTool {
+  server: string;
+  name: string;
+  description: string;
+  input_schema: unknown;
+}
+
 const settings: Settings = {
   theme: "Tokyo Night",
   font: "Menlo",
@@ -331,15 +343,66 @@ window.addEventListener("DOMContentLoaded", async () => {
         `Task: ${task}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
         `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
         `Recent terminal output:\n${lastTerminalLines(20)}\n`;
+      let tools: McpServerTool[] = [];
+      try {
+        tools = await invoke<McpServerTool[]>("mcp_list_tools");
+      } catch {
+        // all servers failed — agent runs shell-only
+      }
+      const system =
+        tools.length === 0
+          ? AI_AGENT
+          : AI_AGENT +
+            " You may also call a tool: respond with EXACTLY 'TOOL: <server>.<name> {json arguments}' (one line).\n" +
+            "TOOLS:\n" +
+            tools.map((t) => `TOOL ${t.server}.${t.name} — ${t.description}`).join("\n");
       for (let step = 1; step <= 12; step++) {
         if (agentAbort) break;
         aiStatus.textContent = `thinking… (${step}/12)`;
-        const reply = (await askAi(AI_AGENT, transcript)).trim();
+        const reply = (await askAi(system, transcript)).trim();
         if (agentAbort) break;
         if (/^DONE:/i.test(reply)) {
           term.write(`\r\n\x1b[36m[agent] ${reply.replace(/^DONE:/i, "").trim()}\x1b[0m\r\n`);
           completed = true;
           break;
+        }
+        if (/^TOOL:/i.test(reply)) {
+          const rest = reply.replace(/^TOOL:/i, "").trim();
+          const sp = rest.indexOf(" ");
+          const ref = sp === -1 ? rest : rest.slice(0, sp);
+          const dot = ref.indexOf(".");
+          if (dot < 1) {
+            transcript += `\nInvalid tool call: ${reply}\n`;
+            continue;
+          }
+          const server = ref.slice(0, dot);
+          const tool = ref.slice(dot + 1);
+          let args: unknown = {};
+          try {
+            args = JSON.parse(sp === -1 ? "{}" : rest.slice(sp + 1));
+          } catch {
+            args = {};
+          }
+          // same explicit-approval gate as RUN — tools never auto-call
+          const approved = await gate(`call ${server}.${tool}(${JSON.stringify(args)})`, false);
+          aiInput.readOnly = true;
+          aiBar.classList.remove("danger");
+          if (agentAbort) break;
+          if (!approved) {
+            transcript += `\nThe user denied tool call ${server}.${tool}. Suggest an alternative or DONE.\n`;
+            aiStatus.textContent = "denied";
+            continue;
+          }
+          aiStatus.textContent = "running tool…";
+          term.write(`\r\n\x1b[36m[agent] tool ${server}.${tool}…\x1b[0m\r\n`);
+          try {
+            const result = await invoke<string>("mcp_call", { server, tool, args });
+            transcript += `\nTool: ${server}.${tool}\nResult:\n${result.slice(0, 2000)}\n`;
+          } catch (e) {
+            transcript += `\nTool error: ${(e as Error).message ?? String(e)}\n`;
+          }
+          if (agentAbort) break;
+          continue;
         }
         const cmd = stripFences(reply.replace(/^RUN:/i, "").trim());
         if (!cmd) {
@@ -418,6 +481,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     "\x1b[36m/use <id> [model]\x1b[0m           switch active provider (+ optional model)\r\n" +
     "\x1b[36m/model <model>\x1b[0m              set the active provider's model\r\n" +
     "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add a local/OpenAI-compatible endpoint\r\n" +
+    "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n" +
+    "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n" +
+    "\x1b[36m/mcp list\x1b[0m                   list MCP servers and their tools\r\n" +
     "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n" +
     "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n";
 
@@ -460,6 +526,43 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (!id || !baseUrl || !model) throw new Error("usage: /local <id> <base_url> <model> [key]");
         await invoke("provider_add_local", { id, baseUrl, model, key: key.join(" ") });
         term.write(`\r\n\x1b[36m[tachyon] added local provider ${id} → ${baseUrl}\x1b[0m\r\n`);
+      } else if (cmd === "mcp") {
+        const sub = (parts.shift() ?? "").toLowerCase();
+        if (sub === "add") {
+          const [name, url] = parts;
+          if (!name || !url) throw new Error("usage: /mcp add <name> <url>");
+          await invoke("mcp_add", { name, url });
+          term.write(`\r\n\x1b[36m[tachyon] mcp server ${name} → ${url}\x1b[0m\r\n`);
+        } else if (sub === "remove") {
+          const [name] = parts;
+          if (!name) throw new Error("usage: /mcp remove <name>");
+          await invoke("mcp_remove", { name });
+          term.write(`\r\n\x1b[36m[tachyon] removed mcp server ${name}\x1b[0m\r\n`);
+        } else if (sub === "list") {
+          const servers = await invoke<McpServer[]>("mcp_servers");
+          if (servers.length === 0) {
+            term.write("\r\n\x1b[36m[tachyon] no mcp servers — /mcp add <name> <url>\x1b[0m\r\n");
+          } else {
+            let tools: McpServerTool[] = [];
+            let toolErr = "";
+            try {
+              tools = await invoke<McpServerTool[]>("mcp_list_tools");
+            } catch (e) {
+              toolErr = (e as Error).message ?? String(e);
+            }
+            let out = "\r\n\x1b[36m[tachyon] mcp servers\x1b[0m\r\n";
+            for (const s of servers) {
+              out += `  ${s.name.padEnd(12)} \x1b[90m${s.url}\x1b[0m\r\n`;
+              for (const t of tools.filter((t) => t.server === s.name)) {
+                out += `    \x1b[36m${t.server}.${t.name}\x1b[0m  \x1b[90m${t.description}\x1b[0m\r\n`;
+              }
+            }
+            if (toolErr) out += `\x1b[31m[tachyon] ${toolErr}\x1b[0m\r\n`;
+            term.write(out);
+          }
+        } else {
+          throw new Error("usage: /mcp add|remove|list");
+        }
       } else {
         throw new Error(`unknown command: /${cmd} — try /help`);
       }
