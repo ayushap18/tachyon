@@ -37,6 +37,8 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] Error autopsy (⌘E explains recent terminal errors, printed in-place)
 - [x] Agent mode with permission gates (⌘J: multi-step task loop, approve/deny each command, danger hard-gated)
 - [x] Eval harness: accuracy + safety benchmarks
+- [x] MCP client: remote Streamable-HTTP servers, agent calls tools behind the approval gate
+- [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
 
 ## Eval results
 
@@ -88,6 +90,27 @@ OpenAI-compatible `/chat/completions` shape, so local runtimes work too:
 
 Config persists to `~/.config/tachyon/providers.json`. The provider registry lives in Rust
 (`src-tauri/src/lib.rs`); the frontend just reads the active provider and dispatches.
+
+### MCP tools (agent mode)
+
+Agent mode (⌘J) can call [MCP](https://modelcontextprotocol.io) server tools, not just shell commands:
+
+```
+/mcp add <name> <url>    register a remote Streamable-HTTP MCP server
+/mcp list                list servers and their tools
+/mcp remove <name>       drop a server
+```
+
+The MCP client is Rust-side (`ureq`, JSON-RPC 2.0 over Streamable HTTP) so remote servers work without webview
+CORS; servers persist to `~/.config/tachyon/mcp.json`. In a run the agent may answer `TOOL: <server>.<tool> {args}`
+— every tool call goes through the **same approve/deny gate** as shell commands and never auto-runs.
+
+### Shell integration (OSC 133)
+
+On launch, Tachyon injects zsh `precmd`/`preexec` hooks that emit OSC 133 marks, so it tracks real command
+boundaries and exit codes off the PTY stream (a journal of `{command, exitCode, output}` blocks) instead of
+scraping the screen. ⌘E error autopsy uses the exact failed command + exit code + output; the status bar shows a
+`✗ <code>` badge on failure. Falls back to buffer scraping if the hooks don't load (non-zsh shells, etc.).
 
 ## Run it
 
