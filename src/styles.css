@@ -10,3 +10,58 @@ body {
   padding: 4px;
   box-sizing: border-box;
 }
+
+#settings-btn {
+  position: fixed;
+  top: 8px;
+  right: 12px;
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+  opacity: 0.5;
+}
+
+#settings-btn:hover {
+  opacity: 1;
+}
+
+#settings {
+  position: fixed;
+  top: 34px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: rgba(30, 30, 40, 0.95);
+  border: 1px solid #444;
+  border-radius: 8px;
+  color: #ddd;
+  font: 13px -apple-system, sans-serif;
+}
+
+#settings[hidden] {
+  display: none;
+}
+
+#settings label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+#settings select,
+#settings input {
+  background: #222;
+  color: #ddd;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+#settings input {
+  width: 52px;
+}
