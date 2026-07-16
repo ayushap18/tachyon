@@ -33,7 +33,7 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] Project scaffold (Tauri + xterm.js + portable-pty)
 - [x] Working terminal: PTY spawn, output streaming, input handling
 - [x] Context collector (cwd, git branch/dirty state, shell pid) + status bar
-- [ ] Natural language → command generation
+- [x] Natural language → command generation (⌘K bar; Claude or Groq via API key)
 - [ ] Error autopsy
 - [ ] Agent mode with permission gates
 - [ ] Eval harness: accuracy + safety benchmarks
