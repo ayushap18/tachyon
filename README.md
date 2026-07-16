@@ -1,6 +1,10 @@
-# ⚡ Tachyon
+<p align="center">
+  <img src="assets/tachyon-wordmark.png" alt="Tachyon" width="520">
+</p>
 
-An AI-native terminal, inspired by Warp — built from scratch to learn how modern terminals and AI agents actually work.
+# Tachyon
+
+An AI-native terminal, inspired by Warp — built from scratch to learn how modern terminals and AI agents actually work. Named for the hypothetical particle that outruns light.
 
 > **Speak to your shell.** Natural language in, reviewed commands out — with real command blocks, an agent with approval gates, and a safety eval to prove it.
 
