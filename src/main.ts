@@ -233,8 +233,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   let oscCarry = ""; // partial mark split across pty chunks
   let oscCapturing = false;
   let oscOutput = ""; // current block output (tail-capped)
-  let oscPreCmd = ""; // text between A and C — best-effort command source
+  let oscPreCmd = ""; // text between A and C — fallback command source (echo scrape)
   let oscCommand = "";
+  // clean command source: what the user actually typed (from term.onData), not the echoed
+  // stream — avoids the doubled-first-char that shell-plugin line redraws leave in the echo.
+  let typedLine = "";
+  let pendingTyped: string | null = null;
   let oscStartedAt = 0;
   const OSC133 = /\x1b\]133;([ABCD])(?:;(\d+))?(?:\x07|\x1b\\)/g;
   const stripAnsi = (s: string) =>
@@ -276,15 +280,19 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (mark === "A" || mark === "B") {
         oscPreCmd = "";
       } else if (mark === "C") {
-        // best-effort: last non-empty line typed since the prompt; "" is fine
-        const lines = stripAnsi(oscPreCmd)
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
-        // ponytail: naive prompt strip (no B mark) — drop through the last space-delimited
-        // prompt sigil ("host ~ % "); exotic prompts/plugin redraws may leave minor residue,
-        // which the AI tolerates and the card still labels usefully
-        oscCommand = (lines[lines.length - 1] ?? "").replace(/^.*\s[%$#>]\s+/, "");
+        // prefer what the user actually typed (clean); fall back to scraping the echo
+        // (agent-injected commands and history/completion recalls have no typed line)
+        if (pendingTyped != null && pendingTyped !== "") {
+          oscCommand = pendingTyped;
+        } else {
+          const lines = stripAnsi(oscPreCmd)
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+          // naive prompt strip (no B mark) — drop through the last space-delimited sigil
+          oscCommand = (lines[lines.length - 1] ?? "").replace(/^.*\s[%$#>]\s+/, "");
+        }
+        pendingTyped = null;
         oscOutput = "";
         oscStartedAt = Date.now();
         oscCapturing = true;
@@ -1038,6 +1046,25 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   term.onData((data) => {
     invoke("pty_write", { data });
+    // reconstruct the typed command line for a clean journal label. Escape sequences
+    // (arrows/history/completion) can't be tracked reliably → drop the line so the C-mark
+    // handler falls back to echo-scraping for that command.
+    if (data.startsWith("\x1b")) {
+      typedLine = "";
+    } else {
+      for (const ch of data) {
+        if (ch === "\r" || ch === "\n") {
+          pendingTyped = typedLine;
+          typedLine = "";
+        } else if (ch === "\x7f" || ch === "\x08") {
+          typedLine = typedLine.slice(0, -1); // backspace
+        } else if (ch === "\x15" || ch === "\x03") {
+          typedLine = ""; // Ctrl-U / Ctrl-C
+        } else if (ch >= " ") {
+          typedLine += ch;
+        }
+      }
+    }
     if (data.includes("\r")) scheduleContextRefresh();
   });
   term.onResize(({ rows, cols }) => invoke("pty_resize", { rows, cols }));
