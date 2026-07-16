@@ -154,3 +154,73 @@ body {
 #settings input {
   width: 52px;
 }
+
+/* Command palette (⌘P) */
+#palette {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 12vh;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 10;
+}
+
+#palette[hidden] {
+  display: none;
+}
+
+#palette-input {
+  width: min(560px, 86vw);
+  box-sizing: border-box;
+  padding: 12px 14px;
+  font: 14px Menlo, monospace;
+  color: #c0caf5;
+  background: #1a1b26;
+  border: 1px solid #7aa2f7;
+  border-radius: 8px 8px 0 0;
+  outline: none;
+}
+
+#palette-list {
+  width: min(560px, 86vw);
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  box-sizing: border-box;
+  background: #1a1b26;
+  border: 1px solid #444;
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+}
+
+#palette-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  color: #c0caf5;
+  font: 13px Menlo, monospace;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#palette-list li .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#palette-list li .hint {
+  color: #6a7392;
+  flex: none;
+}
+
+#palette-list li.sel,
+#palette-list li:hover {
+  background: #2a2e42;
+}

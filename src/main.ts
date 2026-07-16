@@ -148,6 +148,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       explainError();
     }
+    if (e.metaKey && e.key === "p") {
+      e.preventDefault();
+      palette.hidden ? openPalette() : closePalette();
+    }
   });
 
   // AI command bar
@@ -702,6 +706,119 @@ window.addEventListener("DOMContentLoaded", async () => {
       explaining = false;
     }
   }
+
+  // ---- Command palette (⌘P) ----
+  const palette = document.getElementById("palette")!;
+  const paletteInput = document.getElementById("palette-input") as HTMLInputElement;
+  const paletteList = document.getElementById("palette-list")!;
+  interface PaletteEntry {
+    label: string;
+    hint: string;
+    run: () => void;
+  }
+  let paletteEntries: PaletteEntry[] = [];
+  let paletteShown: PaletteEntry[] = [];
+  let paletteSel = 0;
+
+  const escapeHtml = (s: string) =>
+    s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+
+  // subsequence fuzzy match (needle chars appear in order within label)
+  function fuzzy(label: string, needle: string): boolean {
+    const h = label.toLowerCase();
+    const n = needle.toLowerCase();
+    let i = 0;
+    for (const ch of h) if (ch === n[i]) i++;
+    return i === n.length;
+  }
+
+  async function buildPaletteEntries(): Promise<PaletteEntry[]> {
+    const e: PaletteEntry[] = [
+      { label: "AI command", hint: "⌘K", run: () => (closePalette(), openAiBar()) },
+      { label: "Agent: run a task", hint: "⌘J", run: () => (closePalette(), openAgentBar()) },
+      { label: "Explain last error", hint: "⌘E", run: () => (closePalette(), explainError()) },
+      { label: "Settings", hint: "⌘,", run: () => (closePalette(), togglePanel()) },
+    ];
+    try {
+      const st = await invoke<ProviderState>("provider_state");
+      for (const p of st.providers) {
+        e.push({
+          label: `Use provider: ${p.id}`,
+          hint: p.id === st.active ? "active" : p.model,
+          run: async () => {
+            closePalette();
+            await invoke("provider_use", { id: p.id });
+            term.write(`\r\n\x1b[36m[tachyon] active provider: ${p.id}\x1b[0m\r\n`);
+          },
+        });
+      }
+    } catch {
+      /* provider list is best-effort */
+    }
+    // recent commands from the OSC 133 journal (deduped, newest first)
+    const seen = new Set<string>();
+    for (let i = journal.length - 1; i >= 0 && seen.size < 15; i--) {
+      const c = journal[i].command.trim();
+      // skip empty, dupes, and OSC-133 capture noise (prompt fragments, the injected hooks)
+      const noise = !c || c.includes("_tachyon") || c.includes("print -n") || /%\s*$/.test(c) || c.length > 120;
+      if (!noise && !seen.has(c)) {
+        seen.add(c);
+        e.push({ label: c, hint: "history", run: () => (closePalette(), void invoke("pty_write", { data: c })) });
+      }
+    }
+    return e;
+  }
+
+  function renderPalette() {
+    const q = paletteInput.value.trim();
+    paletteShown = q ? paletteEntries.filter((x) => fuzzy(x.label, q)) : paletteEntries;
+    if (paletteSel >= paletteShown.length) paletteSel = Math.max(0, paletteShown.length - 1);
+    paletteList.innerHTML = paletteShown
+      .map(
+        (x, i) =>
+          `<li class="${i === paletteSel ? "sel" : ""}"><span class="label">${escapeHtml(x.label)}</span><span class="hint">${escapeHtml(x.hint)}</span></li>`,
+      )
+      .join("");
+    paletteList.children[paletteSel]?.scrollIntoView({ block: "nearest" });
+  }
+
+  async function openPalette() {
+    paletteEntries = await buildPaletteEntries();
+    paletteSel = 0;
+    paletteInput.value = "";
+    palette.hidden = false;
+    renderPalette();
+    paletteInput.focus();
+  }
+  function closePalette() {
+    palette.hidden = true;
+    term.focus();
+  }
+
+  paletteInput.oninput = () => ((paletteSel = 0), renderPalette());
+  paletteInput.onkeydown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closePalette();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      paletteSel = Math.min(paletteShown.length - 1, paletteSel + 1);
+      renderPalette();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      paletteSel = Math.max(0, paletteSel - 1);
+      renderPalette();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      paletteShown[paletteSel]?.run();
+    }
+  };
+  paletteList.onclick = (ev) => {
+    const li = (ev.target as HTMLElement).closest("li");
+    if (!li) return;
+    const idx = [...paletteList.children].indexOf(li);
+    paletteShown[idx]?.run();
+  };
 
   // pty bridge
   await listen<number[]>("pty-output", (e) => {

@@ -39,6 +39,7 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] Eval harness: accuracy + safety benchmarks
 - [x] MCP client: remote Streamable-HTTP servers, agent calls tools behind the approval gate
 - [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
+- [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
 
 ## Eval results
 
