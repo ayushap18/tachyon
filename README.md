@@ -35,7 +35,7 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] Context collector (cwd, git branch/dirty state, shell pid) + status bar
 - [x] Natural language → command generation (⌘K bar; Claude or Groq via API key)
 - [x] Error autopsy (⌘E explains recent terminal errors, printed in-place)
-- [ ] Agent mode with permission gates
+- [x] Agent mode with permission gates (⌘J: multi-step task loop, approve/deny each command, danger hard-gated)
 - [ ] Eval harness: accuracy + safety benchmarks
 
 ## Run it

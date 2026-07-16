@@ -63,6 +63,24 @@ body {
   color: #f7768e;
 }
 
+#ai-bar.agent {
+  border-top-color: #9ece6a;
+}
+
+#ai-bar.agent #ai-icon {
+  color: #9ece6a;
+}
+
+/* danger must beat agent: id + 2 classes = higher specificity, placed later */
+#ai-bar.agent.danger {
+  border-top-color: #f7768e;
+}
+
+#ai-bar.agent.danger #ai-icon,
+#ai-bar.agent.danger #ai-status {
+  color: #f7768e;
+}
+
 #status-bar {
   flex: none;
   height: 26px;

@@ -15,6 +15,12 @@ const AI_EXPLAIN =
   "You are a terminal assistant. Given recent terminal output, explain the most recent error " +
   "or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. " +
   "Plain text only, no markdown.";
+const AI_AGENT =
+  "You drive a macOS zsh terminal to accomplish the user's task step by step. " +
+  "Respond with EXACTLY ONE line: either 'RUN: <single shell command>' to execute a command, " +
+  "or 'DONE: <one-sentence summary>' when the task is complete or cannot proceed. " +
+  "No markdown, no prose, no multiple commands, no explanation. " +
+  "You are given each command's output before deciding the next step.";
 
 const THEMES: Record<string, ITheme> = {
   "Tokyo Night": { background: "#16161e", foreground: "#c0caf5", cursor: "#c0caf5" },
@@ -110,6 +116,14 @@ window.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       aiBar.hidden ? openAiBar() : closeAiBar();
     }
+    if (e.metaKey && e.key === "j") {
+      e.preventDefault();
+      if (agentRunning) {
+        abortAgent(); // ⌘J while running = dedicated abort
+        return;
+      }
+      aiBar.hidden ? openAgentBar() : closeAiBar();
+    }
     if (e.metaKey && e.key === "e") {
       e.preventDefault();
       explainError();
@@ -120,7 +134,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   const aiBar = document.getElementById("ai-bar")!;
   const aiInput = document.getElementById("ai-input") as HTMLInputElement;
   const aiStatus = document.getElementById("ai-status")!;
+  const aiIcon = document.getElementById("ai-icon")!;
   let aiKey: string | null = null;
+
+  // agent mode state
+  let barMode: "command" | "agent" = "command";
+  let agentRunning = false;
+  let agentAbort = false;
+  let gateResolve: ((approved: boolean) => void) | null = null;
+  let captureResolve: ((r: { output: string; code: number }) => void) | null = null;
+  let captureBuf = "";
+  let captureNonce = "";
+  const dec = new TextDecoder();
 
   async function openAiBar() {
     aiBar.hidden = false;
@@ -130,9 +155,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     aiInput.focus();
   }
 
+  function openAgentBar() {
+    barMode = "agent";
+    aiBar.classList.add("agent");
+    aiIcon.textContent = "⚡";
+    aiInput.placeholder = "Describe a task…";
+    openAiBar();
+  }
+
   function closeAiBar() {
     aiBar.hidden = true;
     aiBar.classList.remove("danger");
+    aiBar.classList.remove("agent");
+    aiIcon.textContent = "✦";
+    aiInput.placeholder = "Describe a command…";
+    aiInput.readOnly = false;
+    barMode = "command";
     aiInput.value = "";
     aiStatus.textContent = "";
     fit.fit();
@@ -214,9 +252,150 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
+  // ---- Agent mode ----
+
+  function gate(cmd: string, danger: boolean): Promise<boolean> {
+    aiInput.value = cmd;
+    aiInput.readOnly = true;
+    aiBar.classList.toggle("danger", danger);
+    aiStatus.textContent = (danger ? "⚠ destructive · " : "") + "run? ⏎ approve · esc deny";
+    return new Promise((res) => (gateResolve = res));
+  }
+
+  function runCaptured(cmd: string, nonce: string): Promise<{ output: string; code: number }> {
+    captureBuf = "";
+    captureNonce = nonce;
+    return new Promise((res) => {
+      // ponytail: 20s wall-clock timeout — resolves with code -1 if the marker never
+      // arrives (interactive/hung program owns the pty). Bounds the loop; abort still works.
+      const timer = window.setTimeout(() => {
+        if (captureResolve) {
+          captureResolve = null;
+          res({ output: captureBuf, code: -1 });
+        }
+      }, 20000);
+      captureResolve = (r) => {
+        clearTimeout(timer);
+        res(r);
+      };
+      void invoke("pty_write", {
+        data: `${cmd}; printf '\\n__TACHYON_${nonce}_%d__\\n' $?\n`,
+      });
+    });
+  }
+
+  function endAgent() {
+    agentRunning = false;
+    gateResolve = null;
+    captureResolve = null;
+    aiInput.readOnly = false;
+    closeAiBar();
+  }
+
+  function abortAgent() {
+    if (!agentRunning) return;
+    agentAbort = true;
+    if (gateResolve) {
+      const r = gateResolve;
+      gateResolve = null;
+      r(false);
+    }
+    if (captureResolve) {
+      const r = captureResolve;
+      captureResolve = null;
+      r({ output: "", code: -1 });
+    }
+    term.write("\r\n\x1b[36m[agent] aborted\x1b[0m\r\n");
+  }
+
+  async function runAgent(task: string) {
+    if (!aiKey || !task || agentRunning) return;
+    agentRunning = true;
+    agentAbort = false;
+    aiInput.readOnly = true;
+    let completed = false;
+    try {
+      const ctx = await invoke<ShellContext>("get_context");
+      let transcript =
+        `Task: ${task}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
+        `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
+        `Recent terminal output:\n${lastTerminalLines(20)}\n`;
+      for (let step = 1; step <= 12; step++) {
+        if (agentAbort) break;
+        aiStatus.textContent = `thinking… (${step}/12)`;
+        const reply = (await askAi(aiKey, AI_AGENT, transcript)).trim();
+        if (agentAbort) break;
+        if (/^DONE:/i.test(reply)) {
+          term.write(`\r\n\x1b[36m[agent] ${reply.replace(/^DONE:/i, "").trim()}\x1b[0m\r\n`);
+          completed = true;
+          break;
+        }
+        const cmd = stripFences(reply.replace(/^RUN:/i, "").trim());
+        if (!cmd) {
+          term.write("\r\n\x1b[36m[agent] no command returned\x1b[0m\r\n");
+          completed = true;
+          break;
+        }
+        const danger = await invoke<boolean>("check_dangerous", { cmd });
+        const approved = await gate(cmd, danger);
+        aiInput.readOnly = true;
+        aiBar.classList.remove("danger");
+        if (agentAbort) break;
+        if (!approved) {
+          transcript += `\nThe user denied running: ${cmd}. Suggest an alternative or DONE.\n`;
+          aiStatus.textContent = "denied";
+          continue;
+        }
+        aiStatus.textContent = "running…";
+        const { output, code } = await runCaptured(cmd, "s" + step);
+        if (agentAbort) break;
+        const clean = output
+          .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+          .replace(cmd, "")
+          .trim()
+          .slice(0, 2000);
+        transcript += `\nCommand: ${cmd}\nExit code: ${code}\nOutput:\n${clean}\n`;
+      }
+      if (!completed && !agentAbort) term.write("\r\n\x1b[36m[agent] step limit reached\x1b[0m\r\n");
+    } catch (e) {
+      aiStatus.textContent = (e as Error).message;
+    } finally {
+      endAgent();
+    }
+  }
+
   aiInput.onkeydown = (e) => {
-    if (e.key === "Escape") closeAiBar();
-    if (e.key === "Enter") runAi(aiInput.value.trim());
+    if (gateResolve) {
+      // permission gate: Enter approves, Esc denies this step
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const r = gateResolve;
+        gateResolve = null;
+        r(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        const r = gateResolve;
+        gateResolve = null;
+        r(false);
+      }
+      return;
+    }
+    if (agentRunning) {
+      // mid-run (thinking/capturing): Esc aborts, Enter ignored
+      if (e.key === "Escape") {
+        e.preventDefault();
+        abortAgent();
+      }
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeAiBar();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const v = aiInput.value.trim();
+      barMode === "agent" ? runAgent(v) : runAi(v);
+    }
   };
 
   // Error autopsy (⌘E): explain the recent terminal output, printed display-only
@@ -242,7 +421,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   // pty bridge
-  await listen<number[]>("pty-output", (e) => term.write(new Uint8Array(e.payload)));
+  await listen<number[]>("pty-output", (e) => {
+    const bytes = new Uint8Array(e.payload);
+    term.write(bytes); // live output — always first, never gated
+    if (!captureResolve) return;
+    captureBuf += dec.decode(bytes, { stream: true });
+    const m = captureBuf.match(new RegExp(`__TACHYON_${captureNonce}_(\\d+)__`));
+    if (m) {
+      const r = captureResolve;
+      captureResolve = null;
+      r({ output: captureBuf.slice(0, m.index), code: parseInt(m[1], 10) });
+    }
+  });
   await listen("pty-exit", () => term.write("\r\n[process exited]\r\n"));
   await invoke("pty_spawn", { rows: term.rows, cols: term.cols });
 
