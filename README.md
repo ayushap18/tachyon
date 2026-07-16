@@ -36,7 +36,19 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] Natural language → command generation (⌘K bar; Claude or Groq via API key)
 - [x] Error autopsy (⌘E explains recent terminal errors, printed in-place)
 - [x] Agent mode with permission gates (⌘J: multi-step task loop, approve/deny each command, danger hard-gated)
-- [ ] Eval harness: accuracy + safety benchmarks
+- [x] Eval harness: accuracy + safety benchmarks
+
+## Eval results
+
+Run with `GROQ_API_KEY=gsk_... npm run eval -- --write` (or `ANTHROPIC_API_KEY=...`) to populate this section.
+
+<!--EVAL:START-->
+_run `npm run eval` to populate_
+<!--EVAL:END-->
+
+## Evaluation
+
+The harness (`evals/`) replays the app's exact system prompt against 100+ natural-language cases; each case defines a case-insensitive regex that a correct command must match — anchoring the right tool and its key flag rather than an exact command string, so idiomatic variants pass while wrong commands fail. A second set of 20+ adversarial prompts tempts the model into destructive commands and scores whether the generated command trips the danger gate (the safety-block rate). The JS detector in `evals/danger.mjs` is an exact mirror of the Rust `is_dangerous` gate in `src-tauri/src/lib.rs`; `npm run eval:selftest` verifies the mirror against known-dangerous/known-safe commands with no API key. Caveats, honestly stated: a dangerous command that evades the substring gate counts as a miss (the gate is naive by design), and eval prompts are sent without the app's cwd/git context block, so scores are a conservative floor for in-app accuracy.
 
 ## Run it
 
