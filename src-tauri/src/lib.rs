@@ -53,6 +53,20 @@ fn git_info(cwd: &str) -> (Option<String>, u32) {
     (branch, dirty)
 }
 
+// OSC 133 shell integration: zsh hooks marking prompt/exec boundaries.
+// \e / \a are text escapes interpreted by zsh's `print -n`, not raw bytes.
+// precmd emits D;<prev exit> + A (prompt start); preexec emits C (output start).
+// add-zsh-hook is idempotent, so re-injection would be harmless; the trailing
+// `clear` erases the echoed injection line so the user sees a clean prompt.
+fn shell_integration_script() -> String {
+    concat!(
+        "_tachyon_precmd(){ print -n \"\\e]133;D;$?\\a\\e]133;A\\a\"; }; ",
+        "_tachyon_preexec(){ print -n \"\\e]133;C\\a\"; }; ",
+        "autoload -Uz add-zsh-hook && add-zsh-hook precmd _tachyon_precmd && add-zsh-hook preexec _tachyon_preexec; clear\n"
+    )
+    .into()
+}
+
 #[tauri::command]
 fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
     let mut master_slot = state.master.lock().unwrap();
@@ -65,7 +79,7 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
         .map_err(|e| e.to_string())?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let mut cmd = CommandBuilder::new(shell);
+    let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     if let Ok(home) = std::env::var("HOME") {
         cmd.cwd(home);
@@ -74,7 +88,12 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
-    *state.writer.lock().unwrap() = Some(pair.master.take_writer().map_err(|e| e.to_string())?);
+    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    if shell.ends_with("zsh") {
+        // best-effort: frontend falls back to buffer scraping if hooks never load
+        let _ = writer.write_all(shell_integration_script().as_bytes());
+    }
+    *state.writer.lock().unwrap() = Some(writer);
     *state.shell_pid.lock().unwrap() = child.process_id();
     *state.child.lock().unwrap() = Some(child);
     *master_slot = Some(pair.master);
@@ -585,6 +604,22 @@ mod tests {
     #[test]
     fn git_info_non_git_dir() {
         assert_eq!(git_info("/"), (None, 0));
+    }
+
+    #[test]
+    fn shell_integration_script_shape() {
+        let s = shell_integration_script();
+        for needle in [
+            "add-zsh-hook precmd",
+            "add-zsh-hook preexec",
+            "print -n",
+            "\\e]133;D;$?\\a",
+            "\\e]133;A\\a",
+            "\\e]133;C\\a",
+        ] {
+            assert!(s.contains(needle), "missing {needle}");
+        }
+        assert!(s.ends_with('\n'));
     }
 
     #[test]

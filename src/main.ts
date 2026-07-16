@@ -12,6 +12,7 @@ const AI_SYSTEM =
 const AI_EXPLAIN =
   "You are a terminal assistant. Given recent terminal output, explain the most recent error " +
   "or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. " +
+  "You may instead be given the exact failing command, its exit code, and its output. " +
   "Plain text only, no markdown.";
 const AI_AGENT =
   "You drive a macOS zsh terminal to accomplish the user's task step by step. " +
@@ -165,6 +166,114 @@ window.addEventListener("DOMContentLoaded", async () => {
   let captureNonce = "";
   const dec = new TextDecoder();
 
+  // ---- OSC 133 command journal ----
+  // The injected zsh hooks (see Rust shell_integration_script) emit
+  // ESC]133;A (prompt start), C (output start), D;<code> (command end).
+  // We scan a decoded COPY of the pty stream — term.write stays byte-identical.
+  interface CommandBlock {
+    command: string;
+    exitCode: number;
+    output: string;
+  }
+  const journal: CommandBlock[] = []; // ring of last 50 finalized blocks
+  let oscReady = false; // true once a D mark proves the hooks loaded
+  let oscCarry = ""; // partial mark split across pty chunks
+  let oscCapturing = false;
+  let oscOutput = ""; // current block output (tail-capped)
+  let oscPreCmd = ""; // text between A and C — best-effort command source
+  let oscCommand = "";
+  const OSC133 = /\x1b\]133;([ABCD])(?:;(\d+))?(?:\x07|\x1b\\)/g;
+  const stripAnsi = (s: string) =>
+    s
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+      .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+      .replace(/[\x00-\x08\x0b-\x1f]/g, "");
+
+  function feedOsc(text: string): void {
+    let s = oscCarry + text;
+    oscCarry = "";
+    // hold back a mark that may be split across chunks
+    const j = s.lastIndexOf("\x1b]133;");
+    const tail = j >= 0 ? s.slice(j) : "";
+    if (j >= 0 && !tail.includes("\x07") && !tail.includes("\x1b\\")) {
+      if (tail.length <= 64) oscCarry = tail; // longer means it's not our mark
+      s = s.slice(0, j);
+    } else {
+      // a bare prefix of the header at the very end ("\x1b", "\x1b]1", …)
+      for (let k = Math.min(5, s.length); k > 0; k--) {
+        if (s.endsWith("\x1b]133;".slice(0, k))) {
+          oscCarry = s.slice(s.length - k);
+          s = s.slice(0, s.length - k);
+          break;
+        }
+      }
+    }
+    OSC133.lastIndex = 0;
+    let idx = 0;
+    let m: RegExpExecArray | null;
+    const feed = (seg: string) => {
+      if (oscCapturing) oscOutput = (oscOutput + seg).slice(-8192);
+      else oscPreCmd = (oscPreCmd + seg).slice(-512);
+    };
+    while ((m = OSC133.exec(s))) {
+      feed(s.slice(idx, m.index));
+      idx = OSC133.lastIndex;
+      const mark = m[1];
+      if (mark === "A" || mark === "B") {
+        oscPreCmd = "";
+      } else if (mark === "C") {
+        // best-effort: last non-empty line typed since the prompt; "" is fine
+        const lines = stripAnsi(oscPreCmd)
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+        // ponytail: naive prompt strip (no B mark) — up to the first %/$/#/> + space;
+        // exotic prompts just leave their text prefixed, which the AI tolerates
+        oscCommand = (lines[lines.length - 1] ?? "").replace(/^\S*[%$#>]\s+/, "");
+        oscOutput = "";
+        oscCapturing = true;
+      } else {
+        // D;<code> — command end. First D (no prior C) is just the handshake.
+        oscReady = true;
+        if (oscCapturing) {
+          journal.push({
+            command: oscCommand,
+            exitCode: Number(m[2] ?? 0),
+            output: stripAnsi(oscOutput).trim(),
+          });
+          if (journal.length > 50) journal.shift();
+        }
+        oscCapturing = false;
+      }
+    }
+    feed(s.slice(idx));
+  }
+
+  function lastBlock(): CommandBlock | null {
+    return journal[journal.length - 1] ?? null;
+  }
+
+  function lastFailedBlock(): CommandBlock | null {
+    for (let i = journal.length - 1; i >= 0; i--) {
+      if (journal[i].exitCode !== 0) return journal[i];
+    }
+    return null;
+  }
+
+  function recentBlocksText(n = 5): string {
+    return journal
+      .slice(-n)
+      .map((b) => `$ ${b.command || "(command)"} (exit ${b.exitCode})\n${b.output.slice(-500)}`)
+      .join("\n");
+  }
+
+  // journal-first terminal context; falls back to buffer scraping pre-handshake
+  function recentContext(maxLines = 30): string {
+    return oscReady && journal.length > 0
+      ? `Recent commands:\n${recentBlocksText(5)}`
+      : `Recent terminal output:\n${lastTerminalLines(maxLines)}`;
+  }
+
   async function openAiBar() {
     aiBar.hidden = false;
     fit.fit();
@@ -255,7 +364,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       const userMsg =
         `${request}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
         `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
-        `Recent terminal output:\n${lastTerminalLines()}`;
+        recentContext();
       const cmd = stripFences(await askAi(AI_SYSTEM, userMsg));
       if (!cmd) {
         aiStatus.textContent = "no command returned";
@@ -342,7 +451,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       let transcript =
         `Task: ${task}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
         `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
-        `Recent terminal output:\n${lastTerminalLines(20)}\n`;
+        recentContext(20) +
+        "\n";
       let tools: McpServerTool[] = [];
       try {
         tools = await invoke<McpServerTool[]>("mcp_list_tools");
@@ -579,7 +689,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     explaining = true;
     term.write("\r\n\x1b[90m[tachyon] explaining…\x1b[0m");
     try {
-      const out = await askAi(AI_EXPLAIN, `Recent terminal output:\n${lastTerminalLines()}`);
+      const fb = oscReady ? lastFailedBlock() : null;
+      const prompt = fb
+        ? `Command: ${fb.command || "(unknown)"}\nExit code: ${fb.exitCode}\nOutput:\n${fb.output.slice(-3000)}`
+        : `Recent terminal output:\n${lastTerminalLines()}`;
+      const out = await askAi(AI_EXPLAIN, prompt);
       const body = out.trim().replace(/\n/g, "\r\n");
       term.write(`\r\x1b[2K\x1b[36m${body}\x1b[0m\r\n`);
     } catch (e) {
@@ -592,9 +706,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   // pty bridge
   await listen<number[]>("pty-output", (e) => {
     const bytes = new Uint8Array(e.payload);
-    term.write(bytes); // live output — always first, never gated
+    term.write(bytes); // live output — always first, never gated, never stripped
+    const text = dec.decode(bytes, { stream: true });
+    feedOsc(text); // OSC 133 scanner works on a decoded copy
     if (!captureResolve) return;
-    captureBuf += dec.decode(bytes, { stream: true });
+    captureBuf += text;
     const m = captureBuf.match(new RegExp(`__TACHYON_${captureNonce}_(\\d+)__`));
     if (m) {
       const r = captureResolve;
@@ -627,9 +743,10 @@ window.addEventListener("DOMContentLoaded", async () => {
           ? "~" + ctx.cwd.slice(home.length)
           : ctx.cwd
       : "";
-    statusGit.textContent = ctx.branch
-      ? `⎇ ${ctx.branch}${ctx.dirty > 0 ? ` ±${ctx.dirty}` : ""}`
-      : "";
+    const lb = lastBlock();
+    statusGit.textContent =
+      (ctx.branch ? `⎇ ${ctx.branch}${ctx.dirty > 0 ? ` ±${ctx.dirty}` : ""}` : "") +
+      (lb && lb.exitCode !== 0 ? ` ✗ ${lb.exitCode}` : "");
   }
 
   function scheduleContextRefresh() {
