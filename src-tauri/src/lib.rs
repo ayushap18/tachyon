@@ -112,6 +112,35 @@ fn pty_resize(state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String
     }
 }
 
+const DANGER_PATTERNS: &[&str] = &[
+    "rm -rf",
+    "rm -fr",
+    "sudo rm",
+    "of=/dev",
+    "mkfs",
+    "> /dev/sd",
+    "chmod -r 777 /",
+    ":(){",
+    "shutdown",
+    "reboot",
+];
+
+// ponytail: lowercase substring scan — warn-only UI, false positives accepted by design
+pub fn is_dangerous(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    DANGER_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+#[tauri::command]
+fn check_dangerous(cmd: String) -> bool {
+    is_dangerous(&cmd)
+}
+
+#[tauri::command]
+fn get_env_api_key() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY").ok()
+}
+
 #[tauri::command]
 async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String> {
     let pid = *state.shell_pid.lock().unwrap();
@@ -128,7 +157,14 @@ pub fn run() {
             app.manage(PtyState::default());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pty_spawn, pty_write, pty_resize, get_context])
+        .invoke_handler(tauri::generate_handler![
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            get_context,
+            check_dangerous,
+            get_env_api_key
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -166,5 +202,30 @@ mod tests {
     #[test]
     fn git_info_non_git_dir() {
         assert_eq!(git_info("/"), (None, 0));
+    }
+
+    #[test]
+    fn dangerous_positives() {
+        for cmd in [
+            "rm -rf /tmp/x",
+            "rm -fr .",
+            "sudo rm file",
+            "dd if=/dev/zero of=/dev/disk2",
+            "mkfs.ext4 /dev/sdb1",
+            ":(){ :|:& };:",
+            "RM -RF /",
+            "shutdown -h now",
+            "sudo reboot",
+            "chmod -R 777 /",
+        ] {
+            assert!(is_dangerous(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn dangerous_negatives() {
+        for cmd in ["ls -la", "git status", "npm run dev", "rm file.txt", "grep -rf pattern .", "mkdir -p src"] {
+            assert!(!is_dangerous(cmd), "{cmd}");
+        }
     }
 }

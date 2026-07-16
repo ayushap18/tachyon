@@ -17,6 +17,52 @@ body {
   box-sizing: border-box;
 }
 
+#ai-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 12px;
+  background: #101014;
+  border-top: 1px solid #7aa2f7;
+  font: 12px Menlo, monospace;
+}
+
+#ai-bar[hidden] {
+  display: none;
+}
+
+#ai-icon {
+  color: #7aa2f7;
+}
+
+#ai-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: #c0caf5;
+  font: inherit;
+}
+
+#ai-status {
+  color: #8a8f9d;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+
+#ai-bar.danger {
+  border-top-color: #f7768e;
+}
+
+#ai-bar.danger #ai-icon,
+#ai-bar.danger #ai-status {
+  color: #f7768e;
+}
+
 #status-bar {
   flex: none;
   height: 26px;

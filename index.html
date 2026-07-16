@@ -10,12 +10,18 @@
 
   <body>
     <div id="terminal"></div>
+    <div id="ai-bar" hidden>
+      <span id="ai-icon">✦</span>
+      <input id="ai-input" placeholder="Describe a command…" />
+      <span id="ai-status"></span>
+    </div>
     <div id="status-bar"><span id="status-cwd"></span><span id="status-git"></span></div>
     <button id="settings-btn" title="Settings (⌘,)">⚙</button>
     <div id="settings" hidden>
       <label>Theme <select id="theme-select"></select></label>
       <label>Font <select id="font-select"></select></label>
       <label>Size <input id="font-size" type="number" min="9" max="28" /></label>
+      <label>API key <input id="api-key" type="password" /></label>
     </div>
   </body>
 </html>
