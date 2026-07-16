@@ -26,12 +26,12 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 
 ## Status
 
-🚧 Early days — PTY ↔ renderer bridge in progress.
+🚧 Early days — it's a working terminal; AI layer up next.
 
 ## Roadmap
 
 - [x] Project scaffold (Tauri + xterm.js + portable-pty)
-- [ ] Working terminal: PTY spawn, output streaming, input handling
+- [x] Working terminal: PTY spawn, output streaming, input handling
 - [ ] Context collector (cwd, git status, history, last exit code)
 - [ ] Natural language → command generation
 - [ ] Error autopsy

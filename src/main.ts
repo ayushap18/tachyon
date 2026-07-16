@@ -1,22 +1,31 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
-
-async function greet() {
-  if (greetMsgEl && greetInputEl) {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsgEl.textContent = await invoke("greet", {
-      name: greetInputEl.value,
-    });
-  }
-}
-
-window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
+window.addEventListener("DOMContentLoaded", async () => {
+  const term = new Terminal({
+    fontFamily: "Menlo, Monaco, monospace",
+    fontSize: 14,
+    cursorBlink: true,
+    theme: {
+      background: "#16161e",
+      foreground: "#c0caf5",
+      cursor: "#c0caf5",
+    },
   });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("terminal")!);
+  fit.fit();
+  term.focus();
+
+  await listen<number[]>("pty-output", (e) => term.write(new Uint8Array(e.payload)));
+  await listen("pty-exit", () => term.write("\r\n[process exited]\r\n"));
+  await invoke("pty_spawn", { rows: term.rows, cols: term.cols });
+
+  term.onData((data) => invoke("pty_write", { data }));
+  term.onResize(({ rows, cols }) => invoke("pty_resize", { rows, cols }));
+  window.addEventListener("resize", () => fit.fit());
 });
