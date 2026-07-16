@@ -38,6 +38,26 @@ const THEMES: Record<string, ITheme> = {
   Matrix: { background: "#000000", foreground: "#00ff41", cursor: "#00ff41" },
 };
 
+// Chrome tokens per theme (accent + surface layers + status colors) — the terminal itself
+// uses THEMES above; these drive every overlay/bar so the whole UI matches the active theme.
+interface Chrome {
+  accent: string;
+  surface: string;
+  surfaceAlt: string;
+  border: string;
+  muted: string;
+  ok: string;
+  err: string;
+}
+const CHROME: Record<string, Chrome> = {
+  "Tokyo Night": { accent: "#7aa2f7", surface: "#1a1b26", surfaceAlt: "#24283b", border: "#2a2e42", muted: "#7b849c", ok: "#9ece6a", err: "#f7768e" },
+  Dracula: { accent: "#bd93f9", surface: "#21222c", surfaceAlt: "#343746", border: "#44475a", muted: "#8a8fa8", ok: "#50fa7b", err: "#ff5555" },
+  Nord: { accent: "#88c0d0", surface: "#2b303b", surfaceAlt: "#3b4252", border: "#434c5e", muted: "#7b869c", ok: "#a3be8c", err: "#bf616a" },
+  "Solarized Dark": { accent: "#268bd2", surface: "#073642", surfaceAlt: "#0a4a5a", border: "#0f4b59", muted: "#657b83", ok: "#859900", err: "#dc322f" },
+  "Solarized Light": { accent: "#268bd2", surface: "#eee8d5", surfaceAlt: "#e3dcc6", border: "#d3cbb3", muted: "#93a1a1", ok: "#859900", err: "#dc322f" },
+  Matrix: { accent: "#00ff41", surface: "#0a0f0a", surfaceAlt: "#0f1a0f", border: "#1c3a1c", muted: "#4a7a4a", ok: "#00ff41", err: "#ff5555" },
+};
+
 const FONTS = ["Menlo", "Monaco", "SF Mono", "Courier New", "JetBrains Mono", "Fira Code"];
 
 interface Settings {
@@ -93,10 +113,22 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   function applySettings() {
     const theme = THEMES[settings.theme] ?? THEMES["Tokyo Night"];
+    const chrome = CHROME[settings.theme] ?? CHROME["Tokyo Night"];
     term.options.theme = theme;
     term.options.fontFamily = `"${settings.font}", monospace`;
     term.options.fontSize = settings.size;
     document.body.style.background = theme.background!;
+    // drive every overlay/bar off the active theme via CSS variables
+    const root = document.documentElement.style;
+    root.setProperty("--bg", theme.background!);
+    root.setProperty("--fg", theme.foreground!);
+    root.setProperty("--accent", chrome.accent);
+    root.setProperty("--surface", chrome.surface);
+    root.setProperty("--surface-alt", chrome.surfaceAlt);
+    root.setProperty("--border", chrome.border);
+    root.setProperty("--muted", chrome.muted);
+    root.setProperty("--ok", chrome.ok);
+    root.setProperty("--err", chrome.err);
     fit.fit();
     localStorage.setItem("tachyon-settings", JSON.stringify(settings));
   }

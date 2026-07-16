@@ -1,8 +1,21 @@
+/* Theme tokens — defaults (Tokyo Night); overridden per-theme by applySettings() in main.ts */
+:root {
+  --bg: #16161e;
+  --fg: #c0caf5;
+  --accent: #7aa2f7;
+  --surface: #1a1b26;
+  --surface-alt: #1f2335;
+  --border: #2a2e42;
+  --muted: #7b849c;
+  --ok: #9ece6a;
+  --err: #f7768e;
+}
+
 html,
 body {
   height: 100%;
   margin: 0;
-  background: #16161e;
+  background: var(--bg);
 }
 
 body {
@@ -17,6 +30,7 @@ body {
   box-sizing: border-box;
 }
 
+/* AI command / agent bar */
 #ai-bar {
   flex: none;
   display: flex;
@@ -24,8 +38,8 @@ body {
   gap: 8px;
   height: 30px;
   padding: 0 12px;
-  background: #101014;
-  border-top: 1px solid #7aa2f7;
+  background: var(--surface);
+  border-top: 1px solid var(--accent);
   font: 12px Menlo, monospace;
 }
 
@@ -34,7 +48,7 @@ body {
 }
 
 #ai-icon {
-  color: #7aa2f7;
+  color: var(--accent);
 }
 
 #ai-input {
@@ -42,12 +56,12 @@ body {
   background: none;
   border: none;
   outline: none;
-  color: #c0caf5;
+  color: var(--fg);
   font: inherit;
 }
 
 #ai-status {
-  color: #8a8f9d;
+  color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -55,32 +69,33 @@ body {
 }
 
 #ai-bar.danger {
-  border-top-color: #f7768e;
+  border-top-color: var(--err);
 }
 
 #ai-bar.danger #ai-icon,
 #ai-bar.danger #ai-status {
-  color: #f7768e;
+  color: var(--err);
 }
 
 #ai-bar.agent {
-  border-top-color: #9ece6a;
+  border-top-color: var(--ok);
 }
 
 #ai-bar.agent #ai-icon {
-  color: #9ece6a;
+  color: var(--ok);
 }
 
 /* danger must beat agent: id + 2 classes = higher specificity, placed later */
 #ai-bar.agent.danger {
-  border-top-color: #f7768e;
+  border-top-color: var(--err);
 }
 
 #ai-bar.agent.danger #ai-icon,
 #ai-bar.agent.danger #ai-status {
-  color: #f7768e;
+  color: var(--err);
 }
 
+/* Status bar */
 #status-bar {
   flex: none;
   height: 26px;
@@ -88,11 +103,12 @@ body {
   display: flex;
   align-items: center;
   gap: 14px;
-  background: #101014;
-  color: #8a8f9d;
+  background: var(--surface);
+  color: var(--muted);
   font: 12px Menlo, monospace;
   white-space: nowrap;
   overflow: hidden;
+  border-top: 1px solid var(--border);
 }
 
 #status-bar #status-cwd {
@@ -100,13 +116,14 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Settings */
 #settings-btn {
   position: fixed;
   top: 8px;
   right: 12px;
   background: none;
   border: none;
-  color: #888;
+  color: var(--muted);
   font-size: 16px;
   cursor: pointer;
   opacity: 0.5;
@@ -124,11 +141,12 @@ body {
   flex-direction: column;
   gap: 10px;
   padding: 14px;
-  background: rgba(30, 30, 40, 0.95);
-  border: 1px solid #444;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 8px;
-  color: #ddd;
+  color: var(--fg);
   font: 13px -apple-system, sans-serif;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }
 
 #settings[hidden] {
@@ -144,9 +162,9 @@ body {
 
 #settings select,
 #settings input {
-  background: #222;
-  color: #ddd;
-  border: 1px solid #555;
+  background: var(--surface-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 3px 6px;
 }
@@ -176,9 +194,9 @@ body {
   box-sizing: border-box;
   padding: 12px 14px;
   font: 14px Menlo, monospace;
-  color: #c0caf5;
-  background: #1a1b26;
-  border: 1px solid #7aa2f7;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--accent);
   border-radius: 8px 8px 0 0;
   outline: none;
 }
@@ -191,10 +209,11 @@ body {
   padding: 4px;
   list-style: none;
   box-sizing: border-box;
-  background: #1a1b26;
-  border: 1px solid #444;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-top: none;
   border-radius: 0 0 8px 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
 }
 
 #palette-list li {
@@ -203,7 +222,7 @@ body {
   gap: 12px;
   padding: 7px 10px;
   border-radius: 5px;
-  color: #c0caf5;
+  color: var(--fg);
   font: 13px Menlo, monospace;
   cursor: pointer;
   white-space: nowrap;
@@ -216,13 +235,13 @@ body {
 }
 
 #palette-list li .hint {
-  color: #6a7392;
+  color: var(--muted);
   flex: none;
 }
 
 #palette-list li.sel,
 #palette-list li:hover {
-  background: #2a2e42;
+  background: var(--surface-alt);
 }
 
 /* Block navigator (⌘B) */
@@ -234,12 +253,13 @@ body {
   width: min(40vw, 560px);
   display: flex;
   flex-direction: column;
-  background: #1a1b26;
-  border-left: 1px solid #444;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
   z-index: 9; /* below #palette (10) so ⌘P stays on top */
   font: 13px Menlo, monospace;
-  color: #c0caf5;
+  color: var(--fg);
   outline: none;
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.25);
 }
 
 #blocks[hidden] {
@@ -251,36 +271,43 @@ body {
   align-items: center;
   gap: 8px;
   padding: 10px 14px;
-  border-bottom: 1px solid #333;
+  border-bottom: 1px solid var(--border);
 }
 
 #blocks-title {
   flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 #blocks-header button {
-  background: none;
-  border: 1px solid #444;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
   border-radius: 4px;
-  color: #7aa2f7;
+  color: var(--accent);
   font: 12px Menlo, monospace;
   padding: 3px 8px;
   cursor: pointer;
 }
 
+#blocks-header button:hover {
+  border-color: var(--accent);
+}
+
 #blocks-header #blocks-close {
   border: none;
+  background: none;
   font-size: 15px;
-  color: #8a8f9d;
+  color: var(--muted);
 }
 
 #blocks-summary {
   margin: 8px;
   padding: 10px;
-  background: #16161e;
-  border-left: 3px solid #7aa2f7;
+  background: var(--surface-alt);
+  border-left: 3px solid var(--accent);
   border-radius: 4px;
-  color: #a9b1d6;
+  color: var(--fg);
   white-space: pre-wrap;
 }
 
@@ -298,8 +325,8 @@ body {
   display: flex;
   gap: 10px;
   margin-bottom: 8px;
-  background: #16161e;
-  border: 1px solid #2a2e42;
+  background: var(--bg);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
   scroll-margin: 8px;
@@ -313,15 +340,15 @@ body {
 }
 
 .block-card.ok .block-stripe {
-  background: #9ece6a;
+  background: var(--ok);
 }
 
 .block-card.err .block-stripe {
-  background: #f7768e;
+  background: var(--err);
 }
 
 .block-card.unk .block-stripe {
-  background: #565f89;
+  background: var(--muted);
 }
 
 .block-body {
@@ -332,16 +359,17 @@ body {
 .block-cmd {
   white-space: pre-wrap;
   word-break: break-all;
+  color: var(--fg);
 }
 
 .block-meta {
-  color: #6a7392;
+  color: var(--muted);
   font-size: 11px;
   margin: 2px 0 6px;
 }
 
 .block-out {
-  color: #8a8f9d;
+  color: var(--muted);
   white-space: pre-wrap;
   word-break: break-all;
   font-size: 12px;
@@ -350,7 +378,7 @@ body {
 .block-expand {
   background: none;
   border: none;
-  color: #7aa2f7;
+  color: var(--accent);
   cursor: pointer;
   font: 11px Menlo, monospace;
   padding: 2px 0;
@@ -359,9 +387,9 @@ body {
 .block-ai {
   margin-top: 6px;
   padding: 8px;
-  background: #101014;
-  border-left: 3px solid #7aa2f7;
-  color: #a9b1d6;
+  background: var(--surface-alt);
+  border-left: 3px solid var(--accent);
+  color: var(--fg);
   white-space: pre-wrap;
   font-size: 12px;
 }
@@ -373,17 +401,17 @@ body {
 }
 
 .block-actions button {
-  background: #1f2335;
-  border: 1px solid #2a2e42;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
   border-radius: 4px;
-  color: #c0caf5;
+  color: var(--fg);
   font: 11px Menlo, monospace;
   padding: 3px 8px;
   cursor: pointer;
 }
 
 .block-actions button:hover {
-  background: #2a2e42;
+  border-color: var(--accent);
 }
 
 .block-actions button:disabled {
@@ -392,7 +420,7 @@ body {
 }
 
 .block-empty {
-  color: #565f89;
+  color: var(--muted);
   padding: 24px;
   text-align: center;
 }
@@ -408,7 +436,7 @@ body {
   flex-direction: column;
   gap: 1px;
   z-index: 11; /* stays clickable over the open panel */
-  opacity: 0.45;
+  opacity: 0.5;
   transition: opacity 0.15s;
 }
 
@@ -429,17 +457,17 @@ body {
 }
 
 .mm-seg.ok {
-  background: #9ece6a;
+  background: var(--ok);
 }
 
 .mm-seg.err {
-  background: #f7768e;
+  background: var(--err);
 }
 
 .mm-seg.unk {
-  background: #565f89;
+  background: var(--muted);
 }
 
 .mm-seg:hover {
-  outline: 1px solid #c0caf5;
+  outline: 1px solid var(--fg);
 }
