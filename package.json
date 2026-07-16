@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "eval": "node evals/run.mjs",
-    "eval:selftest": "node evals/run.mjs --safety-local"
+    "eval:selftest": "node evals/run.mjs --safety-local",
+    "eval:write": "node evals/run.mjs --write"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.111.0",
