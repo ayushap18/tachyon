@@ -6,8 +6,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import Anthropic from "@anthropic-ai/sdk";
 import "@xterm/xterm/css/xterm.css";
 
-const AI_MODEL = "claude-opus-4-8";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
 const AI_SYSTEM =
   "You translate natural-language requests into a single shell command for zsh on macOS. " +
   "Output ONLY the command — no markdown fences, no explanation, no commentary.";
@@ -52,6 +50,19 @@ interface ShellContext {
   shell_pid: number | null;
 }
 
+interface Provider {
+  id: string;
+  kind: string;
+  base_url: string;
+  model: string;
+  key: string;
+}
+
+interface ProviderState {
+  active: string;
+  providers: Provider[];
+}
+
 const settings: Settings = {
   theme: "Tokyo Night",
   font: "Menlo",
@@ -91,11 +102,17 @@ window.addEventListener("DOMContentLoaded", async () => {
     (f) => `<option${f === settings.font ? " selected" : ""}>${f}</option>`,
   ).join("");
   sizeInput.value = String(settings.size);
-  keyInput.value = settings.apiKey ?? "";
+  // The API-key field sets the ACTIVE provider's key (for full control use the /key slash command).
+  const activeProvider = await invoke<Provider>("provider_active");
+  keyInput.value = activeProvider.key;
+  keyInput.placeholder = `${activeProvider.id} key`;
 
   themeSel.onchange = () => ((settings.theme = themeSel.value), applySettings());
   fontSel.onchange = () => ((settings.font = fontSel.value), applySettings());
-  keyInput.onchange = () => ((settings.apiKey = keyInput.value.trim() || undefined), applySettings());
+  keyInput.onchange = async () => {
+    const p = await invoke<Provider>("provider_active");
+    await invoke("provider_set_key", { id: p.id, key: keyInput.value.trim() });
+  };
   sizeInput.onchange = () => {
     settings.size = Math.min(28, Math.max(9, Number(sizeInput.value) || 14));
     sizeInput.value = String(settings.size);
@@ -135,7 +152,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   const aiInput = document.getElementById("ai-input") as HTMLInputElement;
   const aiStatus = document.getElementById("ai-status")!;
   const aiIcon = document.getElementById("ai-icon")!;
-  let aiKey: string | null = null;
 
   // agent mode state
   let barMode: "command" | "agent" = "command";
@@ -150,8 +166,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   async function openAiBar() {
     aiBar.hidden = false;
     fit.fit();
-    aiKey = settings.apiKey ?? (await invoke<string | null>("get_env_api_key"));
-    aiStatus.textContent = aiKey ? "" : "Set API key in settings (⌘,)";
+    const p = await invoke<Provider>("provider_active");
+    aiStatus.textContent = `${p.id} · ${p.model}${p.key || p.kind !== "anthropic" ? "" : " · no key"}`;
     aiInput.focus();
   }
 
@@ -187,32 +203,37 @@ window.addEventListener("DOMContentLoaded", async () => {
     return lines.slice(-max).join("\n");
   }
 
-  async function askAi(key: string, system: string, userMsg: string): Promise<string> {
-    if (key.startsWith("gsk_")) {
-      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          max_tokens: 1024,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userMsg },
-          ],
-        }),
+  async function askAi(system: string, userMsg: string): Promise<string> {
+    const p = await invoke<Provider>("provider_active");
+    if (p.kind === "anthropic") {
+      if (!p.key) throw new Error(`no key for ${p.id} — set with /key ${p.id} <key>`);
+      const client = new Anthropic({ apiKey: p.key, dangerouslyAllowBrowser: true });
+      const msg = await client.messages.create({
+        model: p.model,
+        max_tokens: 1024,
+        system,
+        messages: [{ role: "user", content: userMsg }],
       });
-      if (!r.ok) throw new Error(`Groq ${r.status}: ${(await r.text()).slice(0, 120)}`);
-      return (await r.json()).choices?.[0]?.message?.content ?? "";
+      const block = msg.content.find((b) => b.type === "text");
+      return block?.type === "text" ? block.text : "";
     }
-    const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
-    const msg = await client.messages.create({
-      model: AI_MODEL,
-      max_tokens: 1024,
-      system,
-      messages: [{ role: "user", content: userMsg }],
+    // OpenAI-compatible (openai, groq, gemini, kimi, deepseek, mistral, local). Local may have no key.
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (p.key) headers.authorization = `Bearer ${p.key}`;
+    const r = await fetch(`${p.base_url}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: p.model,
+        max_tokens: 1024,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userMsg },
+        ],
+      }),
     });
-    const block = msg.content.find((b) => b.type === "text");
-    return block?.type === "text" ? block.text : "";
+    if (!r.ok) throw new Error(`${p.id} ${r.status}: ${(await r.text()).slice(0, 120)}`);
+    return (await r.json()).choices?.[0]?.message?.content ?? "";
   }
 
   function stripFences(s: string): string {
@@ -224,7 +245,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function runAi(request: string) {
-    if (!aiKey || !request) return;
+    if (!request) return;
     aiStatus.textContent = "thinking…";
     aiBar.classList.remove("danger");
     try {
@@ -233,7 +254,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         `${request}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
         `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
         `Recent terminal output:\n${lastTerminalLines()}`;
-      const cmd = stripFences(await askAi(aiKey, AI_SYSTEM, userMsg));
+      const cmd = stripFences(await askAi(AI_SYSTEM, userMsg));
       if (!cmd) {
         aiStatus.textContent = "no command returned";
         return;
@@ -309,7 +330,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function runAgent(task: string) {
-    if (!aiKey || !task || agentRunning) return;
+    if (!task || agentRunning) return;
     agentRunning = true;
     agentAbort = false;
     aiInput.readOnly = true;
@@ -323,7 +344,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       for (let step = 1; step <= 12; step++) {
         if (agentAbort) break;
         aiStatus.textContent = `thinking… (${step}/12)`;
-        const reply = (await askAi(aiKey, AI_AGENT, transcript)).trim();
+        const reply = (await askAi(AI_AGENT, transcript)).trim();
         if (agentAbort) break;
         if (/^DONE:/i.test(reply)) {
           term.write(`\r\n\x1b[36m[agent] ${reply.replace(/^DONE:/i, "").trim()}\x1b[0m\r\n`);
@@ -394,23 +415,78 @@ window.addEventListener("DOMContentLoaded", async () => {
     } else if (e.key === "Enter") {
       e.preventDefault();
       const v = aiInput.value.trim();
-      barMode === "agent" ? runAgent(v) : runAi(v);
+      if (v.startsWith("/")) handleSlash(v);
+      else if (barMode === "agent") runAgent(v);
+      else runAi(v);
     }
   };
+
+  // Slash commands: manage AI providers/keys/models. Work with or without a key set.
+  const SLASH_HELP =
+    "\r\n\x1b[36m/keys\x1b[0m                       list providers, active, which have keys\r\n" +
+    "\x1b[36m/key <id> <apikey>\x1b[0m          set a provider's API key\r\n" +
+    "\x1b[36m/use <id> [model]\x1b[0m           switch active provider (+ optional model)\r\n" +
+    "\x1b[36m/model <model>\x1b[0m              set the active provider's model\r\n" +
+    "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add a local/OpenAI-compatible endpoint\r\n" +
+    "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n" +
+    "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n";
+
+  function printProviders(st: ProviderState) {
+    let out = "\r\n\x1b[36m[tachyon] providers\x1b[0m\r\n";
+    for (const p of st.providers) {
+      const mark = p.id === st.active ? "\x1b[32m●\x1b[0m" : " ";
+      const keyed = p.key ? "\x1b[32m✓key\x1b[0m" : p.kind === "anthropic" ? "\x1b[90m—\x1b[0m" : "\x1b[90mno key\x1b[0m";
+      out += `${mark} ${p.id.padEnd(9)} ${keyed}  \x1b[90m${p.model}\x1b[0m\r\n`;
+    }
+    term.write(out);
+  }
+
+  async function handleSlash(input: string) {
+    const parts = input.slice(1).split(/\s+/).filter(Boolean);
+    const cmd = (parts.shift() ?? "").toLowerCase();
+    try {
+      if (cmd === "help" || cmd === "") {
+        term.write(SLASH_HELP);
+      } else if (cmd === "keys" || cmd === "providers") {
+        printProviders(await invoke<ProviderState>("provider_state"));
+      } else if (cmd === "key") {
+        const [id, ...rest] = parts;
+        if (!id || rest.length === 0) throw new Error("usage: /key <id> <apikey>");
+        await invoke("provider_set_key", { id, key: rest.join(" ") });
+        term.write(`\r\n\x1b[36m[tachyon] key set for ${id}\x1b[0m\r\n`);
+      } else if (cmd === "use") {
+        const [id, model] = parts;
+        if (!id) throw new Error("usage: /use <id> [model]");
+        await invoke("provider_use", { id });
+        if (model) await invoke("provider_set_model", { id, model });
+        term.write(`\r\n\x1b[36m[tachyon] active provider: ${id}${model ? ` · ${model}` : ""}\x1b[0m\r\n`);
+      } else if (cmd === "model") {
+        if (parts.length === 0) throw new Error("usage: /model <model>");
+        const st = await invoke<ProviderState>("provider_state");
+        await invoke("provider_set_model", { id: st.active, model: parts.join(" ") });
+        term.write(`\r\n\x1b[36m[tachyon] ${st.active} model: ${parts.join(" ")}\x1b[0m\r\n`);
+      } else if (cmd === "local") {
+        const [id, baseUrl, model, ...key] = parts;
+        if (!id || !baseUrl || !model) throw new Error("usage: /local <id> <base_url> <model> [key]");
+        await invoke("provider_add_local", { id, baseUrl, model, key: key.join(" ") });
+        term.write(`\r\n\x1b[36m[tachyon] added local provider ${id} → ${baseUrl}\x1b[0m\r\n`);
+      } else {
+        throw new Error(`unknown command: /${cmd} — try /help`);
+      }
+    } catch (e) {
+      term.write(`\r\n\x1b[31m[tachyon] ${(e as Error).message}\x1b[0m\r\n`);
+    }
+    closeAiBar();
+  }
 
   // Error autopsy (⌘E): explain the recent terminal output, printed display-only
   let explaining = false;
   async function explainError() {
     if (explaining) return;
-    const key = settings.apiKey ?? (await invoke<string | null>("get_env_api_key"));
-    if (!key) {
-      term.write("\r\n\x1b[90m[tachyon] set an API key in settings (⌘,) to use ⌘E\x1b[0m\r\n");
-      return;
-    }
     explaining = true;
     term.write("\r\n\x1b[90m[tachyon] explaining…\x1b[0m");
     try {
-      const out = await askAi(key, AI_EXPLAIN, `Recent terminal output:\n${lastTerminalLines()}`);
+      const out = await askAi(AI_EXPLAIN, `Recent terminal output:\n${lastTerminalLines()}`);
       const body = out.trim().replace(/\n/g, "\r\n");
       term.write(`\r\x1b[2K\x1b[36m${body}\x1b[0m\r\n`);
     } catch (e) {

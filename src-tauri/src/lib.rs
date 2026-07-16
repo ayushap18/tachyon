@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -141,6 +142,155 @@ fn get_env_api_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY").ok()
 }
 
+// ---- Provider registry ----
+// kind == "anthropic" → called via @anthropic-ai/sdk; anything else is OpenAI-compatible:
+// the frontend POSTs `${base_url}/chat/completions`. Config persists to ~/.config/tachyon/providers.json.
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Provider {
+    id: String,
+    kind: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    key: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ProviderState {
+    active: String,
+    providers: Vec<Provider>,
+}
+
+fn builtin(id: &str, kind: &str, base_url: &str, model: &str) -> Provider {
+    Provider { id: id.into(), kind: kind.into(), base_url: base_url.into(), model: model.into(), key: String::new() }
+}
+
+impl ProviderState {
+    fn defaults() -> Self {
+        ProviderState {
+            active: "claude".into(),
+            providers: vec![
+                builtin("claude", "anthropic", "", "claude-opus-4-8"),
+                builtin("openai", "openai", "https://api.openai.com/v1", "gpt-4o"),
+                builtin("groq", "openai", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+                builtin("gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
+                builtin("kimi", "openai", "https://api.moonshot.ai/v1", "moonshot-v1-8k"),
+                builtin("deepseek", "openai", "https://api.deepseek.com", "deepseek-chat"),
+                builtin("mistral", "openai", "https://api.mistral.ai/v1", "mistral-large-latest"),
+            ],
+        }
+    }
+
+    // add any built-in providers a saved config predates, keeping user keys/models
+    fn merge_defaults(&mut self) {
+        for d in ProviderState::defaults().providers {
+            if !self.providers.iter().any(|p| p.id == d.id) {
+                self.providers.push(d);
+            }
+        }
+    }
+
+    fn find_mut(&mut self, id: &str) -> Result<&mut Provider, String> {
+        self.providers.iter_mut().find(|p| p.id == id).ok_or_else(|| format!("unknown provider: {id}"))
+    }
+
+    fn set_key(&mut self, id: &str, key: String) -> Result<(), String> {
+        self.find_mut(id)?.key = key;
+        Ok(())
+    }
+
+    fn set_model(&mut self, id: &str, model: String) -> Result<(), String> {
+        self.find_mut(id)?.model = model;
+        Ok(())
+    }
+
+    fn use_provider(&mut self, id: &str) -> Result<(), String> {
+        self.find_mut(id)?; // validate exists
+        self.active = id.into();
+        Ok(())
+    }
+
+    fn add_local(&mut self, id: String, base_url: String, model: String, key: String) {
+        let p = Provider { id: id.clone(), kind: "openai".into(), base_url, model, key };
+        match self.providers.iter_mut().find(|x| x.id == id) {
+            Some(existing) => *existing = p,
+            None => self.providers.push(p),
+        }
+    }
+
+    fn active_provider(&self) -> Provider {
+        self.providers
+            .iter()
+            .find(|p| p.id == self.active)
+            .cloned()
+            .unwrap_or_else(|| ProviderState::defaults().providers.remove(0))
+    }
+}
+
+fn providers_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".config/tachyon/providers.json")
+}
+
+fn load_state() -> ProviderState {
+    let mut state = std::fs::read_to_string(providers_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<ProviderState>(&s).ok())
+        .unwrap_or_else(ProviderState::defaults);
+    state.merge_defaults();
+    state
+}
+
+fn save_state(state: &ProviderState) -> Result<(), String> {
+    let path = providers_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+fn mutate<F: FnOnce(&mut ProviderState) -> Result<(), String>>(f: F) -> Result<ProviderState, String> {
+    let mut state = load_state();
+    f(&mut state)?;
+    save_state(&state)?;
+    Ok(state)
+}
+
+#[tauri::command]
+fn provider_state() -> ProviderState {
+    load_state()
+}
+
+#[tauri::command]
+fn provider_active() -> Provider {
+    load_state().active_provider()
+}
+
+#[tauri::command]
+fn provider_set_key(id: String, key: String) -> Result<ProviderState, String> {
+    mutate(|s| s.set_key(&id, key))
+}
+
+#[tauri::command]
+fn provider_set_model(id: String, model: String) -> Result<ProviderState, String> {
+    mutate(|s| s.set_model(&id, model))
+}
+
+#[tauri::command]
+fn provider_use(id: String) -> Result<ProviderState, String> {
+    mutate(|s| s.use_provider(&id))
+}
+
+#[tauri::command]
+fn provider_add_local(id: String, base_url: String, model: String, key: String) -> Result<ProviderState, String> {
+    mutate(|s| {
+        s.add_local(id, base_url, model, key);
+        Ok(())
+    })
+}
+
 #[tauri::command]
 async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String> {
     let pid = *state.shell_pid.lock().unwrap();
@@ -163,7 +313,13 @@ pub fn run() {
             pty_resize,
             get_context,
             check_dangerous,
-            get_env_api_key
+            get_env_api_key,
+            provider_state,
+            provider_active,
+            provider_set_key,
+            provider_set_model,
+            provider_use,
+            provider_add_local
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -227,5 +383,54 @@ mod tests {
         for cmd in ["ls -la", "git status", "npm run dev", "rm file.txt", "grep -rf pattern .", "mkdir -p src"] {
             assert!(!is_dangerous(cmd), "{cmd}");
         }
+    }
+
+    #[test]
+    fn provider_defaults_cover_expected() {
+        let s = ProviderState::defaults();
+        for id in ["claude", "openai", "groq", "gemini", "kimi", "deepseek", "mistral"] {
+            assert!(s.providers.iter().any(|p| p.id == id), "missing {id}");
+        }
+        assert_eq!(s.active_provider().id, "claude");
+    }
+
+    #[test]
+    fn provider_set_and_use() {
+        let mut s = ProviderState::defaults();
+        s.set_key("groq", "gsk_test".into()).unwrap();
+        s.set_model("groq", "llama-3.1-8b-instant".into()).unwrap();
+        s.use_provider("groq").unwrap();
+        let a = s.active_provider();
+        assert_eq!(a.id, "groq");
+        assert_eq!(a.key, "gsk_test");
+        assert_eq!(a.model, "llama-3.1-8b-instant");
+    }
+
+    #[test]
+    fn provider_unknown_id_errors() {
+        let mut s = ProviderState::defaults();
+        assert!(s.use_provider("nope").is_err());
+        assert!(s.set_key("nope", "x".into()).is_err());
+    }
+
+    #[test]
+    fn provider_add_local_upserts() {
+        let mut s = ProviderState::defaults();
+        s.add_local("ollama".into(), "http://localhost:11434/v1".into(), "llama3.2".into(), String::new());
+        s.use_provider("ollama").unwrap();
+        assert_eq!(s.active_provider().base_url, "http://localhost:11434/v1");
+        // second add with same id replaces, not duplicates
+        s.add_local("ollama".into(), "http://localhost:1234/v1".into(), "qwen".into(), String::new());
+        assert_eq!(s.providers.iter().filter(|p| p.id == "ollama").count(), 1);
+        assert_eq!(s.active_provider().model, "qwen");
+    }
+
+    #[test]
+    fn merge_defaults_keeps_user_and_adds_missing() {
+        let mut s = ProviderState { active: "groq".into(), providers: vec![builtin("groq", "openai", "x", "m")] };
+        s.providers[0].key = "keep".into();
+        s.merge_defaults();
+        assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().key, "keep");
+        assert!(s.providers.iter().any(|p| p.id == "mistral"));
     }
 }

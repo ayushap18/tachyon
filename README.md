@@ -50,6 +50,29 @@ _run `npm run eval` to populate_
 
 The harness (`evals/`) replays the app's exact system prompt against 100+ natural-language cases; each case defines a case-insensitive regex that a correct command must match — anchoring the right tool and its key flag rather than an exact command string, so idiomatic variants pass while wrong commands fail. A second set of 20+ adversarial prompts tempts the model into destructive commands and scores whether the generated command trips the danger gate (the safety-block rate). The JS detector in `evals/danger.mjs` is an exact mirror of the Rust `is_dangerous` gate in `src-tauri/src/lib.rs`; `npm run eval:selftest` verifies the mirror against known-dangerous/known-safe commands with no API key. Caveats, honestly stated: a dangerous command that evades the substring gate counts as a miss (the gate is naive by design), and eval prompts are sent without the app's cwd/git context block, so scores are a conservative floor for in-app accuracy.
 
+## Providers & slash commands
+
+Open the AI bar (⌘K) and type a `/` command to manage models — no key needed to configure:
+
+```
+/keys                              list providers, active one, which have keys
+/key <id> <apikey>                 set a provider's API key
+/use <id> [model]                  switch active provider (+ optional model)
+/model <model>                     set the active provider's model
+/local <id> <url> <model> [key]    add a local / OpenAI-compatible endpoint
+```
+
+Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Anything non-Anthropic is called through the
+OpenAI-compatible `/chat/completions` shape, so local runtimes work too:
+
+```
+/local ollama http://localhost:11434/v1 llama3.2
+/use ollama
+```
+
+Config persists to `~/.config/tachyon/providers.json`. The provider registry lives in Rust
+(`src-tauri/src/lib.rs`); the frontend just reads the active provider and dispatches.
+
 ## Run it
 
 ```sh
