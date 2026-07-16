@@ -137,11 +137,6 @@ fn check_dangerous(cmd: String) -> bool {
     is_dangerous(&cmd)
 }
 
-#[tauri::command]
-fn get_env_api_key() -> Option<String> {
-    std::env::var("ANTHROPIC_API_KEY").ok()
-}
-
 // ---- Provider registry ----
 // kind == "anthropic" → called via @anthropic-ai/sdk; anything else is OpenAI-compatible:
 // the frontend POSTs `${base_url}/chat/completions`. Config persists to ~/.config/tachyon/providers.json.
@@ -313,7 +308,6 @@ pub fn run() {
             pty_resize,
             get_context,
             check_dangerous,
-            get_env_api_key,
             provider_state,
             provider_active,
             provider_set_key,

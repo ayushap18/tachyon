@@ -40,7 +40,6 @@ interface Settings {
   theme: string;
   font: string;
   size: number;
-  apiKey?: string;
 }
 
 interface ShellContext {
@@ -93,7 +92,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   const themeSel = document.getElementById("theme-select") as HTMLSelectElement;
   const fontSel = document.getElementById("font-select") as HTMLSelectElement;
   const sizeInput = document.getElementById("font-size") as HTMLInputElement;
-  const keyInput = document.getElementById("api-key") as HTMLInputElement;
 
   themeSel.innerHTML = Object.keys(THEMES)
     .map((t) => `<option${t === settings.theme ? " selected" : ""}>${t}</option>`)
@@ -102,17 +100,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     (f) => `<option${f === settings.font ? " selected" : ""}>${f}</option>`,
   ).join("");
   sizeInput.value = String(settings.size);
-  // The API-key field sets the ACTIVE provider's key (for full control use the /key slash command).
-  const activeProvider = await invoke<Provider>("provider_active");
-  keyInput.value = activeProvider.key;
-  keyInput.placeholder = `${activeProvider.id} key`;
 
   themeSel.onchange = () => ((settings.theme = themeSel.value), applySettings());
   fontSel.onchange = () => ((settings.font = fontSel.value), applySettings());
-  keyInput.onchange = async () => {
-    const p = await invoke<Provider>("provider_active");
-    await invoke("provider_set_key", { id: p.id, key: keyInput.value.trim() });
-  };
   sizeInput.onchange = () => {
     settings.size = Math.min(28, Math.max(9, Number(sizeInput.value) || 14));
     sizeInput.value = String(settings.size);
