@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { homeDir } from "@tauri-apps/api/path";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -24,6 +25,13 @@ interface Settings {
   theme: string;
   font: string;
   size: number;
+}
+
+interface ShellContext {
+  cwd: string | null;
+  branch: string | null;
+  dirty: number;
+  shell_pid: number | null;
 }
 
 const settings: Settings = {
@@ -90,7 +98,36 @@ window.addEventListener("DOMContentLoaded", async () => {
   await listen("pty-exit", () => term.write("\r\n[process exited]\r\n"));
   await invoke("pty_spawn", { rows: term.rows, cols: term.cols });
 
-  term.onData((data) => invoke("pty_write", { data }));
+  term.onData((data) => {
+    invoke("pty_write", { data });
+    if (data.includes("\r")) scheduleContextRefresh();
+  });
   term.onResize(({ rows, cols }) => invoke("pty_resize", { rows, cols }));
   window.addEventListener("resize", () => fit.fit());
+
+  // status bar
+  const statusCwd = document.getElementById("status-cwd")!;
+  const statusGit = document.getElementById("status-git")!;
+  const home = (await homeDir()).replace(/\/$/, "");
+  let ctxTimer: number | undefined;
+
+  async function refreshContext() {
+    const ctx = await invoke<ShellContext>("get_context");
+    statusCwd.textContent = ctx.cwd
+      ? ctx.cwd === home
+        ? "~"
+        : ctx.cwd.startsWith(home + "/")
+          ? "~" + ctx.cwd.slice(home.length)
+          : ctx.cwd
+      : "";
+    statusGit.textContent = ctx.branch
+      ? `⎇ ${ctx.branch}${ctx.dirty > 0 ? ` ±${ctx.dirty}` : ""}`
+      : "";
+  }
+
+  function scheduleContextRefresh() {
+    clearTimeout(ctxTimer);
+    ctxTimer = window.setTimeout(refreshContext, 300);
+  }
+  scheduleContextRefresh();
 });

@@ -5,10 +5,35 @@ body {
   background: #16161e;
 }
 
+body {
+  display: flex;
+  flex-direction: column;
+}
+
 #terminal {
-  height: 100vh;
+  flex: 1;
+  min-height: 0;
   padding: 4px;
   box-sizing: border-box;
+}
+
+#status-bar {
+  flex: none;
+  height: 22px;
+  line-height: 22px;
+  padding: 0 10px;
+  display: flex;
+  gap: 14px;
+  background: #101014;
+  color: #8a8f9d;
+  font: 12px Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#status-bar #status-cwd {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #settings-btn {
