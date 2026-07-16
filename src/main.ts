@@ -11,6 +11,10 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 const AI_SYSTEM =
   "You translate natural-language requests into a single shell command for zsh on macOS. " +
   "Output ONLY the command — no markdown fences, no explanation, no commentary.";
+const AI_EXPLAIN =
+  "You are a terminal assistant. Given recent terminal output, explain the most recent error " +
+  "or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. " +
+  "Plain text only, no markdown.";
 
 const THEMES: Record<string, ITheme> = {
   "Tokyo Night": { background: "#16161e", foreground: "#c0caf5", cursor: "#c0caf5" },
@@ -106,6 +110,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       aiBar.hidden ? openAiBar() : closeAiBar();
     }
+    if (e.metaKey && e.key === "e") {
+      e.preventDefault();
+      explainError();
+    }
   });
 
   // AI command bar
@@ -141,7 +149,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     return lines.slice(-max).join("\n");
   }
 
-  async function generateCommand(key: string, userMsg: string): Promise<string> {
+  async function askAi(key: string, system: string, userMsg: string): Promise<string> {
     if (key.startsWith("gsk_")) {
       const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
@@ -150,7 +158,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           model: GROQ_MODEL,
           max_tokens: 1024,
           messages: [
-            { role: "system", content: AI_SYSTEM },
+            { role: "system", content: system },
             { role: "user", content: userMsg },
           ],
         }),
@@ -162,7 +170,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const msg = await client.messages.create({
       model: AI_MODEL,
       max_tokens: 1024,
-      system: AI_SYSTEM,
+      system,
       messages: [{ role: "user", content: userMsg }],
     });
     const block = msg.content.find((b) => b.type === "text");
@@ -187,7 +195,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         `${request}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
         `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
         `Recent terminal output:\n${lastTerminalLines()}`;
-      const cmd = stripFences(await generateCommand(aiKey, userMsg));
+      const cmd = stripFences(await askAi(aiKey, AI_SYSTEM, userMsg));
       if (!cmd) {
         aiStatus.textContent = "no command returned";
         return;
@@ -210,6 +218,28 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (e.key === "Escape") closeAiBar();
     if (e.key === "Enter") runAi(aiInput.value.trim());
   };
+
+  // Error autopsy (⌘E): explain the recent terminal output, printed display-only
+  let explaining = false;
+  async function explainError() {
+    if (explaining) return;
+    const key = settings.apiKey ?? (await invoke<string | null>("get_env_api_key"));
+    if (!key) {
+      term.write("\r\n\x1b[90m[tachyon] set an API key in settings (⌘,) to use ⌘E\x1b[0m\r\n");
+      return;
+    }
+    explaining = true;
+    term.write("\r\n\x1b[90m[tachyon] explaining…\x1b[0m");
+    try {
+      const out = await askAi(key, AI_EXPLAIN, `Recent terminal output:\n${lastTerminalLines()}`);
+      const body = out.trim().replace(/\n/g, "\r\n");
+      term.write(`\r\x1b[2K\x1b[36m${body}\x1b[0m\r\n`);
+    } catch (e) {
+      term.write(`\r\x1b[2K\x1b[31m[tachyon] ${(e as Error).message}\x1b[0m\r\n`);
+    } finally {
+      explaining = false;
+    }
+  }
 
   // pty bridge
   await listen<number[]>("pty-output", (e) => term.write(new Uint8Array(e.payload)));
