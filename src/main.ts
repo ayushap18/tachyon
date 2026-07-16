@@ -14,6 +14,9 @@ const AI_EXPLAIN =
   "or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. " +
   "You may instead be given the exact failing command, its exit code, and its output. " +
   "Plain text only, no markdown.";
+const AI_SUMMARY =
+  "Summarize what this terminal session accomplished and flag any failures, " +
+  "in 2-4 sentences. Plain text only, no markdown.";
 const AI_AGENT =
   "You drive a macOS zsh terminal to accomplish the user's task step by step. " +
   "Respond with EXACTLY ONE line: either 'RUN: <single shell command>' to execute a command, " +
@@ -152,6 +155,14 @@ window.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       palette.hidden ? openPalette() : closePalette();
     }
+    if (e.metaKey && e.key === "b") {
+      e.preventDefault();
+      blocks.hidden ? openBlocks() : closeBlocks();
+    }
+    if (e.key === "Escape" && !blocks.hidden) {
+      e.preventDefault();
+      closeBlocks();
+    }
   });
 
   // AI command bar
@@ -178,6 +189,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     command: string;
     exitCode: number;
     output: string;
+    startedAt?: number;
+    durationMs?: number;
+    // per-card UI state — lives on the block so re-renders and ring shifts keep/GC it
+    ai?: string;
+    aiPending?: boolean;
+    expanded?: boolean;
   }
   const journal: CommandBlock[] = []; // ring of last 50 finalized blocks
   let oscReady = false; // true once a D mark proves the hooks loaded
@@ -186,6 +203,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   let oscOutput = ""; // current block output (tail-capped)
   let oscPreCmd = ""; // text between A and C — best-effort command source
   let oscCommand = "";
+  let oscStartedAt = 0;
   const OSC133 = /\x1b\]133;([ABCD])(?:;(\d+))?(?:\x07|\x1b\\)/g;
   const stripAnsi = (s: string) =>
     s
@@ -231,10 +249,12 @@ window.addEventListener("DOMContentLoaded", async () => {
           .split("\n")
           .map((l) => l.trim())
           .filter(Boolean);
-        // ponytail: naive prompt strip (no B mark) — up to the first %/$/#/> + space;
-        // exotic prompts just leave their text prefixed, which the AI tolerates
-        oscCommand = (lines[lines.length - 1] ?? "").replace(/^\S*[%$#>]\s+/, "");
+        // ponytail: naive prompt strip (no B mark) — drop through the last space-delimited
+        // prompt sigil ("host ~ % "); exotic prompts/plugin redraws may leave minor residue,
+        // which the AI tolerates and the card still labels usefully
+        oscCommand = (lines[lines.length - 1] ?? "").replace(/^.*\s[%$#>]\s+/, "");
         oscOutput = "";
+        oscStartedAt = Date.now();
         oscCapturing = true;
       } else {
         // D;<code> — command end. First D (no prior C) is just the handshake.
@@ -244,8 +264,12 @@ window.addEventListener("DOMContentLoaded", async () => {
             command: oscCommand,
             exitCode: Number(m[2] ?? 0),
             output: stripAnsi(oscOutput).trim(),
+            startedAt: oscStartedAt || undefined,
+            durationMs: oscStartedAt ? Date.now() - oscStartedAt : undefined,
           });
           if (journal.length > 50) journal.shift();
+          renderMinimap();
+          if (!blocks.hidden) renderBlocks();
         }
         oscCapturing = false;
       }
@@ -737,6 +761,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       { label: "AI command", hint: "⌘K", run: () => (closePalette(), openAiBar()) },
       { label: "Agent: run a task", hint: "⌘J", run: () => (closePalette(), openAgentBar()) },
       { label: "Explain last error", hint: "⌘E", run: () => (closePalette(), explainError()) },
+      { label: "Blocks: session navigator", hint: "⌘B", run: () => (closePalette(), openBlocks()) },
       { label: "Settings", hint: "⌘,", run: () => (closePalette(), togglePanel()) },
     ];
     try {
@@ -818,6 +843,147 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!li) return;
     const idx = [...paletteList.children].indexOf(li);
     paletteShown[idx]?.run();
+  };
+
+  // ---- Block navigator (⌘B) + session-health minimap ----
+  const blocks = document.getElementById("blocks")!;
+  const blocksList = document.getElementById("blocks-list")!;
+  const blocksSummary = document.getElementById("blocks-summary")!;
+  const minimap = document.getElementById("minimap")!;
+
+  function fmtDuration(ms: number): string {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    return `${Math.round(ms / 1000)}s`;
+  }
+
+  function blockClass(code: number): string {
+    return code === 0 ? "ok" : code < 0 ? "unk" : "err";
+  }
+
+  function renderBlocks() {
+    if (journal.length === 0) {
+      blocksList.innerHTML = `<div class="block-empty">${
+        oscReady ? "no commands yet — run something" : "waiting for shell integration (zsh OSC 133 handshake)…"
+      }</div>`;
+      return;
+    }
+    let html = "";
+    for (let i = journal.length - 1; i >= 0; i--) {
+      const b = journal[i];
+      const lines = b.output.split("\n").filter((l) => l.trim());
+      const moreLines = lines.length > 3 || b.output.length > 4000;
+      const preview = b.expanded ? b.output.slice(0, 4000) : lines.slice(0, 3).join("\n");
+      html +=
+        `<div class="block-card ${blockClass(b.exitCode)}" id="block-${i}">` +
+        `<div class="block-stripe"></div><div class="block-body">` +
+        `<div class="block-cmd">${escapeHtml(b.command || `command ${i + 1}`)}</div>` +
+        `<div class="block-meta">exit ${b.exitCode}${b.durationMs != null ? ` · ${fmtDuration(b.durationMs)}` : ""}</div>` +
+        (preview ? `<div class="block-out">${escapeHtml(preview)}</div>` : "") +
+        (moreLines
+          ? `<button class="block-expand" data-action="toggle" data-idx="${i}">${b.expanded ? "▾ collapse" : "▸ expand"}</button>`
+          : "") +
+        (b.ai ? `<div class="block-ai">${escapeHtml(b.ai)}</div>` : "") +
+        `<div class="block-actions">` +
+        `<button data-action="explain" data-idx="${i}"${b.aiPending ? " disabled" : ""}>✦ explain</button>` +
+        `<button data-action="rerun" data-idx="${i}"${b.command.trim() ? "" : " disabled"}>⟳ rerun</button>` +
+        `<button data-action="copy" data-idx="${i}">⎘ copy</button>` +
+        `</div></div></div>`;
+    }
+    blocksList.innerHTML = html;
+  }
+
+  function renderMinimap() {
+    minimap.hidden = journal.length === 0;
+    minimap.innerHTML = journal
+      .map(
+        (b, i) =>
+          `<div class="mm-seg ${blockClass(b.exitCode)}" data-idx="${i}" title="${escapeHtml(b.command || `command ${i + 1}`)}"></div>`,
+      )
+      .join("");
+  }
+
+  function openBlocks(scrollTo?: number) {
+    renderBlocks();
+    blocks.hidden = false;
+    (blocks as HTMLElement).focus(); // keeps Esc away from xterm's textarea
+    if (scrollTo != null) document.getElementById(`block-${scrollTo}`)?.scrollIntoView({ block: "center" });
+  }
+
+  function closeBlocks() {
+    blocks.hidden = true;
+    term.focus();
+  }
+
+  async function explainBlock(i: number) {
+    const b = journal[i];
+    if (!b || b.aiPending) return;
+    b.aiPending = true;
+    b.ai = "thinking…";
+    renderBlocks();
+    try {
+      b.ai = await askAi(
+        AI_EXPLAIN,
+        `$ ${b.command || "(unknown)"}\nexit ${b.exitCode}\nOutput:\n${b.output.slice(0, 2000)}`,
+      );
+    } catch (e) {
+      b.ai = (e as Error).message;
+    } finally {
+      b.aiPending = false;
+    }
+    if (!blocks.hidden) renderBlocks();
+  }
+
+  async function summarizeSession() {
+    blocksSummary.hidden = false;
+    blocksSummary.textContent = "thinking…";
+    const transcript = journal
+      .slice(-20)
+      .map(
+        (b) =>
+          `$ ${b.command || "(command)"} (exit ${b.exitCode})\n${b.output.split("\n").filter(Boolean).slice(0, 2).join("\n")}`,
+      )
+      .join("\n");
+    try {
+      blocksSummary.textContent = transcript
+        ? await askAi(AI_SUMMARY, transcript)
+        : "nothing to summarize yet";
+    } catch (e) {
+      blocksSummary.textContent = (e as Error).message;
+    }
+  }
+
+  blocksList.onclick = (ev) => {
+    const btn = (ev.target as HTMLElement).closest("button");
+    if (!btn) return;
+    const i = Number(btn.dataset.idx);
+    const b = journal[i];
+    if (!b) return;
+    if (btn.dataset.action === "toggle") {
+      b.expanded = !b.expanded;
+      renderBlocks();
+    } else if (btn.dataset.action === "explain") {
+      void explainBlock(i);
+    } else if (btn.dataset.action === "rerun") {
+      const cmd = b.command.replace(/[\r\n]/g, " ").trim();
+      if (!cmd) return;
+      closeBlocks();
+      void invoke("pty_write", { data: cmd }); // no trailing newline — prefill only, never auto-execute
+    } else if (btn.dataset.action === "copy") {
+      navigator.clipboard.writeText(b.output).then(
+        () => {
+          btn.textContent = "copied";
+          setTimeout(() => (btn.textContent = "⎘ copy"), 900);
+        },
+        () => (btn.textContent = "copy failed"),
+      );
+    }
+  };
+  document.getElementById("blocks-summarize")!.onclick = () => void summarizeSession();
+  document.getElementById("blocks-close")!.onclick = closeBlocks;
+  minimap.onclick = (ev) => {
+    const seg = (ev.target as HTMLElement).closest(".mm-seg") as HTMLElement | null;
+    if (seg) openBlocks(Number(seg.dataset.idx));
   };
 
   // pty bridge

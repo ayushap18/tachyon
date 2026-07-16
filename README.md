@@ -2,6 +2,21 @@
 
 An AI-native terminal, inspired by Warp — built from scratch to learn how modern terminals and AI agents actually work.
 
+> **Speak to your shell.** Natural language in, reviewed commands out — with real command blocks, an agent with approval gates, and a safety eval to prove it.
+
+### Keyboard
+
+| Keys | Action |
+|---|---|
+| ⌘K | AI command bar (natural language → command, prefilled for review) |
+| ⌘J | Agent mode (multi-step task loop; ⌘J again aborts a run) |
+| ⌘E | Explain last error |
+| ⌘P | Command palette (actions · providers · history) |
+| ⌘B | Block navigator (session blocks, per-block AI, health minimap) |
+| ⌘, | Settings |
+
+Slash commands (`/keys`, `/key`, `/use`, `/model`, `/local`, `/mcp add|remove|list`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
+
 ## What I'm building
 
 A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
@@ -24,6 +39,33 @@ A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 
 The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU renderer — the interesting problems here are the AI layer, context management, and safety, not reimplementing VT100 parsing.
 
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph WV["Webview — TypeScript"]
+    XT["xterm.js<br/>rendering + input"]
+    OSC["OSC 133 scanner<br/>command journal"]
+    UI["⌘K bar · ⌘J agent · ⌘E autopsy<br/>⌘P palette · ⌘B blocks + minimap"]
+  end
+  subgraph RS["Rust — Tauri backend"]
+    PTY["PTY<br/>portable-pty"]
+    INJ["zsh OSC 133<br/>hook injection"]
+    REG["provider registry<br/>keys + models"]
+    GATE["danger gate<br/>check_dangerous"]
+    MCP["MCP client<br/>JSON-RPC / Streamable HTTP"]
+  end
+  XT <-- "pty_write / pty-output (Tauri IPC)" --> PTY
+  PTY --- INJ
+  XT -- "decoded byte copy" --> OSC
+  OSC --> UI
+  UI -- "provider_active · check_dangerous · mcp_call (IPC)" --> REG & GATE & MCP
+  UI -- "HTTPS chat/completions · Anthropic SDK" --> EXT[("AI providers<br/>Claude · Groq · Gemini · local …")]
+  MCP --> SRV[("remote MCP servers")]
+```
+
+AI HTTP calls go straight from the webview's `askAi` to the provider, using keys fetched from the Rust registry over IPC; the PTY, zsh hook injection, danger gate, and MCP client live Rust-side.
+
 ## Status
 
 🚧 Early days — it's a working terminal; AI layer up next.
@@ -40,6 +82,7 @@ The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU
 - [x] MCP client: remote Streamable-HTTP servers, agent calls tools behind the approval gate
 - [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
 - [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
+- [x] Block navigator (⌘B): session blocks with per-block AI explain, rerun/copy, health minimap, AI session summary
 
 ## Eval results
 
@@ -109,7 +152,7 @@ CORS; servers persist to `~/.config/tachyon/mcp.json`. In a run the agent may an
 ### Shell integration (OSC 133)
 
 On launch, Tachyon injects zsh `precmd`/`preexec` hooks that emit OSC 133 marks, so it tracks real command
-boundaries and exit codes off the PTY stream (a journal of `{command, exitCode, output}` blocks) instead of
+boundaries and exit codes off the PTY stream (a journal of `{command, exitCode, output}` blocks, plus wall-clock duration per block) instead of
 scraping the screen. ⌘E error autopsy uses the exact failed command + exit code + output; the status bar shows a
 `✗ <code>` badge on failure. Falls back to buffer scraping if the hooks don't load (non-zsh shells, etc.).
 
