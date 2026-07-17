@@ -91,6 +91,12 @@ export function initVim({ term, statusEl, searchEl }: VimOptions): void {
   function findFrom(q: string, row: number, col: number, dir: 1 | -1) {
     const n = q.toLowerCase();
     if (!n) return null;
+    if (dir === -1 && col < 0) {
+      // cursor at col 0: lastIndexOf clamps negative fromIndex to 0 and re-finds
+      // the current match; continue from the end of the previous line instead
+      row--;
+      col = Number.MAX_SAFE_INTEGER;
+    }
     if (dir === 1) {
       for (let r = row; r <= lastRow(); r++) {
         const i = lineText(r).toLowerCase().indexOf(n, r === row ? col : 0);
@@ -120,7 +126,7 @@ export function initVim({ term, statusEl, searchEl }: VimOptions): void {
   searchEl.onkeydown = (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      lastSearch = searchEl.value;
+      if (searchEl.value) lastSearch = searchEl.value; // empty '/' repeats last pattern
       searchEl.hidden = true;
       term.focus();
       doSearch(1);
@@ -157,6 +163,7 @@ export function initVim({ term, statusEl, searchEl }: VimOptions): void {
       return true; // other ⌘-chords pass so app shortcuts keep working
     }
     if (e.type !== "keydown") return false; // swallow keypress/keyup twins
+    e.preventDefault(); // cancel default + trailing keypress ('/' typing itself into the search box, Tab focus-escape)
     handleKey(e);
     return false; // nothing reaches the shell in NORMAL/VISUAL
   });

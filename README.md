@@ -89,7 +89,8 @@ AI HTTP calls go straight from the webview's `askAi` to the provider, using keys
 - [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
 - [x] Block navigator (⌘B): session blocks with per-block AI explain, rerun/copy, health minimap, AI session summary
 - [x] Faster PTY I/O: 64 KB reads + base64 transfer (v0.1.1)
-- [x] Vim mode (⌘⇧V): normal/visual navigation over the buffer — `hjkl w b 0 $ gg G ⌃d ⌃u`, `/ n N` search, `v`+`y` yank (v0.1.1)
+- [x] Vim mode (⌘⇧V): normal/visual navigation over the buffer — `hjkl w b 0 $ gg G ⌃d ⌃u`, `/ n N` search, `v`+`y` yank (v0.1.1, hardened in v0.1.3)
+- [x] CI/CD: GitHub Actions run tests on every push; tagging `v*` auto-builds and publishes the release DMG (v0.1.3)
 
 ## Eval results
 
