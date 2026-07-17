@@ -598,9 +598,12 @@ mod tests {
     }
 
     #[test]
-    fn git_info_tachyon_repo() {
-        let (branch, _dirty) = git_info("/Users/ayush18/tachyon");
-        assert_eq!(branch.as_deref(), Some("main"));
+    fn git_info_this_repo() {
+        // run against this crate's own directory (a git repo) so the test is
+        // machine-independent — CARGO_MANIFEST_DIR resolves on any checkout, incl. CI.
+        // Detached-HEAD checkouts (tags/PRs) yield "HEAD", so assert only that a branch resolved.
+        let (branch, _dirty) = git_info(env!("CARGO_MANIFEST_DIR"));
+        assert!(branch.is_some(), "expected a git branch, got None");
     }
 
     #[test]
