@@ -687,18 +687,33 @@ fn setup() {
     }
 
     // --- mouse wheel: scroll native scrollback. Up (delta_y<0) goes BACK in history. ---
+    // A gesture fires many wheel events; doing one IPC round-trip + full repaint per event is what
+    // made scrolling laggy. Coalesce all deltas within a frame into ONE term_scroll via rAF.
     {
         let term = term.clone();
         let canvas_el = term.borrow().canvas.clone();
+        let pending = std::rc::Rc::new(std::cell::Cell::new(0i32));
+        let scheduled = std::rc::Rc::new(std::cell::Cell::new(false));
         let cb = Closure::wrap(Box::new(move |ev: web_sys::WheelEvent| {
             ev.prevent_default();
             let dy = ev.delta_y();
             let ch = term.borrow().cell_h; // live: stays correct after a font-size change
-            let lines = (dy / ch).round().abs().max(1.0) as i32;
-            let delta = if dy < 0.0 { lines } else { -lines };
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = invoke("term_scroll", ScrollArgs { delta }).await;
-            });
+            let mag = (dy.abs() / ch).round().max(1.0) as i32;
+            pending.set(pending.get() + if dy < 0.0 { mag } else { -mag });
+            if !scheduled.replace(true) {
+                let pending = pending.clone();
+                let scheduled = scheduled.clone();
+                let flush = Closure::once_into_js(move || {
+                    scheduled.set(false);
+                    let delta = pending.replace(0);
+                    if delta != 0 {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let _ = invoke("term_scroll", ScrollArgs { delta }).await;
+                        });
+                    }
+                });
+                let _ = win().request_animation_frame(flush.as_ref().unchecked_ref());
+            }
         }) as Box<dyn FnMut(web_sys::WheelEvent)>);
         let _ = canvas_el.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
         cb.forget();

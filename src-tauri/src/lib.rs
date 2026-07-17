@@ -395,10 +395,15 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
                     // below is an ADDITIONAL consumer of the same immutable slice
                     let _ = app.emit("pty-output", STANDARD.encode(&buf[..n]));
                     // grid engine: same bytes -> screen model -> only changed cells painted.
-                    // Emit every chunk (empty cells + fresh cursor) so the cursor stays live.
                     if let Some(eng) = pty.engine.lock().unwrap().as_mut() {
-                        eng.feed(&buf[..n]);
-                        let _ = app.emit("grid-damage", eng.take_damage());
+                        eng.feed(&buf[..n]); // always advance history
+                        // Only repaint when at the live bottom. If the user is scrolled up reading
+                        // history, freeze their view (the grid underneath is shifting as output
+                        // streams — repainting it every chunk is what glitched). They see the new
+                        // output when they scroll/type back to the bottom.
+                        if eng.scrollback() == 0 {
+                            let _ = app.emit("grid-damage", eng.take_damage());
+                        }
                     }
                     let finalized = journal.scanner.lock().unwrap().feed(&buf[..n]);
                     for block in finalized {
