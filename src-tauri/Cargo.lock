@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon"
-version = "0.1.4-beta"
+version = "0.1.4-beta.2"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
@@ -3548,6 +3548,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
  "ureq",
 ]
 

@@ -1,6 +1,6 @@
 [package]
 name = "tachyon"
-version = "0.1.4-beta"
+version = "0.1.4-beta.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,4 +26,6 @@ portable-pty = "0.9.0"
 ureq = { version = "2", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
+# names the sync/time primitives only — tauri 2 already owns the runtime
+tokio = { version = "1", features = ["sync", "time"] }
 

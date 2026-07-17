@@ -7,9 +7,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { initVim, type VimApi } from "./vim";
 import "@xterm/xterm/css/xterm.css";
 
-const AI_SYSTEM =
-  "You translate natural-language requests into a single shell command for zsh on macOS. " +
-  "Output ONLY the command — no markdown fences, no explanation, no commentary.";
 const AI_EXPLAIN =
   "You are a terminal assistant. Given recent terminal output, explain the most recent error " +
   "or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. " +
@@ -18,13 +15,6 @@ const AI_EXPLAIN =
 const AI_SUMMARY =
   "Summarize what this terminal session accomplished and flag any failures, " +
   "in 2-4 sentences. Plain text only, no markdown.";
-const AI_AGENT =
-  "You drive a macOS zsh terminal to accomplish the user's task step by step. " +
-  "Respond with EXACTLY ONE line: either 'RUN: <single shell command>' to execute a command, " +
-  "or 'DONE: <one-sentence summary>' when the task is complete or cannot proceed. " +
-  "No markdown, no prose, no multiple commands, no explanation. " +
-  "You are given each command's output before deciding the next step.";
-
 const THEMES: Record<string, ITheme> = {
   "Tokyo Night": { background: "#16161e", foreground: "#c0caf5", cursor: "#c0caf5" },
   Dracula: { background: "#282a36", foreground: "#f8f8f2", cursor: "#f8f8f2" },
@@ -85,18 +75,6 @@ interface Provider {
 interface ProviderState {
   active: string;
   providers: Provider[];
-}
-
-interface McpServer {
-  name: string;
-  url: string;
-}
-
-interface McpServerTool {
-  server: string;
-  name: string;
-  description: string;
-  input_schema: unknown;
 }
 
 const settings: Settings = {
@@ -175,7 +153,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (e.metaKey && e.key === "j") {
       e.preventDefault();
       if (agentRunning) {
-        abortAgent(); // ⌘J while running = dedicated abort
+        void invoke("agent_abort"); // ⌘J while running = dedicated abort
         return;
       }
       aiBar.hidden ? openAgentBar() : closeAiBar();
@@ -204,143 +182,32 @@ window.addEventListener("DOMContentLoaded", async () => {
   const aiStatus = document.getElementById("ai-status")!;
   const aiIcon = document.getElementById("ai-icon")!;
 
-  // agent mode state
+  // agent mode state — the loop itself lives in Rust; TS only renders the approval gate
   let barMode: "command" | "agent" = "command";
-  let agentRunning = false;
-  let agentAbort = false;
-  let gateResolve: ((approved: boolean) => void) | null = null;
-  let captureResolve: ((r: { output: string; code: number }) => void) | null = null;
-  let captureBuf = "";
-  let captureNonce = "";
-  const dec = new TextDecoder();
+  let agentRunning = false; // mirror of the Rust AgentState.running
+  let pendingGate = false; // an agent-propose is awaiting Enter/Esc
 
-  // ---- OSC 133 command journal ----
-  // The injected zsh hooks (see Rust shell_integration_script) emit
-  // ESC]133;A (prompt start), C (output start), D;<code> (command end).
-  // We scan a decoded COPY of the pty stream — term.write stays byte-identical.
-  interface CommandBlock {
+  // ---- OSC 133 command journal (mirror) ----
+  // The scanner + 50-block ring live in Rust, in the pty reader thread. TS keeps a
+  // render mirror: seeded via journal_blocks(), appended via "journal-block" events.
+  interface JBlock {
     command: string;
-    exitCode: number;
+    exit_code: number;
     output: string;
-    startedAt?: number;
-    durationMs?: number;
+    duration_ms: number;
     // per-card UI state — lives on the block so re-renders and ring shifts keep/GC it
     ai?: string;
     aiPending?: boolean;
     expanded?: boolean;
   }
-  const journal: CommandBlock[] = []; // ring of last 50 finalized blocks
-  let oscReady = false; // true once a D mark proves the hooks loaded
-  let oscCarry = ""; // partial mark split across pty chunks
-  let oscCapturing = false;
-  let oscOutput = ""; // current block output (tail-capped)
-  let oscPreCmd = ""; // text between A and C — fallback command source (echo scrape)
-  let oscCommand = "";
-  // clean command source: what the user actually typed (from term.onData), not the echoed
-  // stream — avoids the doubled-first-char that shell-plugin line redraws leave in the echo.
+  const journal: JBlock[] = []; // mirror of the Rust ring (last 50 finalized blocks)
+  let oscReady = false; // true once a finalized block proves the zsh hooks loaded
+  // clean command source: what the user actually typed (from term.onData) — forwarded
+  // to Rust on Enter (set_typed_command) so the journal label isn't scraped from the echo.
   let typedLine = "";
-  let pendingTyped: string | null = null;
-  let oscStartedAt = 0;
-  const OSC133 = /\x1b\]133;([ABCD])(?:;(\d+))?(?:\x07|\x1b\\)/g;
-  const stripAnsi = (s: string) =>
-    s
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
-      .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
-      .replace(/[\x00-\x08\x0b-\x1f]/g, "");
 
-  function feedOsc(text: string): void {
-    let s = oscCarry + text;
-    oscCarry = "";
-    // hold back a mark that may be split across chunks
-    const j = s.lastIndexOf("\x1b]133;");
-    const tail = j >= 0 ? s.slice(j) : "";
-    if (j >= 0 && !tail.includes("\x07") && !tail.includes("\x1b\\")) {
-      if (tail.length <= 64) oscCarry = tail; // longer means it's not our mark
-      s = s.slice(0, j);
-    } else {
-      // a bare prefix of the header at the very end ("\x1b", "\x1b]1", …)
-      for (let k = Math.min(5, s.length); k > 0; k--) {
-        if (s.endsWith("\x1b]133;".slice(0, k))) {
-          oscCarry = s.slice(s.length - k);
-          s = s.slice(0, s.length - k);
-          break;
-        }
-      }
-    }
-    OSC133.lastIndex = 0;
-    let idx = 0;
-    let m: RegExpExecArray | null;
-    const feed = (seg: string) => {
-      if (oscCapturing) oscOutput = (oscOutput + seg).slice(-8192);
-      else oscPreCmd = (oscPreCmd + seg).slice(-512);
-    };
-    while ((m = OSC133.exec(s))) {
-      feed(s.slice(idx, m.index));
-      idx = OSC133.lastIndex;
-      const mark = m[1];
-      if (mark === "A" || mark === "B") {
-        oscPreCmd = "";
-      } else if (mark === "C") {
-        // prefer what the user actually typed (clean); fall back to scraping the echo
-        // (agent-injected commands and history/completion recalls have no typed line)
-        if (pendingTyped != null && pendingTyped !== "") {
-          oscCommand = pendingTyped;
-        } else {
-          const lines = stripAnsi(oscPreCmd)
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
-          // naive prompt strip (no B mark) — drop through the last space-delimited sigil
-          oscCommand = (lines[lines.length - 1] ?? "").replace(/^.*\s[%$#>]\s+/, "");
-        }
-        pendingTyped = null;
-        oscOutput = "";
-        oscStartedAt = Date.now();
-        oscCapturing = true;
-      } else {
-        // D;<code> — command end. First D (no prior C) is just the handshake.
-        oscReady = true;
-        if (oscCapturing) {
-          journal.push({
-            command: oscCommand,
-            exitCode: Number(m[2] ?? 0),
-            output: stripAnsi(oscOutput).trim(),
-            startedAt: oscStartedAt || undefined,
-            durationMs: oscStartedAt ? Date.now() - oscStartedAt : undefined,
-          });
-          if (journal.length > 50) journal.shift();
-          renderMinimap();
-          if (!blocks.hidden) renderBlocks();
-        }
-        oscCapturing = false;
-      }
-    }
-    feed(s.slice(idx));
-  }
-
-  function lastBlock(): CommandBlock | null {
+  function lastBlock(): JBlock | null {
     return journal[journal.length - 1] ?? null;
-  }
-
-  function lastFailedBlock(): CommandBlock | null {
-    for (let i = journal.length - 1; i >= 0; i--) {
-      if (journal[i].exitCode !== 0) return journal[i];
-    }
-    return null;
-  }
-
-  function recentBlocksText(n = 5): string {
-    return journal
-      .slice(-n)
-      .map((b) => `$ ${b.command || "(command)"} (exit ${b.exitCode})\n${b.output.slice(-500)}`)
-      .join("\n");
-  }
-
-  // journal-first terminal context; falls back to buffer scraping pre-handshake
-  function recentContext(maxLines = 30): string {
-    return oscReady && journal.length > 0
-      ? `Recent commands:\n${recentBlocksText(5)}`
-      : `Recent terminal output:\n${lastTerminalLines(maxLines)}`;
   }
 
   async function openAiBar() {
@@ -373,16 +240,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     term.focus();
   }
 
-  function lastTerminalLines(max = 30): string {
-    const buf = term.buffer.active;
-    const lines: string[] = [];
-    for (let i = 0; i < buf.length; i++) {
-      const text = buf.getLine(i)?.translateToString(true).trim();
-      if (text) lines.push(text);
-    }
-    return lines.slice(-max).join("\n");
-  }
-
   async function askAi(system: string, userMsg: string): Promise<string> {
     try {
       return await invoke<string>("ai_complete", { system, user: userMsg });
@@ -392,31 +249,17 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
-  function stripFences(s: string): string {
-    return s
-      .trim()
-      .replace(/^```[a-z]*\s*/i, "")
-      .replace(/```$/, "")
-      .trim();
-  }
-
   async function runAi(request: string) {
     if (!request) return;
     aiStatus.textContent = "thinking…";
     aiBar.classList.remove("danger");
     try {
-      const ctx = await invoke<ShellContext>("get_context");
-      const userMsg =
-        `${request}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
-        `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
-        recentContext();
-      const cmd = stripFences(await askAi(AI_SYSTEM, userMsg));
-      if (!cmd) {
-        aiStatus.textContent = "no command returned";
-        return;
-      }
-      const danger = await invoke<boolean>("check_dangerous", { cmd });
-      await invoke("pty_write", { data: cmd }); // no trailing newline — never auto-execute
+      // prompt assembly, fence stripping, and the danger check all live in Rust
+      const { command, danger } = await invoke<{ command: string; danger: boolean }>(
+        "nl_to_command",
+        { request },
+      );
+      await invoke("pty_write", { data: command }); // no trailing newline — never auto-execute
       if (danger) {
         aiBar.classList.add("danger");
         aiStatus.textContent = "⚠ destructive — review carefully";
@@ -425,195 +268,83 @@ window.addEventListener("DOMContentLoaded", async () => {
         closeAiBar();
       }
     } catch (e) {
-      aiStatus.textContent = (e as Error).message;
+      // invoke rejects with the plain Err string, not an Error
+      aiStatus.textContent = e instanceof Error ? e.message : String(e);
     }
   }
 
-  // ---- Agent mode ----
+  // ---- Agent mode (loop lives in Rust; TS renders the gate) ----
 
-  function gate(cmd: string, danger: boolean): Promise<boolean> {
-    aiInput.value = cmd;
-    aiInput.readOnly = true;
-    aiBar.classList.toggle("danger", danger);
-    aiStatus.textContent = (danger ? "⚠ destructive · " : "") + "run? ⏎ approve · esc deny";
-    return new Promise((res) => (gateResolve = res));
-  }
-
-  function runCaptured(cmd: string, nonce: string): Promise<{ output: string; code: number }> {
-    captureBuf = "";
-    captureNonce = nonce;
-    return new Promise((res) => {
-      // ponytail: 20s wall-clock timeout — resolves with code -1 if the marker never
-      // arrives (interactive/hung program owns the pty). Bounds the loop; abort still works.
-      const timer = window.setTimeout(() => {
-        if (captureResolve) {
-          captureResolve = null;
-          res({ output: captureBuf, code: -1 });
-        }
-      }, 20000);
-      captureResolve = (r) => {
-        clearTimeout(timer);
-        res(r);
-      };
-      void invoke("pty_write", {
-        data: `${cmd}; printf '\\n__TACHYON_${nonce}_%d__\\n' $?\n`,
-      });
-    });
-  }
-
-  function endAgent() {
-    agentRunning = false;
-    gateResolve = null;
-    captureResolve = null;
-    aiInput.readOnly = false;
-    closeAiBar();
-  }
-
-  function abortAgent() {
-    if (!agentRunning) return;
-    agentAbort = true;
-    if (gateResolve) {
-      const r = gateResolve;
-      gateResolve = null;
-      r(false);
-    }
-    if (captureResolve) {
-      const r = captureResolve;
-      captureResolve = null;
-      r({ output: "", code: -1 });
-    }
-    term.write("\r\n\x1b[36m[agent] aborted\x1b[0m\r\n");
-  }
-
-  async function runAgent(task: string) {
+  async function startAgent(task: string) {
     if (!task || agentRunning) return;
     agentRunning = true;
-    agentAbort = false;
     aiInput.readOnly = true;
-    let completed = false;
+    aiStatus.textContent = "starting…";
     try {
-      const ctx = await invoke<ShellContext>("get_context");
-      let transcript =
-        `Task: ${task}\n\nContext:\ncwd: ${ctx.cwd ?? "unknown"}\n` +
-        `git: ${ctx.branch ? `${ctx.branch}${ctx.dirty > 0 ? ` (${ctx.dirty} dirty)` : ""}` : "none"}\n` +
-        recentContext(20) +
-        "\n";
-      let tools: McpServerTool[] = [];
-      try {
-        tools = await invoke<McpServerTool[]>("mcp_list_tools");
-      } catch {
-        // all servers failed — agent runs shell-only
-      }
-      const system =
-        tools.length === 0
-          ? AI_AGENT
-          : AI_AGENT +
-            " You may also call a tool: respond with EXACTLY 'TOOL: <server>.<name> {json arguments}' (one line).\n" +
-            "TOOLS:\n" +
-            tools.map((t) => `TOOL ${t.server}.${t.name} — ${t.description}`).join("\n");
-      for (let step = 1; step <= 12; step++) {
-        if (agentAbort) break;
-        aiStatus.textContent = `thinking… (${step}/12)`;
-        const reply = (await askAi(system, transcript)).trim();
-        if (agentAbort) break;
-        if (/^DONE:/i.test(reply)) {
-          term.write(`\r\n\x1b[36m[agent] ${reply.replace(/^DONE:/i, "").trim()}\x1b[0m\r\n`);
-          completed = true;
-          break;
-        }
-        if (/^TOOL:/i.test(reply)) {
-          const rest = reply.replace(/^TOOL:/i, "").trim();
-          const sp = rest.indexOf(" ");
-          const ref = sp === -1 ? rest : rest.slice(0, sp);
-          const dot = ref.indexOf(".");
-          if (dot < 1) {
-            transcript += `\nInvalid tool call: ${reply}\n`;
-            continue;
-          }
-          const server = ref.slice(0, dot);
-          const tool = ref.slice(dot + 1);
-          let args: unknown = {};
-          try {
-            args = JSON.parse(sp === -1 ? "{}" : rest.slice(sp + 1));
-          } catch {
-            args = {};
-          }
-          // same explicit-approval gate as RUN — tools never auto-call
-          const approved = await gate(`call ${server}.${tool}(${JSON.stringify(args)})`, false);
-          aiInput.readOnly = true;
-          aiBar.classList.remove("danger");
-          if (agentAbort) break;
-          if (!approved) {
-            transcript += `\nThe user denied tool call ${server}.${tool}. Suggest an alternative or DONE.\n`;
-            aiStatus.textContent = "denied";
-            continue;
-          }
-          aiStatus.textContent = "running tool…";
-          term.write(`\r\n\x1b[36m[agent] tool ${server}.${tool}…\x1b[0m\r\n`);
-          try {
-            const result = await invoke<string>("mcp_call", { server, tool, args });
-            transcript += `\nTool: ${server}.${tool}\nResult:\n${result.slice(0, 2000)}\n`;
-          } catch (e) {
-            transcript += `\nTool error: ${(e as Error).message ?? String(e)}\n`;
-          }
-          if (agentAbort) break;
-          continue;
-        }
-        const cmd = stripFences(reply.replace(/^RUN:/i, "").trim());
-        if (!cmd) {
-          term.write("\r\n\x1b[36m[agent] no command returned\x1b[0m\r\n");
-          completed = true;
-          break;
-        }
-        const danger = await invoke<boolean>("check_dangerous", { cmd });
-        const approved = await gate(cmd, danger);
-        aiInput.readOnly = true;
-        aiBar.classList.remove("danger");
-        if (agentAbort) break;
-        if (!approved) {
-          transcript += `\nThe user denied running: ${cmd}. Suggest an alternative or DONE.\n`;
-          aiStatus.textContent = "denied";
-          continue;
-        }
-        aiStatus.textContent = "running…";
-        const { output, code } = await runCaptured(cmd, "s" + step);
-        if (agentAbort) break;
-        const clean = output
-          .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
-          .replace(cmd, "")
-          .trim()
-          .slice(0, 2000);
-        transcript += `\nCommand: ${cmd}\nExit code: ${code}\nOutput:\n${clean}\n`;
-      }
-      if (!completed && !agentAbort) term.write("\r\n\x1b[36m[agent] step limit reached\x1b[0m\r\n");
+      await invoke("agent_start", { task });
     } catch (e) {
-      aiStatus.textContent = (e as Error).message;
-    } finally {
-      endAgent();
+      aiStatus.textContent = e instanceof Error ? e.message : String(e);
+      agentRunning = false;
+      aiInput.readOnly = false;
     }
   }
 
+  interface AgentPropose {
+    step: number;
+    kind: "run" | "tool";
+    text: string;
+    args?: unknown;
+    danger: boolean;
+  }
+  await listen<AgentPropose>("agent-propose", (e) => {
+    const p = e.payload;
+    agentRunning = true;
+    if (aiBar.hidden) {
+      aiBar.hidden = false;
+      fit.fit();
+    }
+    aiInput.value = p.text;
+    aiInput.readOnly = true;
+    aiBar.classList.toggle("danger", p.danger);
+    aiStatus.textContent = (p.danger ? "⚠ destructive · " : "") + "run? ⏎ approve · esc deny";
+    pendingGate = true;
+    aiInput.focus();
+  });
+  await listen<{ step: number; status: string }>("agent-status", (e) => {
+    const { step, status } = e.payload;
+    aiStatus.textContent = status === "thinking" ? `thinking… (${step}/12)` : status;
+  });
+  await listen<{ step: number; text: string }>("agent-output", (e) => {
+    term.write(`\r\n\x1b[36m[agent] ${e.payload.text.replace(/\n/g, "\r\n")}\x1b[0m\r\n`);
+  });
+  await listen<{ summary: string }>("agent-done", (e) => {
+    term.write(`\r\n\x1b[36m[agent] ${e.payload.summary.replace(/\n/g, "\r\n")}\x1b[0m\r\n`);
+    agentRunning = false;
+    pendingGate = false;
+    closeAiBar();
+  });
+
   aiInput.onkeydown = (e) => {
-    if (gateResolve) {
-      // permission gate: Enter approves, Esc denies this step
+    if (pendingGate) {
+      // THE explicit approval keypress — nothing else may resolve a proposal
       if (e.key === "Enter") {
         e.preventDefault();
-        const r = gateResolve;
-        gateResolve = null;
-        r(true);
+        pendingGate = false;
+        aiBar.classList.remove("danger");
+        void invoke("agent_decide", { approved: true });
       } else if (e.key === "Escape") {
         e.preventDefault();
-        const r = gateResolve;
-        gateResolve = null;
-        r(false);
+        pendingGate = false;
+        aiBar.classList.remove("danger");
+        void invoke("agent_decide", { approved: false });
       }
       return;
     }
     if (agentRunning) {
-      // mid-run (thinking/capturing): Esc aborts, Enter ignored
+      // mid-run (thinking/running): Esc aborts, Enter ignored
       if (e.key === "Escape") {
         e.preventDefault();
-        abortAgent();
+        void invoke("agent_abort");
       }
       return;
     }
@@ -624,125 +355,30 @@ window.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       const v = aiInput.value.trim();
       if (v.startsWith("/")) handleSlash(v);
-      else if (barMode === "agent") runAgent(v);
+      else if (barMode === "agent") void startAgent(v);
       else runAi(v);
     }
   };
 
-  // Slash commands: manage AI providers/keys/models. Work with or without a key set.
-  const SLASH_HELP =
-    "\r\n\x1b[36m/keys\x1b[0m                       list providers, active, which have keys\r\n" +
-    "\x1b[36m/key <id> <apikey>\x1b[0m          set a provider's API key\r\n" +
-    "\x1b[36m/use <id> [model]\x1b[0m           switch active provider (+ optional model)\r\n" +
-    "\x1b[36m/model <model>\x1b[0m              set the active provider's model\r\n" +
-    "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add a local/OpenAI-compatible endpoint\r\n" +
-    "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n" +
-    "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n" +
-    "\x1b[36m/mcp list\x1b[0m                   list MCP servers and their tools\r\n" +
-    "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n" +
-    "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n";
-
-  function printProviders(st: ProviderState) {
-    let out = "\r\n\x1b[36m[tachyon] providers\x1b[0m\r\n";
-    for (const p of st.providers) {
-      const mark = p.id === st.active ? "\x1b[32m●\x1b[0m" : " ";
-      const keyed = p.has_key ? "\x1b[32m✓key\x1b[0m" : p.kind === "anthropic" ? "\x1b[90m—\x1b[0m" : "\x1b[90mno key\x1b[0m";
-      out += `${mark} ${p.id.padEnd(9)} ${keyed}  \x1b[90m${p.model}\x1b[0m\r\n`;
-    }
-    term.write(out);
-  }
-
+  // Slash commands: parsed and executed in Rust (run_slash); we just print the result.
   async function handleSlash(input: string) {
-    const parts = input.slice(1).split(/\s+/).filter(Boolean);
-    const cmd = (parts.shift() ?? "").toLowerCase();
-    try {
-      if (cmd === "help" || cmd === "") {
-        term.write(SLASH_HELP);
-      } else if (cmd === "keys" || cmd === "providers") {
-        printProviders(await invoke<ProviderState>("provider_state"));
-      } else if (cmd === "key") {
-        const [id, ...rest] = parts;
-        if (!id || rest.length === 0) throw new Error("usage: /key <id> <apikey>");
-        await invoke("provider_set_key", { id, key: rest.join(" ") });
-        term.write(`\r\n\x1b[36m[tachyon] key set for ${id}\x1b[0m\r\n`);
-      } else if (cmd === "use") {
-        const [id, model] = parts;
-        if (!id) throw new Error("usage: /use <id> [model]");
-        await invoke("provider_use", { id });
-        if (model) await invoke("provider_set_model", { id, model });
-        term.write(`\r\n\x1b[36m[tachyon] active provider: ${id}${model ? ` · ${model}` : ""}\x1b[0m\r\n`);
-      } else if (cmd === "model") {
-        if (parts.length === 0) throw new Error("usage: /model <model>");
-        const st = await invoke<ProviderState>("provider_state");
-        await invoke("provider_set_model", { id: st.active, model: parts.join(" ") });
-        term.write(`\r\n\x1b[36m[tachyon] ${st.active} model: ${parts.join(" ")}\x1b[0m\r\n`);
-      } else if (cmd === "local") {
-        const [id, baseUrl, model, ...key] = parts;
-        if (!id || !baseUrl || !model) throw new Error("usage: /local <id> <base_url> <model> [key]");
-        await invoke("provider_add_local", { id, baseUrl, model, key: key.join(" ") });
-        term.write(`\r\n\x1b[36m[tachyon] added local provider ${id} → ${baseUrl}\x1b[0m\r\n`);
-      } else if (cmd === "mcp") {
-        const sub = (parts.shift() ?? "").toLowerCase();
-        if (sub === "add") {
-          const [name, url] = parts;
-          if (!name || !url) throw new Error("usage: /mcp add <name> <url>");
-          await invoke("mcp_add", { name, url });
-          term.write(`\r\n\x1b[36m[tachyon] mcp server ${name} → ${url}\x1b[0m\r\n`);
-        } else if (sub === "remove") {
-          const [name] = parts;
-          if (!name) throw new Error("usage: /mcp remove <name>");
-          await invoke("mcp_remove", { name });
-          term.write(`\r\n\x1b[36m[tachyon] removed mcp server ${name}\x1b[0m\r\n`);
-        } else if (sub === "list") {
-          const servers = await invoke<McpServer[]>("mcp_servers");
-          if (servers.length === 0) {
-            term.write("\r\n\x1b[36m[tachyon] no mcp servers — /mcp add <name> <url>\x1b[0m\r\n");
-          } else {
-            let tools: McpServerTool[] = [];
-            let toolErr = "";
-            try {
-              tools = await invoke<McpServerTool[]>("mcp_list_tools");
-            } catch (e) {
-              toolErr = (e as Error).message ?? String(e);
-            }
-            let out = "\r\n\x1b[36m[tachyon] mcp servers\x1b[0m\r\n";
-            for (const s of servers) {
-              out += `  ${s.name.padEnd(12)} \x1b[90m${s.url}\x1b[0m\r\n`;
-              for (const t of tools.filter((t) => t.server === s.name)) {
-                out += `    \x1b[36m${t.server}.${t.name}\x1b[0m  \x1b[90m${t.description}\x1b[0m\r\n`;
-              }
-            }
-            if (toolErr) out += `\x1b[31m[tachyon] ${toolErr}\x1b[0m\r\n`;
-            term.write(out);
-          }
-        } else {
-          throw new Error("usage: /mcp add|remove|list");
-        }
-      } else {
-        throw new Error(`unknown command: /${cmd} — try /help`);
-      }
-    } catch (e) {
-      term.write(`\r\n\x1b[31m[tachyon] ${(e as Error).message}\x1b[0m\r\n`);
-    }
+    term.write(await invoke<string>("run_slash", { input }));
     closeAiBar();
   }
 
-  // Error autopsy (⌘E): explain the recent terminal output, printed display-only
+  // Error autopsy (⌘E): Rust picks the failed block and builds the prompt;
+  // the returned text is printed display-only (cyan)
   let explaining = false;
   async function explainError() {
     if (explaining) return;
     explaining = true;
     term.write("\r\n\x1b[90m[tachyon] explaining…\x1b[0m");
     try {
-      const fb = oscReady ? lastFailedBlock() : null;
-      const prompt = fb
-        ? `Command: ${fb.command || "(unknown)"}\nExit code: ${fb.exitCode}\nOutput:\n${fb.output.slice(-3000)}`
-        : `Recent terminal output:\n${lastTerminalLines()}`;
-      const out = await askAi(AI_EXPLAIN, prompt);
+      const out = await invoke<string>("explain_last_error");
       const body = out.trim().replace(/\n/g, "\r\n");
       term.write(`\r\x1b[2K\x1b[36m${body}\x1b[0m\r\n`);
     } catch (e) {
-      term.write(`\r\x1b[2K\x1b[31m[tachyon] ${(e as Error).message}\x1b[0m\r\n`);
+      term.write(`\r\x1b[2K\x1b[31m[tachyon] ${e instanceof Error ? e.message : String(e)}\x1b[0m\r\n`);
     } finally {
       explaining = false;
     }
@@ -895,10 +531,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       const moreLines = lines.length > 3 || b.output.length > 4000;
       const preview = b.expanded ? b.output.slice(0, 4000) : lines.slice(0, 3).join("\n");
       html +=
-        `<div class="block-card ${blockClass(b.exitCode)}" id="block-${i}">` +
+        `<div class="block-card ${blockClass(b.exit_code)}" id="block-${i}">` +
         `<div class="block-stripe"></div><div class="block-body">` +
         `<div class="block-cmd">${escapeHtml(b.command || `command ${i + 1}`)}</div>` +
-        `<div class="block-meta">exit ${b.exitCode}${b.durationMs != null ? ` · ${fmtDuration(b.durationMs)}` : ""}</div>` +
+        `<div class="block-meta">exit ${b.exit_code} · ${fmtDuration(b.duration_ms)}</div>` +
         (preview ? `<div class="block-out">${escapeHtml(preview)}</div>` : "") +
         (moreLines
           ? `<button class="block-expand" data-action="toggle" data-idx="${i}">${b.expanded ? "▾ collapse" : "▸ expand"}</button>`
@@ -918,7 +554,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     minimap.innerHTML = journal
       .map(
         (b, i) =>
-          `<div class="mm-seg ${blockClass(b.exitCode)}" data-idx="${i}" title="${escapeHtml(b.command || `command ${i + 1}`)}"></div>`,
+          `<div class="mm-seg ${blockClass(b.exit_code)}" data-idx="${i}" title="${escapeHtml(b.command || `command ${i + 1}`)}"></div>`,
       )
       .join("");
   }
@@ -944,7 +580,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     try {
       b.ai = await askAi(
         AI_EXPLAIN,
-        `$ ${b.command || "(unknown)"}\nexit ${b.exitCode}\nOutput:\n${b.output.slice(0, 2000)}`,
+        `$ ${b.command || "(unknown)"}\nexit ${b.exit_code}\nOutput:\n${b.output.slice(0, 2000)}`,
       );
     } catch (e) {
       b.ai = (e as Error).message;
@@ -961,7 +597,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       .slice(-20)
       .map(
         (b) =>
-          `$ ${b.command || "(command)"} (exit ${b.exitCode})\n${b.output.split("\n").filter(Boolean).slice(0, 2).join("\n")}`,
+          `$ ${b.command || "(command)"} (exit ${b.exit_code})\n${b.output.split("\n").filter(Boolean).slice(0, 2).join("\n")}`,
       )
       .join("\n");
     try {
@@ -1013,19 +649,23 @@ window.addEventListener("DOMContentLoaded", async () => {
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return bytes;
   }
+  // journal mirror: listener installed BEFORE the seed so no block slips between
+  await listen<JBlock>("journal-block", (e) => {
+    journal.push(e.payload);
+    if (journal.length > 50) journal.shift();
+    oscReady = true;
+    renderMinimap();
+    if (!blocks.hidden) renderBlocks();
+  });
+  const seed = await invoke<JBlock[]>("journal_blocks");
+  if (journal.length === 0 && seed.length > 0) {
+    // hot-reload: the Rust journal survives the webview
+    journal.push(...seed);
+    oscReady = true;
+    renderMinimap();
+  }
   await listen<string>("pty-output", (e) => {
-    const bytes = b64ToBytes(e.payload);
-    term.write(bytes); // live output — always first, never gated, never stripped
-    const text = dec.decode(bytes, { stream: true });
-    feedOsc(text); // OSC 133 scanner works on a decoded copy
-    if (!captureResolve) return;
-    captureBuf += text;
-    const m = captureBuf.match(new RegExp(`__TACHYON_${captureNonce}_(\\d+)__`));
-    if (m) {
-      const r = captureResolve;
-      captureResolve = null;
-      r({ output: captureBuf.slice(0, m.index), code: parseInt(m[1], 10) });
-    }
+    term.write(b64ToBytes(e.payload)); // live output — never gated, never stripped
   });
   await listen("pty-exit", () => term.write("\r\n[process exited]\r\n"));
   await invoke("pty_spawn", { rows: term.rows, cols: term.cols });
@@ -1040,7 +680,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     } else {
       for (const ch of data) {
         if (ch === "\r" || ch === "\n") {
-          pendingTyped = typedLine;
+          void invoke("set_typed_command", { line: typedLine });
           typedLine = "";
         } else if (ch === "\x7f" || ch === "\x08") {
           typedLine = typedLine.slice(0, -1); // backspace
@@ -1082,7 +722,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const lb = lastBlock();
     statusGit.textContent =
       (ctx.branch ? `⎇ ${ctx.branch}${ctx.dirty > 0 ? ` ±${ctx.dirty}` : ""}` : "") +
-      (lb && lb.exitCode !== 0 ? ` ✗ ${lb.exitCode}` : "");
+      (lb && lb.exit_code !== 0 ? ` ✗ ${lb.exit_code}` : "");
   }
 
   function scheduleContextRefresh() {
