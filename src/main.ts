@@ -79,7 +79,7 @@ interface Provider {
   kind: string;
   base_url: string;
   model: string;
-  key: string;
+  has_key: boolean;
 }
 
 interface ProviderState {
@@ -347,7 +347,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     aiBar.hidden = false;
     fit.fit();
     const p = await invoke<Provider>("provider_active");
-    aiStatus.textContent = `${p.id} · ${p.model}${p.key || p.kind !== "anthropic" ? "" : " · no key"}`;
+    aiStatus.textContent = `${p.id} · ${p.model}${p.has_key || p.kind !== "anthropic" ? "" : " · no key"}`;
     aiInput.focus();
   }
 
@@ -646,7 +646,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     let out = "\r\n\x1b[36m[tachyon] providers\x1b[0m\r\n";
     for (const p of st.providers) {
       const mark = p.id === st.active ? "\x1b[32m●\x1b[0m" : " ";
-      const keyed = p.key ? "\x1b[32m✓key\x1b[0m" : p.kind === "anthropic" ? "\x1b[90m—\x1b[0m" : "\x1b[90mno key\x1b[0m";
+      const keyed = p.has_key ? "\x1b[32m✓key\x1b[0m" : p.kind === "anthropic" ? "\x1b[90m—\x1b[0m" : "\x1b[90mno key\x1b[0m";
       out += `${mark} ${p.id.padEnd(9)} ${keyed}  \x1b[90m${p.model}\x1b[0m\r\n`;
     }
     term.write(out);

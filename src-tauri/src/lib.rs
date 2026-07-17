@@ -179,6 +179,40 @@ struct ProviderState {
     providers: Vec<Provider>,
 }
 
+// IPC-safe views: never carry the raw key across the Tauri bridge into the webview.
+#[derive(Clone, serde::Serialize)]
+struct PublicProvider {
+    id: String,
+    kind: String,
+    base_url: String,
+    model: String,
+    has_key: bool,
+}
+
+impl From<&Provider> for PublicProvider {
+    fn from(p: &Provider) -> Self {
+        PublicProvider {
+            id: p.id.clone(),
+            kind: p.kind.clone(),
+            base_url: p.base_url.clone(),
+            model: p.model.clone(),
+            has_key: !p.key.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PublicProviderState {
+    active: String,
+    providers: Vec<PublicProvider>,
+}
+
+impl From<&ProviderState> for PublicProviderState {
+    fn from(s: &ProviderState) -> Self {
+        PublicProviderState { active: s.active.clone(), providers: s.providers.iter().map(PublicProvider::from).collect() }
+    }
+}
+
 fn builtin(id: &str, kind: &str, base_url: &str, model: &str) -> Provider {
     Provider { id: id.into(), kind: kind.into(), base_url: base_url.into(), model: model.into(), key: String::new() }
 }
@@ -276,36 +310,37 @@ fn mutate<F: FnOnce(&mut ProviderState) -> Result<(), String>>(f: F) -> Result<P
 }
 
 #[tauri::command]
-fn provider_state() -> ProviderState {
-    load_state()
+fn provider_state() -> PublicProviderState {
+    (&load_state()).into()
 }
 
 #[tauri::command]
-fn provider_active() -> Provider {
-    load_state().active_provider()
+fn provider_active() -> PublicProvider {
+    (&load_state().active_provider()).into()
 }
 
 #[tauri::command]
-fn provider_set_key(id: String, key: String) -> Result<ProviderState, String> {
-    mutate(|s| s.set_key(&id, key))
+fn provider_set_key(id: String, key: String) -> Result<PublicProviderState, String> {
+    mutate(|s| s.set_key(&id, key)).map(|s| (&s).into())
 }
 
 #[tauri::command]
-fn provider_set_model(id: String, model: String) -> Result<ProviderState, String> {
-    mutate(|s| s.set_model(&id, model))
+fn provider_set_model(id: String, model: String) -> Result<PublicProviderState, String> {
+    mutate(|s| s.set_model(&id, model)).map(|s| (&s).into())
 }
 
 #[tauri::command]
-fn provider_use(id: String) -> Result<ProviderState, String> {
-    mutate(|s| s.use_provider(&id))
+fn provider_use(id: String) -> Result<PublicProviderState, String> {
+    mutate(|s| s.use_provider(&id)).map(|s| (&s).into())
 }
 
 #[tauri::command]
-fn provider_add_local(id: String, base_url: String, model: String, key: String) -> Result<ProviderState, String> {
+fn provider_add_local(id: String, base_url: String, model: String, key: String) -> Result<PublicProviderState, String> {
     mutate(|s| {
         s.add_local(id, base_url, model, key);
         Ok(())
     })
+    .map(|s| (&s).into())
 }
 
 // ---- AI completion ----
@@ -369,7 +404,7 @@ async fn ai_complete(system: String, user: String) -> Result<String, String> {
     } else {
         // OpenAI-compatible (openai, groq, gemini, kimi, deepseek, mistral, local). Local may have no key.
         let mut r = client
-            .post(format!("{}/chat/completions", p.base_url))
+            .post(format!("{}/chat/completions", p.base_url.trim_end_matches('/')))
             .json(&build_openai_body(&p.model, &system, &user));
         if !p.key.is_empty() {
             r = r.bearer_auth(&p.key);
@@ -873,6 +908,64 @@ mod tests {
         assert!(parse_openai_response(r#"{"error":{"message":"bad key"}}"#).is_err());
         assert!(parse_openai_response(r#"{"choices":[]}"#).is_err());
         assert!(parse_openai_response("not json").is_err());
+    }
+
+    // Adversarial tests for parse_anthropic_response
+    #[test]
+    fn parse_anthropic_empty_text() {
+        // valid structure but empty text string
+        let body = r#"{"content":[{"type":"text","text":""}]}"#;
+        assert_eq!(parse_anthropic_response(body).unwrap(), "");
+    }
+
+    #[test]
+    fn parse_anthropic_unicode_content() {
+        // valid unicode including emoji, non-Latin scripts, etc.
+        let body = r#"{"content":[{"type":"text","text":"Hello 世界 🚀 مرحبا"}]}"#;
+        assert_eq!(parse_anthropic_response(body).unwrap(), "Hello 世界 🚀 مرحبا");
+    }
+
+    #[test]
+    fn parse_anthropic_no_content_array() {
+        // missing "content" field entirely
+        let body = r#"{"message":"no content field"}"#;
+        assert!(parse_anthropic_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_anthropic_null_content() {
+        // "content" is null
+        let body = r#"{"content":null}"#;
+        assert!(parse_anthropic_response(body).is_err());
+    }
+
+    // Adversarial tests for parse_openai_response
+    #[test]
+    fn parse_openai_empty_content() {
+        // valid structure but empty content string
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#;
+        assert_eq!(parse_openai_response(body).unwrap(), "");
+    }
+
+    #[test]
+    fn parse_openai_unicode_content() {
+        // valid unicode including emoji, RTL, CJK
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"Привет 🌍 العالم こんにちは"}}]}"#;
+        assert_eq!(parse_openai_response(body).unwrap(), "Привет 🌍 العالم こんにちは");
+    }
+
+    #[test]
+    fn parse_openai_no_choices() {
+        // missing "choices" field
+        let body = r#"{"message":"missing choices"}"#;
+        assert!(parse_openai_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_openai_null_choices() {
+        // "choices" is null
+        let body = r#"{"choices":null}"#;
+        assert!(parse_openai_response(body).is_err());
     }
 
     #[test]
