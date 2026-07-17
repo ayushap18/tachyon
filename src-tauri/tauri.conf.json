@@ -4,10 +4,9 @@
   "version": "0.1.4-beta.2",
   "identifier": "com.ayush18.tachyon-beta",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "beforeDevCommand": "sh ui/build-web.sh",
+    "beforeBuildCommand": "sh ui/build-web.sh --release",
+    "frontendDist": "../ui/target/dx/tachyon-ui/debug/web/public"
   },
   "app": {
     "withGlobalTauri": true,
