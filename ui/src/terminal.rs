@@ -193,11 +193,11 @@ impl Term {
         self.dpr = win().device_pixel_ratio();
         let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
         let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        // Backing store only — the CSS (100vw/100vh, position:fixed) owns the *display* size, so
+        // the canvas always fills the viewport (incl. fullscreen). Setting an inline px width/height
+        // here would override that CSS and pin the canvas to a stale size (the fullscreen bug).
         self.canvas.set_width((w * self.dpr).round() as u32);
         self.canvas.set_height((h * self.dpr).round() as u32);
-        let style = self.canvas.style();
-        let _ = style.set_property("width", &format!("{}px", w));
-        let _ = style.set_property("height", &format!("{}px", h));
         // canvas resize resets the transform; re-apply DPR scaling + baseline.
         let _ = self.ctx.scale(self.dpr, self.dpr);
         self.ctx.set_text_baseline("top");
@@ -761,6 +761,10 @@ fn setup() {
         // ResizeObserver fires once automatically on observe(); setup() already did the initial
         // fit(), so skip that first callback to avoid a redundant wipe-repaint flicker at launch.
         let first = std::rc::Rc::new(std::cell::Cell::new(true));
+        // Observe the canvas itself — it's position:fixed 100vw/100vh, so its box tracks the
+        // viewport and the observer fires reliably on fullscreen / window resize. (Observing
+        // <html> failed: its layout followed the canvas, so it didn't change on fullscreen.)
+        let canvas_obs = term.borrow().canvas.clone();
         let cb = Closure::wrap(Box::new(move |_: js_sys::Array, _: web_sys::ResizeObserver| {
             if first.replace(false) {
                 return;
@@ -773,9 +777,7 @@ fn setup() {
         })
             as Box<dyn FnMut(js_sys::Array, web_sys::ResizeObserver)>);
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
-            if let Some(root) = document.document_element() {
-                observer.observe(&root);
-            }
+            observer.observe(canvas_obs.unchecked_ref());
             std::mem::forget(observer);
         }
         cb.forget();
