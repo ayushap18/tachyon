@@ -11,8 +11,31 @@ extern "C" {
     async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 
     // window.__TAURI__.event.listen(event, handler) -> Promise<UnlistenFn>
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
-    fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> js_sys::Promise;
+    // `catch` so a JS throw here surfaces as Err instead of unwinding into WASM.
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen, catch)]
+    fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> Result<js_sys::Promise, JsValue>;
+}
+
+/// Zero-arg invoke payload (`{}`), shared by every command that takes no params.
+#[derive(Serialize)]
+pub struct NoArgs {}
+
+/// `{ data }` — keystrokes / pasted text / prefill forwarded to `pty_write`.
+#[derive(Serialize)]
+pub struct WriteArgs {
+    pub data: String,
+}
+
+/// navigator.clipboard.writeText(text) via Reflect (no web-sys Clipboard feature enabled).
+pub fn clipboard_write(text: &str) {
+    let Some(win) = web_sys::window() else { return };
+    let get = |o: &JsValue, k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
+    let Some(clip) = get(win.as_ref(), "navigator").as_ref().and_then(|n| get(n, "clipboard")) else {
+        return;
+    };
+    if let Some(f) = get(&clip, "writeText").and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
+        let _ = f.call1(&clip, &JsValue::from_str(text));
+    }
 }
 
 /// Invoke a Tauri command. `args` is serialized to a JS object (its fields

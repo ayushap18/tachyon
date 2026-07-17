@@ -68,6 +68,11 @@ pub enum VimMode {
 /// output/duration_ms; ai/ai_pending/expanded are per-card UI state added here.
 #[derive(Clone, PartialEq, Default, Deserialize)]
 pub struct JournalBlock {
+    /// Client-assigned stable id (the native payload has none). Lets async work — e.g.
+    /// per-block AI explain — reattach to the right block after a ring shift, instead of
+    /// re-indexing by a Vec position that eviction may have moved.
+    #[serde(skip)]
+    pub id: u64,
     #[serde(default)]
     pub command: String,
     #[serde(default)]
@@ -135,6 +140,19 @@ struct NoArgs {}
 
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+thread_local! {
+    static NEXT_BLOCK_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Monotonic block id (WASM is single-threaded, so a Cell is enough).
+pub fn next_block_id() -> u64 {
+    NEXT_BLOCK_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
 }
 
 fn load_settings() -> Settings {
@@ -205,6 +223,14 @@ pub fn App() -> Element {
                 let _ = ls.set_item("tachyon-settings", &json);
             }
         }
+        // Notify the canvas terminal to re-read font/size from the just-persisted settings.
+        // Fired post-persist so terminal.rs sees current values (mirrors main.ts applySettings
+        // driving term.options.fontFamily/fontSize).
+        if let Some(win) = web_sys::window() {
+            if let Ok(ev) = web_sys::Event::new("tachyon-font") {
+                let _ = win.dispatch_event(&ev);
+            }
+        }
     });
 
     // Journal mirror + provider seed + global keybindings — once on mount.
@@ -212,7 +238,8 @@ pub fn App() -> Element {
         // listener BEFORE seed so no block slips between (main.ts line 652).
         let journal = state.journal;
         listen("journal-block", move |payload| {
-            if let Ok(b) = serde_wasm_bindgen::from_value::<JournalBlock>(payload) {
+            if let Ok(mut b) = serde_wasm_bindgen::from_value::<JournalBlock>(payload) {
+                b.id = next_block_id();
                 let mut j = journal;
                 j.write().push(b);
                 if j.read().len() > 50 {
@@ -225,9 +252,12 @@ pub fn App() -> Element {
         let provider = state.provider_active;
         spawn_local(async move {
             if let Ok(v) = invoke("journal_blocks", NoArgs {}).await {
-                if let Ok(seed) = serde_wasm_bindgen::from_value::<Vec<JournalBlock>>(v) {
+                if let Ok(mut seed) = serde_wasm_bindgen::from_value::<Vec<JournalBlock>>(v) {
                     let mut j = journal;
                     if j.read().is_empty() && !seed.is_empty() {
+                        for b in &mut seed {
+                            b.id = next_block_id(); // stable ids for the hot-reload seed too
+                        }
                         j.set(seed); // hot-reload: the Rust journal survives the webview
                     }
                 }

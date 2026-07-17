@@ -28,6 +28,8 @@ features = [
     "CssStyleDeclaration",
     "Storage",
     "KeyboardEvent",
+    "ClipboardEvent",
+    "DataTransfer",
     "Event",
     "EventTarget",
 ]

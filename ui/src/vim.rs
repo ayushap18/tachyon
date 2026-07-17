@@ -15,6 +15,7 @@ use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{HtmlElement, KeyboardEvent};
 
 use crate::app::{AppState, VimMode};
+use crate::bridge::clipboard_write;
 use crate::terminal::{grid_view, GridView};
 
 // ---- grid text helpers (pure) ----
@@ -169,18 +170,6 @@ fn search_value() -> String {
         .and_then(|el| js_sys::Reflect::get(el.as_ref(), &JsValue::from_str("value")).ok())
         .and_then(|v| v.as_string())
         .unwrap_or_default()
-}
-
-/// navigator.clipboard.writeText(text) via Reflect (no Clipboard feature enabled).
-fn clipboard_write(text: &str) {
-    let Some(win) = web_sys::window() else { return };
-    let get = |o: &JsValue, k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
-    let Some(clip) = get(win.as_ref(), "navigator").as_ref().and_then(|n| get(n, "clipboard")) else {
-        return;
-    };
-    if let Some(f) = get(&clip, "writeText").and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
-        let _ = f.call1(&clip, &JsValue::from_str(text));
-    }
 }
 
 // ---- mode transitions ----

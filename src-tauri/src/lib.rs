@@ -430,9 +430,12 @@ fn pty_write(state: State<PtyState>, data: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pty_resize(state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
+fn pty_resize(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
     if let Some(eng) = state.engine.lock().unwrap().as_mut() {
         eng.resize(cols, rows);
+        // repaint immediately — the child may not write anything after a resize (a static
+        // prompt, a paused pager), and the canvas was just blanked to the new dimensions.
+        let _ = app.emit("grid-damage", eng.full_repaint());
     }
     match state.master.lock().unwrap().as_ref() {
         Some(m) => m
@@ -442,11 +445,14 @@ fn pty_resize(state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String
     }
 }
 
-// Frontend calls this once on mount to get the initial full grid; the reader thread
-// emits incremental "grid-damage" thereafter.
+// Frontend calls this once on mount to paint the initial full grid; the reader thread
+// emits incremental "grid-damage" thereafter. Emits rather than only returning, so the
+// same grid-damage listener paints it (the caller need not apply the return value).
 #[tauri::command]
-fn term_full_repaint(state: State<PtyState>) -> Option<engine::GridDamage> {
-    state.engine.lock().unwrap().as_mut().map(|e| e.full_repaint())
+fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        let _ = app.emit("grid-damage", eng.full_repaint());
+    }
 }
 
 // Settings panel: switch the terminal color table (chrome CSS is handled frontend-side).
@@ -838,6 +844,15 @@ async fn explain_last_error(journal: State<'_, JournalState>) -> Result<String, 
     };
     let cmd = if b.command.is_empty() { "(unknown)" } else { &b.command };
     let prompt = format!("Command: {cmd}\nExit code: {}\nOutput:\n{}", b.exit_code, tail_chars(&b.output, 3000));
+    ai_call(AI_EXPLAIN, &prompt).await
+}
+
+// Per-block explain (⌘B "explain" button): same AI_EXPLAIN prompt as ⌘E, but for an
+// arbitrary journal block the frontend names — so the prompt string lives only here.
+#[tauri::command]
+async fn explain_output(command: String, exit_code: i64, output: String) -> Result<String, String> {
+    let cmd = if command.is_empty() { "(unknown)" } else { &command };
+    let prompt = format!("Command: {cmd}\nExit code: {exit_code}\nOutput:\n{}", tail_chars(&output, 2000));
     ai_call(AI_EXPLAIN, &prompt).await
 }
 
@@ -1489,6 +1504,7 @@ pub fn run() {
             ai_complete,
             nl_to_command,
             explain_last_error,
+            explain_output,
             agent_start,
             agent_decide,
             agent_abort,

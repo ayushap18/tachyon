@@ -40,6 +40,9 @@ pub struct GridDamage {
     pub cols: u16,
     pub rows: u16,
     pub cursor: CursorPayload,
+    // DECCKM: when true, arrow/Home/End keys must be encoded as SS3 (ESC O x) not CSI (ESC [ x),
+    // else curses apps (vim/htop/less) misread them. The frontend key encoder reads this.
+    pub application_cursor: bool,
     pub cells: Vec<CellPayload>,
 }
 
@@ -107,6 +110,9 @@ const fn h(v: u32) -> [u8; 3] {
 
 fn theme_colors(name: &str) -> ColorTable {
     // ANSI order: black,red,green,yellow,blue,magenta,cyan,white, then bright variants.
+    // NOTE: beta (xterm.js) only themed bg/fg/cursor and used xterm's stock 16-color ANSI palette;
+    // these per-theme ANSI tables are a NEW, intentional addition so colored program output
+    // (ls --color, git diff, vim syntax) matches each theme rather than a fixed default set.
     match name {
         "Dracula" => ColorTable::new(
             [
@@ -248,7 +254,7 @@ impl TerminalEngine {
                 }
             }
         }
-        GridDamage { cols: self.cols, rows: self.rows, cursor: self.cursor(), cells }
+        GridDamage { cols: self.cols, rows: self.rows, cursor: self.cursor(), application_cursor: self.parser.screen().application_cursor(), cells }
     }
 
     /// Full snapshot of every cell — the frontend calls this on mount (term_full_repaint).
@@ -262,7 +268,7 @@ impl TerminalEngine {
                 cells.push(cur);
             }
         }
-        GridDamage { cols: self.cols, rows: self.rows, cursor: self.cursor(), cells }
+        GridDamage { cols: self.cols, rows: self.rows, cursor: self.cursor(), application_cursor: self.parser.screen().application_cursor(), cells }
     }
 }
 

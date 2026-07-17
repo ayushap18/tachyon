@@ -4,12 +4,12 @@
 //! indicator maps `state.vim_mode` to a class.
 
 use dioxus::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, VimMode};
-use crate::bridge::invoke;
+use crate::bridge::{invoke, NoArgs};
 
 #[wasm_bindgen]
 extern "C" {
@@ -17,9 +17,6 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "path"], js_name = homeDir, catch)]
     async fn tauri_home_dir() -> Result<JsValue, JsValue>;
 }
-
-#[derive(Serialize)]
-struct NoArgs {}
 
 #[derive(Deserialize, Default)]
 struct ShellContext {

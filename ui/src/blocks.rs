@@ -5,17 +5,12 @@
 
 use dioxus::prelude::*;
 use serde::Serialize;
-use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
-use crate::bridge::invoke;
+use crate::bridge::{clipboard_write, invoke, WriteArgs};
 
-const AI_EXPLAIN: &str =
-    "You are a terminal assistant. Given recent terminal output, explain the most recent error \
-     or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. \
-     You may instead be given the exact failing command, its exit code, and its output. \
-     Plain text only, no markdown.";
+// AI_EXPLAIN lives Rust-side (lib.rs) behind the `explain_output` command — not duplicated here.
 const AI_SUMMARY: &str =
     "Summarize what this terminal session accomplished and flag any failures, \
      in 2-4 sentences. Plain text only, no markdown.";
@@ -27,8 +22,10 @@ struct AiArgs {
 }
 
 #[derive(Serialize)]
-struct PtyWrite {
-    data: String,
+struct ExplainArgs {
+    command: String,
+    exit_code: i64,
+    output: String,
 }
 
 fn fmt_duration(ms: f64) -> String {
@@ -51,22 +48,14 @@ fn block_class(code: i32) -> &'static str {
     }
 }
 
-/// navigator.clipboard.writeText without the web-sys Clipboard feature.
-fn copy_to_clipboard(text: &str) {
-    let Some(win) = web_sys::window() else { return };
-    let get = |o: &JsValue, k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
-    let Some(clip) = get(&win, "navigator").and_then(|n| get(&n, "clipboard")) else { return };
-    if let Some(f) = get(&clip, "writeText").and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
-        let _ = f.call1(&clip, &JsValue::from_str(text));
-    }
-}
-
-/// Ask ai_complete and stash the reply (or the Err string) at journal[i].ai.
-fn explain(state: AppState, i: usize) {
+/// Ask the native `explain_output` command and stash the reply at the block with this id.
+/// Keyed by stable block id (not Vec index) so a journal ring-shift during the async call
+/// can't misattribute the reply — main.ts held a direct object reference for the same reason.
+fn explain(state: AppState, id: u64) {
     let mut j = state.journal;
     let (cmd, code, out) = {
         let mut w = j.write();
-        let Some(b) = w.get_mut(i) else { return };
+        let Some(b) = w.iter_mut().find(|b| b.id == id) else { return };
         if b.ai_pending {
             return;
         }
@@ -74,18 +63,17 @@ fn explain(state: AppState, i: usize) {
         b.ai = Some("thinking…".into());
         (
             b.command.clone(),
-            b.exit_code,
+            b.exit_code as i64,
             b.output.chars().take(2000).collect::<String>(),
         )
     };
-    let cmd = if cmd.is_empty() { "(unknown)".to_string() } else { cmd };
     spawn_local(async move {
-        let user = format!("$ {cmd}\nexit {code}\nOutput:\n{out}");
-        let reply = match invoke("ai_complete", AiArgs { system: AI_EXPLAIN, user }).await {
+        let args = ExplainArgs { command: cmd, exit_code: code, output: out };
+        let reply = match invoke("explain_output", args).await {
             Ok(v) => v.as_string().unwrap_or_default(),
             Err(e) => e.as_string().unwrap_or_else(|| "ai error".into()),
         };
-        if let Some(b) = j.write().get_mut(i) {
+        if let Some(b) = j.write().iter_mut().find(|b| b.id == id) {
             b.ai = Some(reply);
             b.ai_pending = false;
         }
@@ -128,6 +116,7 @@ pub fn BlocksPanel() -> Element {
         let ai = b.ai.clone();
         let ai_pending = b.ai_pending;
         let expanded = b.expanded;
+        let bid = b.id;
         let copied_now = *copied.read() == Some(i);
         rsx! {
             div { class: "block-card {block_class(b.exit_code)}", id: "block-{i}",
@@ -151,7 +140,7 @@ pub fn BlocksPanel() -> Element {
                     div { class: "block-actions",
                         button {
                             disabled: ai_pending,
-                            onclick: move |_| explain(state, i),
+                            onclick: move |_| explain(state, bid),
                             "✦ explain"
                         }
                         button {
@@ -162,14 +151,14 @@ pub fn BlocksPanel() -> Element {
                                 if cmd.is_empty() { return; }
                                 state.close();
                                 // no trailing newline — prefill only, never auto-execute
-                                spawn_local(async move { let _ = invoke("pty_write", PtyWrite { data: cmd }).await; });
+                                spawn_local(async move { let _ = invoke("pty_write", WriteArgs { data: cmd }).await; });
                             },
                             "⟳ rerun"
                         }
                         button {
                             onclick: move |_| {
                                 let out = state.journal.read().get(i).map(|b| b.output.clone()).unwrap_or_default();
-                                copy_to_clipboard(&out);
+                                clipboard_write(&out);
                                 copied.set(Some(i));
                             },
                             if copied_now { "copied" } else { "⎘ copy" }

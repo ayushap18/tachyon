@@ -16,18 +16,12 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
-use crate::bridge::{invoke, listen};
+use crate::bridge::{invoke, listen, NoArgs, WriteArgs};
 
 // ---- invoke arg shapes ----
 #[derive(Serialize)]
-struct NoArgs {}
-#[derive(Serialize)]
 struct RequestArgs {
     request: String,
-}
-#[derive(Serialize)]
-struct WriteArgs {
-    data: String,
 }
 #[derive(Serialize)]
 struct TaskArgs {

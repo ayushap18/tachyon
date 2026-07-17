@@ -10,24 +10,19 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::{AppState, Overlay, VimMode};
-use crate::bridge::invoke;
+use crate::bridge::{invoke, NoArgs, WriteArgs};
 
 #[wasm_bindgen]
 extern "C" {
-    // window.__TAURI__.app.getVersion() -> Promise<string>
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "app"], js_name = getVersion)]
-    fn tauri_get_version() -> js_sys::Promise;
+    // window.__TAURI__.app.getVersion() -> Promise<string>. `catch` so a throw (e.g. the app
+    // namespace missing) is an Err rather than a WASM unwind.
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "app"], js_name = getVersion, catch)]
+    fn tauri_get_version() -> Result<js_sys::Promise, JsValue>;
 }
 
 #[derive(Serialize)]
-struct NoArgs {}
-#[derive(Serialize)]
 struct IdArgs {
     id: String,
-}
-#[derive(Serialize)]
-struct WriteArgs {
-    data: String,
 }
 
 #[derive(Deserialize)]
@@ -115,9 +110,11 @@ pub fn Palette() -> Element {
     // App version (bottom-right), fetched once — best-effort cosmetic.
     use_effect(move || {
         spawn_local(async move {
-            if let Ok(v) = JsFuture::from(tauri_get_version()).await {
-                if let Some(s) = v.as_string() {
-                    version.set(format!("v{s}"));
+            if let Ok(p) = tauri_get_version() {
+                if let Ok(v) = JsFuture::from(p).await {
+                    if let Some(s) = v.as_string() {
+                        version.set(format!("v{s}"));
+                    }
                 }
             }
         });

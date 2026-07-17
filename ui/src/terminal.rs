@@ -10,10 +10,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, KeyboardEvent};
 
-use crate::bridge::{invoke, listen};
+use crate::bridge::{invoke, listen, WriteArgs};
 
 const FONT_PX: f64 = 14.0;
-const FONT_FAMILY: &str = "Menlo, monospace";
 const DEFAULT_FG: [u8; 3] = [0xc0, 0xc6, 0xc6];
 const DEFAULT_BG: [u8; 3] = [0x16, 0x16, 0x1e];
 const CURSOR_COLOR: [u8; 3] = [0xc0, 0xc6, 0xc6];
@@ -47,6 +46,8 @@ struct GridDamage {
     cols: u16,
     rows: u16,
     cursor: Cursor,
+    #[serde(default)]
+    application_cursor: bool,
     cells: Vec<Cell>,
 }
 
@@ -68,12 +69,41 @@ struct Term {
     ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
     dpr: f64,
+    font_px: f64,
+    font_family: String,
     cell_w: f64,
     cell_h: f64,
     cols: u16,
     rows: u16,
     buf: Vec<Cell>,
     cursor: Cursor,
+}
+
+thread_local! {
+    // DECCKM state from the latest grid-damage; read by the keydown handler (which doesn't
+    // hold the Term) to pick SS3 vs CSI arrow encoding. Cell, not RefCell — it's a Copy bool.
+    static APP_CURSOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Font family + pixel size from the persisted settings (localStorage "tachyon-settings").
+/// Falls back to the defaults when unset/unparseable — mirrors settings.rs's seed.
+fn settings_font() -> (f64, String) {
+    let mut px = FONT_PX;
+    let mut family = "Menlo".to_string();
+    if let Some(raw) = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item("tachyon-settings").ok().flatten())
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(s) = v.get("size").and_then(|s| s.as_f64()) {
+                px = s.clamp(9.0, 28.0);
+            }
+            if let Some(f) = v.get("font").and_then(|f| f.as_str()) {
+                family = f.to_string();
+            }
+        }
+    }
+    (px, format!("\"{family}\", monospace"))
 }
 
 fn css(c: [u8; 3]) -> String {
@@ -124,8 +154,8 @@ impl Term {
                 "{}{}{}px {}",
                 if cell.italic { "italic " } else { "" },
                 if cell.bold { "bold " } else { "" },
-                FONT_PX,
-                FONT_FAMILY,
+                self.font_px,
+                self.font_family,
             );
             self.ctx.set_font(&font);
             self.ctx.set_fill_style_str(&css(fg));
@@ -159,7 +189,7 @@ impl Term {
         if let Some(i) = self.idx(line, col) {
             let cell = &self.buf[i];
             if cell.ch != " " && !cell.ch.is_empty() {
-                let font = format!("{}px {}", FONT_PX, FONT_FAMILY);
+                let font = format!("{}px {}", self.font_px, self.font_family);
                 self.ctx.set_font(&font);
                 self.ctx.set_fill_style_str(&css(cell.bg));
                 let _ = self.ctx.fill_text(&cell.ch, x, y);
@@ -182,8 +212,19 @@ impl Term {
             }
         }
         self.cursor = d.cursor;
+        APP_CURSOR.with(|a| a.set(d.application_cursor));
         self.draw_cursor();
         self.publish();
+    }
+
+    /// Change the font (from a settings update) and re-measure the cell box. The caller
+    /// then recomputes cols/rows and resizes the PTY, which triggers a full repaint.
+    fn set_font(&mut self, px: f64, family: String) {
+        self.font_px = px;
+        self.font_family = family;
+        self.ctx.set_font(&format!("{}px {}", self.font_px, self.font_family));
+        self.cell_w = self.ctx.measure_text("M").map(|m| m.width()).unwrap_or(px * 0.6).max(1.0);
+        self.cell_h = (px * 1.2).round();
     }
 
     /// Publish a read-only snapshot of the visible grid for the vim module.
@@ -244,18 +285,27 @@ pub fn grid_view() -> GridView {
 /// (control bytes ride as chars — the native `pty_write` takes a String and
 /// the typed-line reconstruction walks the same chars). Returns None for keys
 /// we don't handle (leave the browser's default).
-fn encode_key(key: &str, ctrl: bool, alt: bool) -> Option<String> {
+fn encode_key(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Option<String> {
+    // Cursor keys: in DECCKM (application cursor) mode, curses apps (vim/htop/less) expect
+    // SS3 (ESC O x); otherwise CSI (ESC [ x). PageUp/Down/Delete are the same in both modes.
+    let ck = if app_cursor { '\u{4f}' } else { '[' }; // 'O' vs '['
+    let cursor = match key {
+        "ArrowUp" => Some(format!("\x1b{ck}A")),
+        "ArrowDown" => Some(format!("\x1b{ck}B")),
+        "ArrowRight" => Some(format!("\x1b{ck}C")),
+        "ArrowLeft" => Some(format!("\x1b{ck}D")),
+        "Home" => Some(format!("\x1b{ck}H")),
+        "End" => Some(format!("\x1b{ck}F")),
+        _ => None,
+    };
+    if let Some(s) = cursor {
+        return Some(s);
+    }
     let named = match key {
         "Enter" => Some("\r"),
         "Backspace" => Some("\x7f"),
         "Tab" => Some("\t"),
         "Escape" => Some("\x1b"),
-        "ArrowUp" => Some("\x1b[A"),
-        "ArrowDown" => Some("\x1b[B"),
-        "ArrowRight" => Some("\x1b[C"),
-        "ArrowLeft" => Some("\x1b[D"),
-        "Home" => Some("\x1b[H"),
-        "End" => Some("\x1b[F"),
         "PageUp" => Some("\x1b[5~"),
         "PageDown" => Some("\x1b[6~"),
         "Delete" => Some("\x1b[3~"),
@@ -290,23 +340,41 @@ fn encode_key(key: &str, ctrl: bool, alt: bool) -> Option<String> {
 // ---- invoke argument shapes ----
 
 #[derive(Serialize)]
-struct Empty {}
-#[derive(Serialize)]
 struct SpawnArgs {
     rows: u16,
     cols: u16,
 }
 #[derive(Serialize)]
-struct WriteArgs {
-    data: String,
-}
-#[derive(Serialize)]
 struct TypedArgs {
     line: String,
+}
+#[derive(Serialize)]
+struct ThemeArgs {
+    name: String,
+}
+
+/// Persisted terminal theme name (localStorage "tachyon-settings"), default Tokyo Night.
+fn settings_theme() -> String {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item("tachyon-settings").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("theme").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "Tokyo Night".into())
 }
 
 fn win() -> web_sys::Window {
     web_sys::window().expect("no window")
+}
+
+/// True when the focused element is a text input (any overlay: ai-bar, palette, settings,
+/// vim search). The terminal's document-level key/paste handlers defer to it in that case.
+fn editable_focused() -> bool {
+    win()
+        .document()
+        .and_then(|d| d.active_element())
+        .map(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT"))
+        .unwrap_or(false)
 }
 
 fn grid_dims(cell_w: f64, cell_h: f64) -> (u16, u16) {
@@ -332,19 +400,22 @@ fn setup() {
         .expect("not a 2d context");
 
     let dpr = win().device_pixel_ratio();
-    // measure a monospace cell.
-    ctx.set_font(&format!("{}px {}", FONT_PX, FONT_FAMILY));
+    // measure a monospace cell at the persisted font/size.
+    let (font_px, font_family) = settings_font();
+    ctx.set_font(&format!("{}px {}", font_px, font_family));
     let cell_w = ctx
         .measure_text("M")
         .map(|m| m.width())
-        .unwrap_or(FONT_PX * 0.6)
+        .unwrap_or(font_px * 0.6)
         .max(1.0);
-    let cell_h = (FONT_PX * 1.2).round();
+    let cell_h = (font_px * 1.2).round();
 
     let term = Rc::new(RefCell::new(Term {
         ctx,
         canvas,
         dpr,
+        font_px,
+        font_family,
         cell_w,
         cell_h,
         cols: 0,
@@ -375,7 +446,7 @@ fn setup() {
             let t = term.borrow();
             let x = 0.0;
             let y = (t.cursor.line as f64 + 1.0).min(t.rows.saturating_sub(1) as f64) * t.cell_h;
-            t.ctx.set_font(&format!("{}px {}", FONT_PX, FONT_FAMILY));
+            t.ctx.set_font(&format!("{}px {}", t.font_px, t.font_family));
             t.ctx.set_fill_style_str(&css([0xff, 0x6b, 0x6b]));
             let _ = t.ctx.fill_text("[process exited]", x, y);
         });
@@ -383,9 +454,13 @@ fn setup() {
 
     // --- spawn the PTY, then request the initial full grid ---
     let (cols, rows) = grid_dims(cell_w, cell_h);
+    let theme = settings_theme();
     wasm_bindgen_futures::spawn_local(async move {
         let _ = invoke("pty_spawn", SpawnArgs { rows, cols }).await;
-        let _ = invoke("term_full_repaint", Empty {}).await;
+        // Apply the persisted theme to the engine now that it exists (fixes the grid rendering
+        // default colors until the user re-touches the theme select). term_set_theme also emits
+        // the initial full grid-damage repaint, so no separate term_full_repaint is needed.
+        let _ = invoke("term_set_theme", ThemeArgs { name: theme }).await;
     });
 
     // --- keyboard input ---
@@ -397,7 +472,14 @@ fn setup() {
             if ev.meta_key() {
                 return;
             }
-            let Some(data) = encode_key(&ev.key(), ev.ctrl_key(), ev.alt_key()) else {
+            // An overlay input (ai-bar / palette / settings / vim search) is focused: its own
+            // handler owns the key. This document-level listener must NOT also write it to the
+            // PTY — otherwise typing (and the agent-approval Enter) leaks straight to the shell.
+            if editable_focused() {
+                return;
+            }
+            let app_cursor = APP_CURSOR.with(|a| a.get());
+            let Some(data) = encode_key(&ev.key(), ev.ctrl_key(), ev.alt_key(), app_cursor) else {
                 return;
             };
             ev.prevent_default();
@@ -412,6 +494,49 @@ fn setup() {
         cb.forget();
     }
 
+    // --- paste (Cmd+V): the native `paste` event fires even though keydown ignores ⌘-chords;
+    // forward the clipboard text to the PTY, but not while an overlay input is focused. ---
+    {
+        let typed = typed.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::ClipboardEvent| {
+            if editable_focused() {
+                return;
+            }
+            let Some(text) = ev.clipboard_data().and_then(|d| d.get_data("text/plain").ok()) else {
+                return;
+            };
+            if text.is_empty() {
+                return;
+            }
+            ev.prevent_default();
+            reconstruct_typed_line(&typed, &text);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = invoke("pty_write", WriteArgs { data: text }).await;
+            });
+        }) as Box<dyn FnMut(web_sys::ClipboardEvent)>);
+        let _ = document.add_event_listener_with_callback("paste", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // --- live font/size changes from the settings panel (dispatches "tachyon-font") ---
+    {
+        let term = term.clone();
+        let cb = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
+            let (px, family) = settings_font();
+            let (cols, rows) = {
+                let mut t = term.borrow_mut();
+                t.set_font(px, family);
+                grid_dims(t.cell_w, t.cell_h)
+            };
+            // resizing the PTY makes the native side emit a full grid-damage repaint.
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
+            });
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        let _ = win().add_event_listener_with_callback("tachyon-font", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
     // --- window resize: recompute grid, resize PTY, force a full repaint ---
     {
         let term = term.clone();
@@ -421,9 +546,9 @@ fn setup() {
                 (t.cell_w, t.cell_h)
             };
             let (cols, rows) = grid_dims(cell_w, cell_h);
+            // pty_resize emits a full grid-damage repaint from the native side.
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
-                let _ = invoke("term_full_repaint", Empty {}).await;
             });
         }) as Box<dyn FnMut(web_sys::Event)>);
         let _ = win().add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
@@ -469,26 +594,32 @@ mod tests {
 
     #[test]
     fn key_encoding() {
-        assert_eq!(encode_key("a", false, false).as_deref(), Some("a"));
-        assert_eq!(encode_key("Enter", false, false).as_deref(), Some("\r"));
-        assert_eq!(encode_key("Backspace", false, false).as_deref(), Some("\x7f"));
-        assert_eq!(encode_key("Tab", false, false).as_deref(), Some("\t"));
-        assert_eq!(encode_key("Escape", false, false).as_deref(), Some("\x1b"));
-        assert_eq!(encode_key("ArrowUp", false, false).as_deref(), Some("\x1b[A"));
-        assert_eq!(encode_key("ArrowDown", false, false).as_deref(), Some("\x1b[B"));
-        assert_eq!(encode_key("ArrowRight", false, false).as_deref(), Some("\x1b[C"));
-        assert_eq!(encode_key("ArrowLeft", false, false).as_deref(), Some("\x1b[D"));
-        assert_eq!(encode_key("Home", false, false).as_deref(), Some("\x1b[H"));
-        assert_eq!(encode_key("End", false, false).as_deref(), Some("\x1b[F"));
-        assert_eq!(encode_key("PageUp", false, false).as_deref(), Some("\x1b[5~"));
+        // normal-cursor (CSI) mode
+        assert_eq!(encode_key("a", false, false, false).as_deref(), Some("a"));
+        assert_eq!(encode_key("Enter", false, false, false).as_deref(), Some("\r"));
+        assert_eq!(encode_key("Backspace", false, false, false).as_deref(), Some("\x7f"));
+        assert_eq!(encode_key("Tab", false, false, false).as_deref(), Some("\t"));
+        assert_eq!(encode_key("Escape", false, false, false).as_deref(), Some("\x1b"));
+        assert_eq!(encode_key("ArrowUp", false, false, false).as_deref(), Some("\x1b[A"));
+        assert_eq!(encode_key("ArrowDown", false, false, false).as_deref(), Some("\x1b[B"));
+        assert_eq!(encode_key("ArrowRight", false, false, false).as_deref(), Some("\x1b[C"));
+        assert_eq!(encode_key("ArrowLeft", false, false, false).as_deref(), Some("\x1b[D"));
+        assert_eq!(encode_key("Home", false, false, false).as_deref(), Some("\x1b[H"));
+        assert_eq!(encode_key("End", false, false, false).as_deref(), Some("\x1b[F"));
+        assert_eq!(encode_key("PageUp", false, false, false).as_deref(), Some("\x1b[5~"));
+        // application-cursor (DECCKM) mode: SS3 (ESC O x) for cursor keys
+        assert_eq!(encode_key("ArrowUp", false, false, true).as_deref(), Some("\x1bOA"));
+        assert_eq!(encode_key("End", false, false, true).as_deref(), Some("\x1bOF"));
+        // PageUp is mode-independent
+        assert_eq!(encode_key("PageUp", false, false, true).as_deref(), Some("\x1b[5~"));
         // Ctrl-C = 0x03, Ctrl-U = 0x15, Ctrl-A = 0x01
-        assert_eq!(encode_key("c", true, false).as_deref(), Some("\x03"));
-        assert_eq!(encode_key("u", true, false).as_deref(), Some("\x15"));
-        assert_eq!(encode_key("A", true, false).as_deref(), Some("\x01"));
+        assert_eq!(encode_key("c", true, false, false).as_deref(), Some("\x03"));
+        assert_eq!(encode_key("u", true, false, false).as_deref(), Some("\x15"));
+        assert_eq!(encode_key("A", true, false, false).as_deref(), Some("\x01"));
         // Alt/meta prefix
-        assert_eq!(encode_key("b", false, true).as_deref(), Some("\x1bb"));
+        assert_eq!(encode_key("b", false, true, false).as_deref(), Some("\x1bb"));
         // Unhandled modifiers/keys
-        assert_eq!(encode_key("Shift", false, false), None);
-        assert_eq!(encode_key("F5", false, false), None);
+        assert_eq!(encode_key("Shift", false, false, false), None);
+        assert_eq!(encode_key("F5", false, false, false), None);
     }
 }
