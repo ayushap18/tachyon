@@ -1,6 +1,6 @@
 [package]
 name = "tachyon"
-version = "0.1.4-beta.2"
+version = "0.1.5-beta"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

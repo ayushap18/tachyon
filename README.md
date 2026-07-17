@@ -26,7 +26,7 @@ Slash commands (`/keys`, `/key`, `/use`, `/model`, `/local`, `/mcp add|remove|li
 
 A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 
-- **Real terminal first** — a native app (Tauri + Rust) driving a real shell through a PTY, rendered with xterm.js
+- **Real terminal first** — a native app (Tauri + Rust) driving a real shell through a PTY, with a Rust-side `vt100` engine that owns the screen grid and paints it to a canvas
 - **Natural language → commands** — type *"undo my last commit but keep the changes"* and get the right `git` incantation, aware of your cwd, git state, and recent history
 - **Agent mode** — describe a multi-step task, the agent plans the commands, shows them, and executes step-by-step with explicit approve/deny gates
 - **Error autopsy** — when a command fails, one keystroke explains the actual stderr and suggests a fix
@@ -39,37 +39,40 @@ A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 |-------|--------|
 | Shell/PTY | Rust, `portable-pty` |
 | App shell | Tauri 2 |
-| Rendering | xterm.js |
-| Frontend | TypeScript + Vite |
+| Terminal engine | Rust, `vt100` (grid/scrollback/cursor) |
+| Rendering | canvas 2D painter, per-cell |
+| Frontend | Rust + Dioxus (WASM) |
 
-The terminal emulator layer deliberately reuses xterm.js instead of a custom GPU renderer — the interesting problems here are the AI layer, context management, and safety, not reimplementing VT100 parsing.
+The entire frontend is Rust: Dioxus components compiled to WASM host the chrome and paint a `<canvas>`. VT100/ANSI parsing lives Rust-side (`vt100`, the same engine family as many Rust terminals) — the app feeds PTY bytes to it and ships only the changed cells (`grid-damage`) to the painter. No JavaScript, no xterm.js.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph WV["Webview — TypeScript"]
-    XT["xterm.js<br/>rendering + input"]
-    OSC["OSC 133 scanner<br/>command journal"]
+  subgraph WV["Webview — Rust/WASM (Dioxus)"]
+    XT["canvas painter<br/>grid-damage → cells + input"]
     UI["⌘K bar · ⌘J agent · ⌘E autopsy<br/>⌘P palette · ⌘B blocks + minimap"]
   end
   subgraph RS["Rust — Tauri backend"]
     PTY["PTY<br/>portable-pty"]
+    ENG["vt100 engine<br/>grid + damage diff"]
+    OSC["OSC 133 scanner<br/>command journal"]
     INJ["zsh OSC 133<br/>hook injection"]
     REG["provider registry<br/>keys + models"]
     GATE["danger gate<br/>check_dangerous"]
     MCP["MCP client<br/>JSON-RPC / Streamable HTTP"]
   end
-  XT <-- "pty_write / pty-output (Tauri IPC)" --> PTY
+  XT <-- "pty_write / grid-damage (Tauri IPC)" --> ENG
+  ENG --- PTY
   PTY --- INJ
-  XT -- "decoded byte copy" --> OSC
+  PTY -- "raw bytes" --> OSC
   OSC --> UI
   UI -- "provider_active · check_dangerous · mcp_call (IPC)" --> REG & GATE & MCP
   UI -- "HTTPS chat/completions · Anthropic SDK" --> EXT[("AI providers<br/>Claude · Groq · Gemini · local …")]
   MCP --> SRV[("remote MCP servers")]
 ```
 
-AI HTTP calls go straight from the webview's `askAi` to the provider, using keys fetched from the Rust registry over IPC; the PTY, zsh hook injection, danger gate, and MCP client live Rust-side.
+All business logic lives Rust-side: the PTY, the vt100 terminal engine, AI completion (`ai_complete` over `reqwest` — keys never touch the webview), zsh hook injection, the danger gate, and the MCP client. The Dioxus/WASM frontend only paints and forwards input.
 
 ## Status
 
@@ -77,7 +80,8 @@ AI HTTP calls go straight from the webview's `askAi` to the provider, using keys
 
 ## Roadmap
 
-- [x] Project scaffold (Tauri + xterm.js + portable-pty)
+- [x] Project scaffold (Tauri + portable-pty)
+- [x] **v0.1.5: pure-Rust frontend** — Dioxus/WASM chrome + a Rust `vt100` engine painting a canvas; xterm.js, Vite, and all TypeScript removed
 - [x] Working terminal: PTY spawn, output streaming, input handling
 - [x] Context collector (cwd, git branch/dirty state, shell pid) + status bar
 - [x] Natural language → command generation (⌘K bar; Claude or Groq via API key)
