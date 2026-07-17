@@ -29,6 +29,8 @@ body {
 
 canvas#term {
   display: block;
+  width: 100vw;
+  height: 100vh;
 }
 
 /* AI command / agent bar — docked above the status bar (fixed so the canvas

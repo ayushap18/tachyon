@@ -113,6 +113,32 @@ fn css(c: [u8; 3]) -> String {
     format!("rgb({},{},{})", c[0], c[1], c[2])
 }
 
+fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim().strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&s[0..2], 16).ok()?,
+        u8::from_str_radix(&s[2..4], 16).ok()?,
+        u8::from_str_radix(&s[4..6], 16).ok()?,
+    ])
+}
+
+/// The active theme's terminal background, read from the `--bg` CSS variable that
+/// theme::apply_theme sets on :root. Used to fill the full canvas so the sub-cell
+/// margin (and any resize flash) matches the theme instead of a hardcoded color.
+fn doc_bg() -> [u8; 3] {
+    web_sys::window()
+        .and_then(|w| {
+            let el = w.document()?.document_element()?;
+            w.get_computed_style(&el).ok().flatten()
+        })
+        .and_then(|s| s.get_property_value("--bg").ok())
+        .and_then(|v| parse_hex(&v))
+        .unwrap_or(DEFAULT_BG)
+}
+
 /// Row-major linear selection text over trailing-trimmed row strings, between
 /// anchor `a` and focus `b` (each (row, col)). Mirrors vim.rs selection_text ordering.
 fn linear_selection(lines: &[String], a: (u16, u16), b: (u16, u16)) -> String {
@@ -150,36 +176,60 @@ impl Term {
         }
     }
 
-    /// Reallocate the buffer and resize the canvas to a fresh full frame.
+    /// Cell rect snapped to integer CSS px so a cell's right/bottom edge equals the
+    /// next cell's left/top edge exactly (no anti-aliasing seam). Returns (x, y, w, h).
+    fn cell_px(&self, col: u16, line: u16) -> (f64, f64, f64, f64) {
+        let x0 = (col as f64 * self.cell_w).round();
+        let x1 = ((col + 1) as f64 * self.cell_w).round();
+        let y0 = (line as f64 * self.cell_h).round();
+        let y1 = ((line + 1) as f64 * self.cell_h).round();
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+
+    /// Size the canvas to the window, paint it the theme bg, and return the grid
+    /// (cols, rows) that fit. The <1-cell right/bottom remainder stays theme bg.
+    fn fit(&mut self) -> (u16, u16) {
+        // Re-read DPR each fit so moving to a different-density display stays crisp.
+        self.dpr = win().device_pixel_ratio();
+        let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        self.canvas.set_width((w * self.dpr).round() as u32);
+        self.canvas.set_height((h * self.dpr).round() as u32);
+        let style = self.canvas.style();
+        let _ = style.set_property("width", &format!("{}px", w));
+        let _ = style.set_property("height", &format!("{}px", h));
+        // canvas resize resets the transform; re-apply DPR scaling + baseline.
+        let _ = self.ctx.scale(self.dpr, self.dpr);
+        self.ctx.set_text_baseline("top");
+        self.ctx.set_fill_style_str(&css(doc_bg()));
+        self.ctx.fill_rect(0.0, 0.0, w, h);
+        let cols = (w / self.cell_w).floor().max(1.0) as u16;
+        let rows = (h / self.cell_h).floor().max(1.0) as u16;
+        (cols, rows)
+    }
+
+    /// Reallocate the buffer for a fresh full frame. The canvas element size is
+    /// owned by `fit`; here we just repaint the whole window-sized canvas to theme
+    /// bg so a shrunk grid leaves no stale cells and the margin stays bg.
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
         self.buf = vec![blank_cell(); cols as usize * rows as usize];
-        let px_w = self.cell_w * cols as f64;
-        let px_h = self.cell_h * rows as f64;
-        self.canvas.set_width((px_w * self.dpr) as u32);
-        self.canvas.set_height((px_h * self.dpr) as u32);
-        let style = self.canvas.style();
-        let _ = style.set_property("width", &format!("{}px", px_w));
-        let _ = style.set_property("height", &format!("{}px", px_h));
-        // canvas resize resets the transform; re-apply DPR scaling.
-        let _ = self.ctx.scale(self.dpr, self.dpr);
-        self.ctx.set_text_baseline("top");
-        // clear to default background
-        self.ctx.set_fill_style_str(&css(DEFAULT_BG));
-        self.ctx.fill_rect(0.0, 0.0, px_w, px_h);
+        let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        self.ctx.set_fill_style_str(&css(doc_bg()));
+        self.ctx.fill_rect(0.0, 0.0, w, h);
     }
 
     fn draw_cell(&self, line: u16, col: u16, cell: &Cell) {
-        let x = col as f64 * self.cell_w;
-        let y = line as f64 * self.cell_h;
+        let (x, y, w, h) = self.cell_px(col, line);
         let (fg, bg) = if cell.inverse {
             (cell.bg, cell.fg)
         } else {
             (cell.fg, cell.bg)
         };
         self.ctx.set_fill_style_str(&css(bg));
-        self.ctx.fill_rect(x, y, self.cell_w, self.cell_h);
+        self.ctx.fill_rect(x, y, w, h);
         if cell.ch != " " && !cell.ch.is_empty() {
             let font = format!(
                 "{}{}{}px {}",
@@ -194,7 +244,7 @@ impl Term {
         }
         if cell.underline {
             self.ctx.set_fill_style_str(&css(fg));
-            self.ctx.fill_rect(x, y + self.cell_h - 1.0, self.cell_w, 1.0);
+            self.ctx.fill_rect(x, y + h - 1.0, w, 1.0);
         }
     }
 
@@ -213,10 +263,9 @@ impl Term {
         if self.idx(line, col).is_none() {
             return;
         }
-        let x = col as f64 * self.cell_w;
-        let y = line as f64 * self.cell_h;
+        let (x, y, w, h) = self.cell_px(col, line);
         self.ctx.set_fill_style_str(&css(CURSOR_COLOR));
-        self.ctx.fill_rect(x, y, self.cell_w, self.cell_h);
+        self.ctx.fill_rect(x, y, w, h);
         if let Some(i) = self.idx(line, col) {
             let cell = &self.buf[i];
             if cell.ch != " " && !cell.ch.is_empty() {
@@ -264,10 +313,9 @@ impl Term {
         for r in s.0..=e.0 {
             let sc = if r == s.0 { s.1 } else { 0 };
             let ec = if r == e.0 { e.1 } else { self.cols.saturating_sub(1) };
-            let x = sc as f64 * self.cell_w;
-            let w = (ec.saturating_sub(sc) + 1) as f64 * self.cell_w;
-            let y = r as f64 * self.cell_h;
-            self.ctx.fill_rect(x, y, w, self.cell_h);
+            let (x, y, _, h) = self.cell_px(sc, r);
+            let (x1, _, w1, _) = self.cell_px(ec, r);
+            self.ctx.fill_rect(x, y, x1 + w1 - x, h);
         }
     }
 
@@ -472,14 +520,6 @@ fn editable_focused() -> bool {
         .unwrap_or(false)
 }
 
-fn grid_dims(cell_w: f64, cell_h: f64) -> (u16, u16) {
-    let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-    let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
-    let cols = (w / cell_w).floor().max(1.0) as u16;
-    let rows = (h / cell_h).floor().max(1.0) as u16;
-    (cols, rows)
-}
-
 fn setup() {
     let document = win().document().expect("no document");
     let canvas: HtmlCanvasElement = document
@@ -541,8 +581,8 @@ fn setup() {
         let term = term.clone();
         listen("pty-exit", move |_| {
             let t = term.borrow();
-            let x = 0.0;
-            let y = (t.cursor.line as f64 + 1.0).min(t.rows.saturating_sub(1) as f64) * t.cell_h;
+            let row = (t.cursor.line + 1).min(t.rows.saturating_sub(1));
+            let (x, y, _, _) = t.cell_px(0, row);
             t.ctx.set_font(&format!("{}px {}", t.font_px, t.font_family));
             t.ctx.set_fill_style_str(&css([0xff, 0x6b, 0x6b]));
             let _ = t.ctx.fill_text("[process exited]", x, y);
@@ -550,7 +590,7 @@ fn setup() {
     }
 
     // --- spawn the PTY, then request the initial full grid ---
-    let (cols, rows) = grid_dims(cell_w, cell_h);
+    let (cols, rows) = term.borrow_mut().fit();
     let theme = settings_theme();
     wasm_bindgen_futures::spawn_local(async move {
         let _ = invoke("pty_spawn", SpawnArgs { rows, cols }).await;
@@ -703,7 +743,7 @@ fn setup() {
             let (cols, rows) = {
                 let mut t = term.borrow_mut();
                 t.set_font(px, family);
-                grid_dims(t.cell_w, t.cell_h)
+                t.fit()
             };
             // resizing the PTY makes the native side emit a full grid-damage repaint.
             wasm_bindgen_futures::spawn_local(async move {
@@ -714,21 +754,30 @@ fn setup() {
         cb.forget();
     }
 
-    // --- window resize: recompute grid, resize PTY, force a full repaint ---
+    // --- resize: a ResizeObserver on <html> refits the canvas and resizes the PTY.
+    // More reliable than the window "resize" event across the macOS fullscreen settle. ---
     {
         let term = term.clone();
-        let cb = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
-            let (cell_w, cell_h) = {
-                let t = term.borrow();
-                (t.cell_w, t.cell_h)
-            };
-            let (cols, rows) = grid_dims(cell_w, cell_h);
+        // ResizeObserver fires once automatically on observe(); setup() already did the initial
+        // fit(), so skip that first callback to avoid a redundant wipe-repaint flicker at launch.
+        let first = std::rc::Rc::new(std::cell::Cell::new(true));
+        let cb = Closure::wrap(Box::new(move |_: js_sys::Array, _: web_sys::ResizeObserver| {
+            if first.replace(false) {
+                return;
+            }
+            let (cols, rows) = term.borrow_mut().fit();
             // pty_resize emits a full grid-damage repaint from the native side.
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
             });
-        }) as Box<dyn FnMut(web_sys::Event)>);
-        let _ = win().add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        })
+            as Box<dyn FnMut(js_sys::Array, web_sys::ResizeObserver)>);
+        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+            if let Some(root) = document.document_element() {
+                observer.observe(&root);
+            }
+            std::mem::forget(observer);
+        }
         cb.forget();
     }
 }

@@ -34,6 +34,8 @@ features = [
     "DataTransfer",
     "Event",
     "EventTarget",
+    "ResizeObserver",
+    "ResizeObserverEntry",
 ]
 
 [profile.release]
