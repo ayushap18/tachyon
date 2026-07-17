@@ -1,4 +1,6 @@
 use std::io::{Read, Write};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -99,12 +101,12 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     *master_slot = Some(pair.master);
 
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 65536];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let _ = app.emit("pty-output", buf[..n].to_vec());
+                    let _ = app.emit("pty-output", STANDARD.encode(&buf[..n]));
                 }
             }
         }
@@ -741,5 +743,14 @@ mod tests {
         s.merge_defaults();
         assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().key, "keep");
         assert!(s.providers.iter().any(|p| p.id == "mistral"));
+    }
+
+    #[test]
+    fn pty_output_base64_roundtrip() {
+        // bytes exercise non-ASCII + padding, like real pty chunks
+        let bytes: &[u8] = b"hi\x1b]133;A\x07\xff\x00";
+        let enc = STANDARD.encode(bytes);
+        assert_eq!(enc, "aGkbXTEzMztBB/8A");
+        assert_eq!(STANDARD.decode(&enc).unwrap(), bytes);
     }
 }

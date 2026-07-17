@@ -471,3 +471,26 @@ body {
 .mm-seg:hover {
   outline: 1px solid var(--fg);
 }
+
+/* Vim mode indicator */
+#status-vim { font-weight: 600; letter-spacing: 0.04em; flex: none; }
+#status-vim.normal { color: var(--accent); }
+#status-vim.visual { color: var(--ok); }
+
+/* Vim search input (/) — docked above the status bar */
+#vim-search {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 26px;
+  box-sizing: border-box;
+  padding: 6px 12px;
+  font: 12px Menlo, monospace;
+  color: var(--fg);
+  background: var(--surface);
+  border: none;
+  border-top: 1px solid var(--accent);
+  outline: none;
+  z-index: 10;
+}
+#vim-search[hidden] { display: none; }

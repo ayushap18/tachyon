@@ -17,6 +17,7 @@ An AI-native terminal, inspired by Warp — built from scratch to learn how mode
 | ⌘E | Explain last error |
 | ⌘P | Command palette (actions · providers · history) |
 | ⌘B | Block navigator (session blocks, per-block AI, health minimap) |
+| ⌘⇧V | Vim mode (normal/visual navigation over the buffer; `i`/`a`/`Esc` to insert) |
 | ⌘, | Settings |
 
 Slash commands (`/keys`, `/key`, `/use`, `/model`, `/local`, `/mcp add|remove|list`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
@@ -87,6 +88,8 @@ AI HTTP calls go straight from the webview's `askAi` to the provider, using keys
 - [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
 - [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
 - [x] Block navigator (⌘B): session blocks with per-block AI explain, rerun/copy, health minimap, AI session summary
+- [x] Faster PTY I/O: 64 KB reads + base64 transfer (v0.1.1)
+- [x] Vim mode (⌘⇧V): normal/visual navigation over the buffer — `hjkl w b 0 $ gg G ⌃d ⌃u`, `/ n N` search, `v`+`y` yank (v0.1.1)
 
 ## Eval results
 

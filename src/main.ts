@@ -4,6 +4,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import Anthropic from "@anthropic-ai/sdk";
+import { initVim } from "./vim";
 import "@xterm/xterm/css/xterm.css";
 
 const AI_SYSTEM =
@@ -1026,9 +1027,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (seg) openBlocks(Number(seg.dataset.idx));
   };
 
-  // pty bridge
-  await listen<number[]>("pty-output", (e) => {
-    const bytes = new Uint8Array(e.payload);
+  // pty bridge — payload is base64 (STANDARD, padded) from the Rust reader thread
+  function b64ToBytes(s: string): Uint8Array {
+    const bin = atob(s);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  await listen<string>("pty-output", (e) => {
+    const bytes = b64ToBytes(e.payload);
     term.write(bytes); // live output — always first, never gated, never stripped
     const text = dec.decode(bytes, { stream: true });
     feedOsc(text); // OSC 133 scanner works on a decoded copy
@@ -1073,6 +1080,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   // status bar
   const statusCwd = document.getElementById("status-cwd")!;
   const statusGit = document.getElementById("status-git")!;
+  initVim({
+    term,
+    statusEl: document.getElementById("status-vim")!,
+    searchEl: document.getElementById("vim-search") as HTMLInputElement,
+  });
   const home = (await homeDir()).replace(/\/$/, "");
   let ctxTimer: number | undefined;
 
