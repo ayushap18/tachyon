@@ -28,4 +28,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 base64 = "0.22"
 # names the sync/time primitives only — tauri 2 already owns the runtime
 tokio = { version = "1", features = ["sync", "time"] }
+# terminal engine: owns the grid/scrollback/cursor; we feed it PTY bytes and paint the grid
+vt100 = "0.15"
 

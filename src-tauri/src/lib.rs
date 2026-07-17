@@ -1,3 +1,5 @@
+mod engine;
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 
@@ -14,6 +16,8 @@ struct PtyState {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
     shell_pid: Mutex<Option<u32>>,
+    // owns the grid: fed the same PTY bytes the base64 path emits, painted as "grid-damage"
+    engine: Mutex<Option<engine::TerminalEngine>>,
 }
 
 #[derive(serde::Serialize)]
@@ -377,9 +381,11 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     *state.shell_pid.lock().unwrap() = child.process_id();
     *state.child.lock().unwrap() = Some(child);
     *master_slot = Some(pair.master);
+    *state.engine.lock().unwrap() = Some(engine::TerminalEngine::new(cols, rows));
 
     std::thread::spawn(move || {
         let journal = app.state::<JournalState>();
+        let pty = app.state::<PtyState>();
         let mut buf = [0u8; 65536];
         loop {
             match reader.read(&mut buf) {
@@ -388,6 +394,12 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
                     // live output — always first, base64, byte-identical; the OSC scan
                     // below is an ADDITIONAL consumer of the same immutable slice
                     let _ = app.emit("pty-output", STANDARD.encode(&buf[..n]));
+                    // grid engine: same bytes -> screen model -> only changed cells painted.
+                    // Emit every chunk (empty cells + fresh cursor) so the cursor stays live.
+                    if let Some(eng) = pty.engine.lock().unwrap().as_mut() {
+                        eng.feed(&buf[..n]);
+                        let _ = app.emit("grid-damage", eng.take_damage());
+                    }
                     let finalized = journal.scanner.lock().unwrap().feed(&buf[..n]);
                     for block in finalized {
                         journal_push(&journal.blocks, &block); // no lock held across emit
@@ -419,11 +431,30 @@ fn pty_write(state: State<PtyState>, data: String) -> Result<(), String> {
 
 #[tauri::command]
 fn pty_resize(state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        eng.resize(cols, rows);
+    }
     match state.master.lock().unwrap().as_ref() {
         Some(m) => m
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string()),
         None => Err("pty not spawned".into()),
+    }
+}
+
+// Frontend calls this once on mount to get the initial full grid; the reader thread
+// emits incremental "grid-damage" thereafter.
+#[tauri::command]
+fn term_full_repaint(state: State<PtyState>) -> Option<engine::GridDamage> {
+    state.engine.lock().unwrap().as_mut().map(|e| e.full_repaint())
+}
+
+// Settings panel: switch the terminal color table (chrome CSS is handled frontend-side).
+#[tauri::command]
+fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String) {
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        eng.set_theme(&name);
+        let _ = app.emit("grid-damage", eng.full_repaint());
     }
 }
 
@@ -871,7 +902,7 @@ fn parse_rpc_result(body: &str, content_type: &str) -> Result<serde_json::Value,
     let payload = if content_type.contains("text/event-stream") {
         body.lines()
             .filter_map(|l| l.strip_prefix("data:"))
-            .last()
+            .next_back()
             .ok_or("no data line in SSE response")?
             .trim()
             .to_string()
@@ -1442,6 +1473,8 @@ pub fn run() {
             pty_spawn,
             pty_write,
             pty_resize,
+            term_full_repaint,
+            term_set_theme,
             set_typed_command,
             journal_blocks,
             last_failed_block,
