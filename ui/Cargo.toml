@@ -26,6 +26,7 @@ features = [
     "CanvasRenderingContext2d",
     "TextMetrics",
     "CssStyleDeclaration",
+    "Storage",
     "KeyboardEvent",
     "Event",
     "EventTarget",

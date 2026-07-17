@@ -1,17 +1,521 @@
-html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background: #16161e;
+/* Theme tokens — defaults (Tokyo Night); overridden per-theme at runtime by
+   theme::apply_theme (mirrors main.ts applySettings). */
+:root {
+  --bg: #16161e;
+  --fg: #c0caf5;
+  --accent: #7aa2f7;
+  --surface: #1a1b26;
+  --surface-alt: #24283b;
+  --border: #2a2e42;
+  --muted: #7b849c;
+  --ok: #9ece6a;
+  --err: #f7768e;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
 }
 
 #main {
-    width: 100%;
-    height: 100%;
+  width: 100%;
+  height: 100%;
 }
 
 canvas#term {
-    display: block;
+  display: block;
+}
+
+/* AI command / agent bar — docked above the status bar (fixed so the canvas
+   terminal keeps sizing to the full window; layout integration is deferred). */
+#ai-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 26px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  background: var(--surface);
+  border-top: 1px solid var(--accent);
+  font: 12px Menlo, monospace;
+  z-index: 8;
+}
+
+#ai-icon {
+  color: var(--accent);
+}
+
+#ai-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--fg);
+  font: inherit;
+}
+
+#ai-status {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+
+#ai-bar.danger {
+  border-top-color: var(--err);
+}
+
+#ai-bar.danger #ai-icon,
+#ai-bar.danger #ai-status {
+  color: var(--err);
+}
+
+#ai-bar.agent {
+  border-top-color: var(--ok);
+}
+
+#ai-bar.agent #ai-icon {
+  color: var(--ok);
+}
+
+/* danger must beat agent: id + 2 classes = higher specificity, placed later */
+#ai-bar.agent.danger {
+  border-top-color: var(--err);
+}
+
+#ai-bar.agent.danger #ai-icon,
+#ai-bar.agent.danger #ai-status {
+  color: var(--err);
+}
+
+/* Status bar — fixed at the bottom edge. */
+#status-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 26px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-sizing: border-box;
+  background: var(--surface);
+  color: var(--muted);
+  font: 12px Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  z-index: 8;
+}
+
+#status-bar #status-cwd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Settings */
+#settings-btn {
+  position: fixed;
+  top: 8px;
+  right: 12px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  opacity: 0.5;
+  z-index: 8;
+}
+
+#settings-btn:hover {
+  opacity: 1;
+}
+
+#settings {
+  position: fixed;
+  top: 34px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font: 13px -apple-system, sans-serif;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 9;
+}
+
+#settings label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+#settings select,
+#settings input {
+  background: var(--surface-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+#settings input {
+  width: 52px;
+}
+
+/* Command palette (⌘P) */
+#palette {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 12vh;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 10;
+}
+
+#palette-input {
+  width: min(560px, 86vw);
+  box-sizing: border-box;
+  padding: 12px 14px;
+  font: 14px Menlo, monospace;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 8px 8px 0 0;
+  outline: none;
+}
+
+#palette-list {
+  width: min(560px, 86vw);
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  box-sizing: border-box;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+}
+
+#palette-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  color: var(--fg);
+  font: 13px Menlo, monospace;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#palette-list li .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#palette-list li .hint {
+  color: var(--muted);
+  flex: none;
+}
+
+#palette-list li.sel,
+#palette-list li:hover {
+  background: var(--surface-alt);
+}
+
+#palette-version {
+  width: min(560px, 86vw);
+  box-sizing: border-box;
+  margin-top: 6px;
+  padding: 0 4px;
+  text-align: right;
+  color: var(--muted);
+  font: 10px Menlo, monospace;
+  opacity: 0.7;
+}
+
+/* Block navigator (⌘B) + session-health minimap */
+#blocks {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(40vw, 560px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 9; /* below #palette (10) so ⌘P stays on top */
+  font: 13px Menlo, monospace;
+  color: var(--fg);
+  outline: none;
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.25);
+}
+
+#blocks-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+#blocks-title {
+  flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+#blocks-header button {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  font: 12px Menlo, monospace;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+#blocks-header button:hover {
+  border-color: var(--accent);
+}
+
+#blocks-header #blocks-close {
+  border: none;
+  background: none;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+#blocks-summary {
+  margin: 8px;
+  padding: 10px;
+  background: var(--surface-alt);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  color: var(--fg);
+  white-space: pre-wrap;
+}
+
+#blocks-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 14px 8px 8px; /* right padding keeps the scrollbar clear of the minimap rail */
+}
+
+.block-card {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  scroll-margin: 8px;
+}
+
+.block-stripe {
+  flex: none;
+  width: 3px;
+  border-radius: 2px;
+  align-self: stretch;
+}
+
+.block-card.ok .block-stripe {
+  background: var(--ok);
+}
+
+.block-card.err .block-stripe {
+  background: var(--err);
+}
+
+.block-card.unk .block-stripe {
+  background: var(--muted);
+}
+
+.block-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.block-cmd {
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg);
+}
+
+.block-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 2px 0 6px;
+}
+
+.block-out {
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.block-expand {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: 11px Menlo, monospace;
+  padding: 2px 0;
+}
+
+.block-ai {
+  margin-top: 6px;
+  padding: 8px;
+  background: var(--surface-alt);
+  border-left: 3px solid var(--accent);
+  color: var(--fg);
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.block-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.block-actions button {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font: 11px Menlo, monospace;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.block-actions button:hover {
+  border-color: var(--accent);
+}
+
+.block-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.block-empty {
+  color: var(--muted);
+  padding: 24px;
+  text-align: center;
+}
+
+/* Session-health minimap rail */
+#minimap {
+  position: fixed;
+  top: 40px; /* clears the ⚙ settings button */
+  right: 1px;
+  bottom: 34px; /* clears the status bar */
+  width: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  z-index: 11; /* stays clickable over the open panel */
+  opacity: 0.5;
+  transition: opacity 0.15s;
+}
+
+#minimap:hover {
+  opacity: 1;
+}
+
+.mm-seg {
+  flex: 1;
+  min-height: 3px;
+  max-height: 14px;
+  border-radius: 1px;
+  cursor: pointer;
+}
+
+.mm-seg.ok {
+  background: var(--ok);
+}
+
+.mm-seg.err {
+  background: var(--err);
+}
+
+.mm-seg.unk {
+  background: var(--muted);
+}
+
+.mm-seg:hover {
+  outline: 1px solid var(--fg);
+}
+
+/* Vim mode indicator */
+#status-vim {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  flex: none;
+}
+#status-vim.normal {
+  color: var(--accent);
+}
+#status-vim.visual {
+  color: var(--ok);
+}
+
+/* Vim search input (/) — docked above the status bar */
+#vim-search {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 26px;
+  box-sizing: border-box;
+  padding: 6px 12px;
+  font: 12px Menlo, monospace;
+  color: var(--fg);
+  background: var(--surface);
+  border: none;
+  border-top: 1px solid var(--accent);
+  outline: none;
+  z-index: 10;
+}
+#vim-search[hidden] {
+  display: none;
+}
+
+/* Vim navigation overlay — cursor cell / visual selection highlights, painted
+   as a DOM layer over the canvas (below the ai/status bars at z-index 8). */
+#vim-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 7;
+}
+.vim-cell {
+  position: absolute;
+  background: var(--accent);
+  opacity: 0.3;
 }

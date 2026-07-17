@@ -183,7 +183,59 @@ impl Term {
         }
         self.cursor = d.cursor;
         self.draw_cursor();
+        self.publish();
     }
+
+    /// Publish a read-only snapshot of the visible grid for the vim module.
+    /// ponytail: visible viewport only — the native side owns scrollback and
+    /// there's no scroll command, so vim navigates the painted rows.
+    fn publish(&self) {
+        let mut lines = Vec::with_capacity(self.rows as usize);
+        for r in 0..self.rows {
+            let mut s = String::with_capacity(self.cols as usize);
+            for c in 0..self.cols {
+                if let Some(i) = self.idx(r, c) {
+                    s.push_str(&self.buf[i].ch);
+                }
+            }
+            lines.push(s.trim_end().to_string());
+        }
+        GRID.with(|g| {
+            *g.borrow_mut() = GridView {
+                cols: self.cols,
+                rows: self.rows,
+                cell_w: self.cell_w,
+                cell_h: self.cell_h,
+                cursor_line: self.cursor.line,
+                cursor_col: self.cursor.col,
+                lines,
+            };
+        });
+    }
+}
+
+// ---- read-only grid snapshot (consumed by the vim module) ----
+
+/// A clone-on-read view of the currently painted terminal grid.
+#[derive(Clone, Default)]
+pub struct GridView {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_w: f64,
+    pub cell_h: f64,
+    pub cursor_line: u16,
+    pub cursor_col: u16,
+    /// One trailing-trimmed string per visible row (mirrors xterm translateToString(true)).
+    pub lines: Vec<String>,
+}
+
+thread_local! {
+    static GRID: RefCell<GridView> = RefCell::new(GridView::default());
+}
+
+/// Snapshot the current visible grid. Cheap enough (a handful of KB) to clone per keypress.
+pub fn grid_view() -> GridView {
+    GRID.with(|g| g.borrow().clone())
 }
 
 // ---- key encoding (pure, tested below) ----
@@ -341,6 +393,10 @@ fn setup() {
     {
         let typed = typed.clone();
         let cb = Closure::wrap(Box::new(move |ev: KeyboardEvent| {
+            // ⌘-chords are app shortcuts (settings/ai-bar/palette/…) — never PTY input.
+            if ev.meta_key() {
+                return;
+            }
             let Some(data) = encode_key(&ev.key(), ev.ctrl_key(), ev.alt_key()) else {
                 return;
             };
