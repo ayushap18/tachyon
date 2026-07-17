@@ -30,4 +30,6 @@ base64 = "0.22"
 tokio = { version = "1", features = ["sync", "time"] }
 # terminal engine: owns the grid/scrollback/cursor; we feed it PTY bytes and paint the grid
 vt100 = "0.15"
+# system clipboard from Rust (webview navigator.clipboard is blocked in the Tauri webview)
+arboard = "3"
 

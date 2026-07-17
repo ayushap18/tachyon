@@ -425,8 +425,35 @@ fn pty_write_internal(state: &PtyState, data: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pty_write(state: State<PtyState>, data: String) -> Result<(), String> {
+fn pty_write(app: AppHandle, state: State<PtyState>, data: String) -> Result<(), String> {
+    // Typing snaps the view back to the live bottom so the prompt is always visible. Repaint
+    // here (not just on the echo) so it snaps even when the foreground program doesn't echo
+    // (sudo/ssh password prompts). Guarded on scrollback != 0 so normal typing at the bottom
+    // stays an incremental diff, not a full repaint per keystroke.
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        if eng.scrollback() != 0 {
+            eng.scroll_to_bottom();
+            let _ = app.emit("grid-damage", eng.full_repaint());
+        }
+    }
     pty_write_internal(&state, &data)
+}
+
+// Scroll the native grid by `delta` rows (delta > 0 = up into history) and repaint.
+#[tauri::command]
+fn term_scroll(app: AppHandle, state: State<PtyState>, delta: i32) {
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        eng.scroll_by(delta);
+        let _ = app.emit("grid-damage", eng.full_repaint());
+    }
+}
+
+// Write to the system clipboard from Rust: the webview's navigator.clipboard is blocked here.
+#[tauri::command]
+fn clipboard_set(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1490,6 +1517,8 @@ pub fn run() {
             pty_resize,
             term_full_repaint,
             term_set_theme,
+            term_scroll,
+            clipboard_set,
             set_typed_command,
             journal_blocks,
             last_failed_block,

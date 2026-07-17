@@ -26,16 +26,19 @@ pub struct WriteArgs {
     pub data: String,
 }
 
-/// navigator.clipboard.writeText(text) via Reflect (no web-sys Clipboard feature enabled).
+/// `{ text }` — clipboard payload forwarded to the native `clipboard_set` command.
+#[derive(Serialize)]
+struct ClipArgs {
+    text: String,
+}
+
+/// Copy `text` to the system clipboard via the native `clipboard_set` command
+/// (reliable inside the webview, unlike navigator.clipboard). Fire-and-forget.
 pub fn clipboard_write(text: &str) {
-    let Some(win) = web_sys::window() else { return };
-    let get = |o: &JsValue, k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).ok();
-    let Some(clip) = get(win.as_ref(), "navigator").as_ref().and_then(|n| get(n, "clipboard")) else {
-        return;
-    };
-    if let Some(f) = get(&clip, "writeText").and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
-        let _ = f.call1(&clip, &JsValue::from_str(text));
-    }
+    let text = text.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = invoke("clipboard_set", ClipArgs { text }).await;
+    });
 }
 
 /// Invoke a Tauri command. `args` is serialized to a JS object (its fields

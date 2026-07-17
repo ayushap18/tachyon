@@ -184,7 +184,7 @@ pub struct TerminalEngine {
 impl TerminalEngine {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
-            parser: Parser::new(rows, cols, 0), // note: vt100 takes (rows, cols, scrollback)
+            parser: Parser::new(rows, cols, 5000), // note: vt100 takes (rows, cols, scrollback)
             colors: theme_colors("Tokyo Night"),
             cols,
             rows,
@@ -207,6 +207,35 @@ impl TerminalEngine {
         self.colors = theme_colors(name);
         for s in &mut self.snapshot {
             *s = None; // colors changed -> re-emit everything
+        }
+    }
+
+    /// Scroll the view by `delta` rows: delta > 0 scrolls UP into history, delta < 0 toward the
+    /// live bottom. set_scrollback clamps to available history; we clear the snapshot so the next
+    /// emit is a full frame of the scrolled view.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let cur = self.parser.screen().scrollback() as i32;
+        let next = (cur + delta).max(0) as usize;
+        self.parser.set_scrollback(next);
+        for s in &mut self.snapshot {
+            *s = None;
+        }
+    }
+
+    /// Current scrollback offset (0 = live bottom).
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// Snap back to the live bottom (offset 0) and force a full re-emit. No-op (and no snapshot
+    /// nuke) when already at the bottom, so this is cheap to call on every keystroke.
+    pub fn scroll_to_bottom(&mut self) {
+        if self.parser.screen().scrollback() == 0 {
+            return;
+        }
+        self.parser.set_scrollback(0);
+        for s in &mut self.snapshot {
+            *s = None;
         }
     }
 
@@ -236,7 +265,10 @@ impl TerminalEngine {
     fn cursor(&self) -> CursorPayload {
         let screen = self.parser.screen();
         let (line, col) = screen.cursor_position();
-        CursorPayload { line, col, shape: "block", visible: !screen.hide_cursor() }
+        // Hide the cursor while scrolled into history — its live position would land on
+        // unrelated historical text.
+        let visible = !screen.hide_cursor() && screen.scrollback() == 0;
+        CursorPayload { line, col, shape: "block", visible }
     }
 
     /// Emit only the cells that changed since the last emit, updating the snapshot.
@@ -323,6 +355,15 @@ mod tests {
         // Matrix bg is pure black
         let cell = &d.cells[0];
         assert_eq!(cell.bg, [0, 0, 0]);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_zero() {
+        let mut e = TerminalEngine::new(20, 5);
+        e.feed(b"hello");
+        // already at the live bottom; scrolling further toward bottom stays at 0.
+        e.scroll_by(-100);
+        assert_eq!(e.parser.screen().scrollback(), 0);
     }
 
     #[test]

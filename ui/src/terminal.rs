@@ -77,6 +77,9 @@ struct Term {
     rows: u16,
     buf: Vec<Cell>,
     cursor: Cursor,
+    /// Mouse text selection as (anchor, focus) cells, each (row, col). None = no selection.
+    sel: Option<((u16, u16), (u16, u16))>,
+    selecting: bool,
 }
 
 thread_local! {
@@ -108,6 +111,34 @@ fn settings_font() -> (f64, String) {
 
 fn css(c: [u8; 3]) -> String {
     format!("rgb({},{},{})", c[0], c[1], c[2])
+}
+
+/// Row-major linear selection text over trailing-trimmed row strings, between
+/// anchor `a` and focus `b` (each (row, col)). Mirrors vim.rs selection_text ordering.
+fn linear_selection(lines: &[String], a: (u16, u16), b: (u16, u16)) -> String {
+    let fwd = a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1);
+    let (s, e) = if fwd { (a, b) } else { (b, a) };
+    let slice = |r: u16, from: u16, to: Option<u16>| -> String {
+        let line: Vec<char> = lines.get(r as usize).map(|l| l.chars().collect()).unwrap_or_default();
+        let from = (from as usize).min(line.len());
+        let to = to.map(|t| (t as usize + 1).min(line.len())).unwrap_or(line.len());
+        line[from..to.max(from)].iter().collect()
+    };
+    if s.0 == e.0 {
+        return slice(s.0, s.1, Some(e.1));
+    }
+    (s.0..=e.0)
+        .map(|r| {
+            if r == s.0 {
+                slice(r, s.1, None)
+            } else if r == e.0 {
+                slice(r, 0, Some(e.1))
+            } else {
+                slice(r, 0, None)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Term {
@@ -197,6 +228,63 @@ impl Term {
         }
     }
 
+    /// Pixel (canvas-relative CSS px) -> (row, col), clamped to the grid.
+    fn cell_at(&self, ox: f64, oy: f64) -> (u16, u16) {
+        let col = (ox / self.cell_w).floor().max(0.0) as u16;
+        let row = (oy / self.cell_h).floor().max(0.0) as u16;
+        (row.min(self.rows.saturating_sub(1)), col.min(self.cols.saturating_sub(1)))
+    }
+
+    /// Trailing-trimmed row strings of the visible buffer (for selection extraction).
+    fn rows_text(&self) -> Vec<String> {
+        (0..self.rows)
+            .map(|r| {
+                let mut s = String::with_capacity(self.cols as usize);
+                for c in 0..self.cols {
+                    if let Some(i) = self.idx(r, c) {
+                        s.push_str(&self.buf[i].ch);
+                    }
+                }
+                s.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// Extract the current selection's text (None if nothing selected).
+    fn selection_text(&self) -> Option<String> {
+        let (a, b) = self.sel?;
+        Some(linear_selection(&self.rows_text(), a, b))
+    }
+
+    /// Overlay a translucent highlight on the cells inside the linear selection.
+    fn overlay_selection(&self) {
+        let Some((a, b)) = self.sel else { return };
+        let (s, e) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { (a, b) } else { (b, a) };
+        self.ctx.set_fill_style_str("rgba(120,150,220,0.35)");
+        for r in s.0..=e.0 {
+            let sc = if r == s.0 { s.1 } else { 0 };
+            let ec = if r == e.0 { e.1 } else { self.cols.saturating_sub(1) };
+            let x = sc as f64 * self.cell_w;
+            let w = (ec.saturating_sub(sc) + 1) as f64 * self.cell_w;
+            let y = r as f64 * self.cell_h;
+            self.ctx.fill_rect(x, y, w, self.cell_h);
+        }
+    }
+
+    /// Full repaint of the visible buffer, then selection overlay, then cursor.
+    fn redraw(&self) {
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                if let Some(i) = self.idx(r, c) {
+                    let cell = self.buf[i].clone();
+                    self.draw_cell(r, c, &cell);
+                }
+            }
+        }
+        self.overlay_selection();
+        self.draw_cursor();
+    }
+
     fn apply(&mut self, d: GridDamage) {
         // Dimension change => this is a full frame (mount / resize repaint).
         if d.cols != self.cols || d.rows != self.rows || self.buf.is_empty() {
@@ -214,6 +302,9 @@ impl Term {
         self.cursor = d.cursor;
         APP_CURSOR.with(|a| a.set(d.application_cursor));
         self.draw_cursor();
+        // A selection's (row,col) coords are screen-relative and become meaningless once new
+        // content is painted (or the view scrolls), so drop it rather than highlight stale cells.
+        self.sel = None;
         self.publish();
     }
 
@@ -352,6 +443,10 @@ struct TypedArgs {
 struct ThemeArgs {
     name: String,
 }
+#[derive(Serialize)]
+struct ScrollArgs {
+    delta: i32,
+}
 
 /// Persisted terminal theme name (localStorage "tachyon-settings"), default Tokyo Night.
 fn settings_theme() -> String {
@@ -427,6 +522,8 @@ fn setup() {
             shape: "block".into(),
             visible: false,
         },
+        sel: None,
+        selecting: false,
     }));
 
     // --- grid-damage listener ---
@@ -467,7 +564,17 @@ fn setup() {
     let typed = Rc::new(RefCell::new(String::new()));
     {
         let typed = typed.clone();
+        let term = term.clone();
         let cb = Closure::wrap(Box::new(move |ev: KeyboardEvent| {
+            // ⌘C with an active selection: copy it, don't fall through to the shell.
+            if ev.meta_key() && ev.key() == "c" {
+                if let Some(text) = term.borrow().selection_text() {
+                    crate::bridge::clipboard_write(&text);
+                    ev.prevent_default();
+                    return;
+                }
+                // no selection: fall through to the ⌘-chord return below (⌘C = default/no-op).
+            }
             // ⌘-chords are app shortcuts (settings/ai-bar/palette/…) — never PTY input.
             if ev.meta_key() {
                 return;
@@ -515,6 +622,76 @@ fn setup() {
             });
         }) as Box<dyn FnMut(web_sys::ClipboardEvent)>);
         let _ = document.add_event_listener_with_callback("paste", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // --- mouse wheel: scroll native scrollback. Up (delta_y<0) goes BACK in history. ---
+    {
+        let term = term.clone();
+        let canvas_el = term.borrow().canvas.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::WheelEvent| {
+            ev.prevent_default();
+            let dy = ev.delta_y();
+            let ch = term.borrow().cell_h; // live: stays correct after a font-size change
+            let lines = (dy / ch).round().abs().max(1.0) as i32;
+            let delta = if dy < 0.0 { lines } else { -lines };
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = invoke("term_scroll", ScrollArgs { delta }).await;
+            });
+        }) as Box<dyn FnMut(web_sys::WheelEvent)>);
+        let _ = canvas_el.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // --- mouse selection: mousedown (canvas) anchors; mousemove/mouseup (document) drag/end ---
+    {
+        let term = term.clone();
+        let canvas_el = term.borrow().canvas.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            let mut t = term.borrow_mut();
+            let cell = t.cell_at(ev.offset_x() as f64, ev.offset_y() as f64);
+            t.sel = Some((cell, cell));
+            t.selecting = true;
+            t.redraw();
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        let _ = canvas_el.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+    {
+        let term = term.clone();
+        let canvas_el = term.borrow().canvas.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            let mut t = term.borrow_mut();
+            if !t.selecting {
+                return;
+            }
+            // mousemove is on `document` so the drag can continue past the canvas edges, but
+            // offset_x/offset_y would then be relative to whatever element is under the pointer
+            // (a status/ai bar). Use client coords minus the canvas rect; cell_at clamps.
+            let rect = canvas_el.get_bounding_client_rect();
+            let x = ev.client_x() as f64 - rect.left();
+            let y = ev.client_y() as f64 - rect.top();
+            let anchor = t.sel.map(|(a, _)| a).unwrap_or_default();
+            let focus = t.cell_at(x, y);
+            t.sel = Some((anchor, focus));
+            t.redraw();
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        let _ = document.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+    {
+        let term = term.clone();
+        let cb = Closure::wrap(Box::new(move |_ev: web_sys::MouseEvent| {
+            let mut t = term.borrow_mut();
+            // A plain click (no drag) leaves a 1-cell anchor==focus selection; clear it so it
+            // doesn't linger as a stray highlight.
+            if t.sel.map(|(a, b)| a == b).unwrap_or(false) {
+                t.sel = None;
+                t.redraw();
+            }
+            t.selecting = false;
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        let _ = document.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
@@ -590,7 +767,18 @@ pub fn Terminal() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_key;
+    use super::{encode_key, linear_selection};
+
+    #[test]
+    fn selection_extraction() {
+        let lines = ["foo bar baz".to_string(), "qux Foo end".to_string()];
+        // row-major across two rows: (row,col) from (0,8) to (1,2) => "baz\nqux"
+        assert_eq!(linear_selection(&lines, (0, 8), (1, 2)), "baz\nqux");
+        // reversed anchor/focus yields the same text
+        assert_eq!(linear_selection(&lines, (1, 2), (0, 8)), "baz\nqux");
+        // single-row inclusive slice
+        assert_eq!(linear_selection(&lines, (0, 0), (0, 2)), "foo");
+    }
 
     #[test]
     fn key_encoding() {
