@@ -510,6 +510,27 @@ fn win() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
+/// Re-fit the canvas to the current viewport. fit() runs every call (it resizes the backing store
+/// to match the display size, so the canvas never stretches a stale frame during a maximize/resize
+/// animation); pty_resize only fires when the grid dimensions actually changed, so we don't spam
+/// the native side per animation frame.
+fn refit(term: &Rc<RefCell<Term>>) {
+    let (cols, rows, changed) = {
+        let mut t = term.borrow_mut();
+        let (cols, rows) = t.fit(); // resizes the backing store, which CLEARS the canvas
+        let changed = cols != t.cols || rows != t.rows;
+        t.redraw(); // repaint current content so a no-grid-change resize doesn't blank the screen
+        (cols, rows, changed)
+    };
+    // Only round-trip to the native side when the grid actually changed (a real reflow); the
+    // full grid-damage it emits then repaints the new dimensions.
+    if changed {
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
+        });
+    }
+}
+
 /// True when the focused element is a text input (any overlay: ai-bar, palette, settings,
 /// vim search). The terminal's document-level key/paste handlers defer to it in that case.
 fn editable_focused() -> bool {
@@ -769,17 +790,25 @@ fn setup() {
             if first.replace(false) {
                 return;
             }
-            let (cols, rows) = term.borrow_mut().fit();
-            // pty_resize emits a full grid-damage repaint from the native side.
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
-            });
+            refit(&term);
         })
             as Box<dyn FnMut(js_sys::Array, web_sys::ResizeObserver)>);
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
             observer.observe(canvas_obs.unchecked_ref());
             std::mem::forget(observer);
         }
+        cb.forget();
+    }
+
+    // --- window "resize": fires per-frame during a maximize/drag animation, so refit here keeps
+    // the backing store synced with the display size and the canvas never stretches a stale frame
+    // (the ResizeObserver above still catches the macOS fullscreen settle the resize event misses). ---
+    {
+        let term = term.clone();
+        let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+            refit(&term);
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        let _ = win().add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 }
