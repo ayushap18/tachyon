@@ -159,8 +159,9 @@ fn check_dangerous(cmd: String) -> bool {
 }
 
 // ---- Provider registry ----
-// kind == "anthropic" → called via @anthropic-ai/sdk; anything else is OpenAI-compatible:
-// the frontend POSTs `${base_url}/chat/completions`. Config persists to ~/.config/tachyon/providers.json.
+// All AI HTTP happens in Rust via ai_complete below (anthropic → /v1/messages, anything else
+// is OpenAI-compatible → `${base_url}/chat/completions`). Keys never reach the webview.
+// Config persists to ~/.config/tachyon/providers.json.
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Provider {
@@ -305,6 +306,83 @@ fn provider_add_local(id: String, base_url: String, model: String, key: String) 
         s.add_local(id, base_url, model, key);
         Ok(())
     })
+}
+
+// ---- AI completion ----
+// Request/response shaping lives in pure helpers so they unit-test without a network.
+
+fn build_anthropic_body(model: &str, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "system": system,
+        "messages": [{"role": "user", "content": user}]
+    })
+}
+
+fn build_openai_body(model: &str, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+    })
+}
+
+// first content block of type "text" wins — tolerates a leading thinking block
+fn parse_anthropic_response(body: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")))
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .ok_or_else(|| "no text content in response".into())
+}
+
+fn parse_openai_response(body: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    v.pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .map(String::from)
+        .ok_or_else(|| "no choices[0].message.content in response".into())
+}
+
+// The key appears ONLY in request headers — never in any error/log string.
+#[tauri::command]
+async fn ai_complete(system: String, user: String) -> Result<String, String> {
+    let p = load_state().active_provider();
+    let client = reqwest::Client::new(); // ponytail: per-call client; OnceLock<Client> if profiling ever cares
+    let is_anthropic = p.kind == "anthropic";
+    let req = if is_anthropic {
+        if p.key.is_empty() {
+            return Err(format!("no key for {} — set with /key {} <key>", p.id, p.id));
+        }
+        client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &p.key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&build_anthropic_body(&p.model, &system, &user))
+    } else {
+        // OpenAI-compatible (openai, groq, gemini, kimi, deepseek, mistral, local). Local may have no key.
+        let mut r = client
+            .post(format!("{}/chat/completions", p.base_url))
+            .json(&build_openai_body(&p.model, &system, &user));
+        if !p.key.is_empty() {
+            r = r.bearer_auth(&p.key);
+        }
+        r
+    };
+    let resp = req.send().await.map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
+    if !status.is_success() {
+        return Err(format!("{} {}: {}", p.id, status.as_u16(), truncate_chars(&body, 120)));
+    }
+    if is_anthropic { parse_anthropic_response(&body) } else { parse_openai_response(&body) }
 }
 
 // ---- MCP client (Streamable HTTP) ----
@@ -563,6 +641,7 @@ pub fn run() {
             provider_set_model,
             provider_use,
             provider_add_local,
+            ai_complete,
             mcp_add,
             mcp_remove,
             mcp_servers,
@@ -746,6 +825,54 @@ mod tests {
         s.merge_defaults();
         assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().key, "keep");
         assert!(s.providers.iter().any(|p| p.id == "mistral"));
+    }
+
+    #[test]
+    fn anthropic_body_shape() {
+        assert_eq!(
+            build_anthropic_body("m", "sys", "hi"),
+            serde_json::json!({
+                "model": "m", "max_tokens": 1024, "system": "sys",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+        );
+    }
+
+    #[test]
+    fn openai_body_shape() {
+        assert_eq!(
+            build_openai_body("m", "sys", "hi"),
+            serde_json::json!({
+                "model": "m", "max_tokens": 1024,
+                "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_ok_and_skips_non_text() {
+        let body = r#"{"content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"hello"}]}"#;
+        assert_eq!(parse_anthropic_response(body).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_anthropic_error_payload() {
+        assert!(parse_anthropic_response(r#"{"type":"error","error":{"type":"authentication_error","message":"x"}}"#).is_err());
+        assert!(parse_anthropic_response("not json").is_err());
+        assert!(parse_anthropic_response(r#"{"content":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_openai_ok() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        assert_eq!(parse_openai_response(body).unwrap(), "hi");
+    }
+
+    #[test]
+    fn parse_openai_missing_or_error() {
+        assert!(parse_openai_response(r#"{"error":{"message":"bad key"}}"#).is_err());
+        assert!(parse_openai_response(r#"{"choices":[]}"#).is_err());
+        assert!(parse_openai_response("not json").is_err());
     }
 
     #[test]

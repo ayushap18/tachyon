@@ -1,7 +1,7 @@
 {
   "name": "tachyon",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4-beta",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,13 +13,13 @@
     "eval:write": "node evals/run.mjs --write"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.111.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.112.1",
     "@tauri-apps/cli": "^2",
     "typescript": "~5.6.2",
     "vite": "^6.0.3"

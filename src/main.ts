@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import Anthropic from "@anthropic-ai/sdk";
 import { getVersion } from "@tauri-apps/api/app";
 import { initVim, type VimApi } from "./vim";
 import "@xterm/xterm/css/xterm.css";
@@ -385,36 +384,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function askAi(system: string, userMsg: string): Promise<string> {
-    const p = await invoke<Provider>("provider_active");
-    if (p.kind === "anthropic") {
-      if (!p.key) throw new Error(`no key for ${p.id} — set with /key ${p.id} <key>`);
-      const client = new Anthropic({ apiKey: p.key, dangerouslyAllowBrowser: true });
-      const msg = await client.messages.create({
-        model: p.model,
-        max_tokens: 1024,
-        system,
-        messages: [{ role: "user", content: userMsg }],
-      });
-      const block = msg.content.find((b) => b.type === "text");
-      return block?.type === "text" ? block.text : "";
+    try {
+      return await invoke<string>("ai_complete", { system, user: userMsg });
+    } catch (e) {
+      // Tauri rejects invoke with the plain Err string; callers read (e as Error).message
+      throw e instanceof Error ? e : new Error(String(e));
     }
-    // OpenAI-compatible (openai, groq, gemini, kimi, deepseek, mistral, local). Local may have no key.
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (p.key) headers.authorization = `Bearer ${p.key}`;
-    const r = await fetch(`${p.base_url}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: p.model,
-        max_tokens: 1024,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: userMsg },
-        ],
-      }),
-    });
-    if (!r.ok) throw new Error(`${p.id} ${r.status}: ${(await r.text()).slice(0, 120)}`);
-    return (await r.json()).choices?.[0]?.message?.content ?? "";
   }
 
   function stripFences(s: string): string {
