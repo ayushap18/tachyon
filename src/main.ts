@@ -4,7 +4,8 @@ import { homeDir } from "@tauri-apps/api/path";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import Anthropic from "@anthropic-ai/sdk";
-import { initVim } from "./vim";
+import { getVersion } from "@tauri-apps/api/app";
+import { initVim, type VimApi } from "./vim";
 import "@xterm/xterm/css/xterm.css";
 
 const AI_SYSTEM =
@@ -776,6 +777,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   const palette = document.getElementById("palette")!;
   const paletteInput = document.getElementById("palette-input") as HTMLInputElement;
   const paletteList = document.getElementById("palette-list")!;
+  const paletteVersion = document.getElementById("palette-version")!;
+  let vim: VimApi | null = null;
   interface PaletteEntry {
     label: string;
     hint: string;
@@ -803,6 +806,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       { label: "Agent: run a task", hint: "⌘J", run: () => (closePalette(), openAgentBar()) },
       { label: "Explain last error", hint: "⌘E", run: () => (closePalette(), explainError()) },
       { label: "Blocks: session navigator", hint: "⌘B", run: () => (closePalette(), openBlocks()) },
+      { label: "Vim mode", hint: "⌘⇧V", run: () => (closePalette(), vim?.enterNormal()) },
       { label: "Settings", hint: "⌘,", run: () => (closePalette(), togglePanel()) },
     ];
     try {
@@ -1080,11 +1084,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   // status bar
   const statusCwd = document.getElementById("status-cwd")!;
   const statusGit = document.getElementById("status-git")!;
-  initVim({
+  vim = initVim({
     term,
     statusEl: document.getElementById("status-vim")!,
     searchEl: document.getElementById("vim-search") as HTMLInputElement,
   });
+  getVersion()
+    .then((v) => (paletteVersion.textContent = `v${v}`))
+    .catch(() => {});
   const home = (await homeDir()).replace(/\/$/, "");
   let ctxTimer: number | undefined;
 

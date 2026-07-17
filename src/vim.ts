@@ -10,7 +10,11 @@ export interface VimOptions {
 
 type Mode = "insert" | "normal" | "visual";
 
-export function initVim({ term, statusEl, searchEl }: VimOptions): void {
+export interface VimApi {
+  enterNormal: () => void;
+}
+
+export function initVim({ term, statusEl, searchEl }: VimOptions): VimApi {
   let mode: Mode = "insert";
   let cur = { row: 0, col: 0 }; // absolute buffer coords
   let anchor = { row: 0, col: 0 }; // visual selection anchor
@@ -260,4 +264,7 @@ export function initVim({ term, statusEl, searchEl }: VimOptions): void {
   }
 
   setMode("insert");
+
+  // expose control so other UI (e.g. the ⌘P palette) can enter Vim mode
+  return { enterNormal };
 }

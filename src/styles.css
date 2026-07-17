@@ -244,6 +244,17 @@ body {
   background: var(--surface-alt);
 }
 
+#palette-version {
+  width: min(560px, 86vw);
+  box-sizing: border-box;
+  margin-top: 6px;
+  padding: 0 4px;
+  text-align: right;
+  color: var(--muted);
+  font: 10px Menlo, monospace;
+  opacity: 0.7;
+}
+
 /* Block navigator (⌘B) */
 #blocks {
   position: fixed;
