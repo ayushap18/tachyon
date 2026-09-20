@@ -72,16 +72,45 @@ in `AI_SYSTEM` / `AI_AGENT` with the detected shell and OS.
 `ProviderState` (`active` + `Vec<Provider>`) is loaded from `providers.json` on every call;
 there is no in-memory cache to go stale. `mutate()` is the only writer and holds
 `CONFIG_WRITE` across its read-modify-write. IPC returns `PublicProvider` /
-`PublicProviderState`, which replace `key` with `has_key`.
+`PublicProviderState`, which replace `key` with `has_key` and `key_source`
+(`saved` / `env` / `none`).
+
+Keys: `local_models::key_for` returns the saved key, else the conventional env var
+(`env_key_name`: `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, …, `<ID>_API_KEY` for a custom id). It
+is resolved per request and never written into `Provider`, so an env key cannot reach
+`providers.json` or the webview. A Finder/Dock launch does not inherit the shell's
+environment; `/help` says so.
+
+Built-ins are re-added by `merge_defaults` on every load, except ids in
+`ProviderState.hidden`. `/remove <id>` deletes a provider (and its key), records a built-in
+in `hidden`, and moves `active` if it pointed there; `/use <id>` un-hides. The last provider
+cannot be removed.
 
 `ai_call(system, user)` is the only function that talks to a model. `kind == "anthropic"`
-posts to `/v1/messages`; everything else posts the OpenAI shape to
-`{base_url}/chat/completions`. It uses one shared `reqwest` client with connect and request
+posts to `/v1/messages` (on `base_url` when set — a proxy or gateway, `/url <id> <base_url>` —
+else `api.anthropic.com`; see `anthropic_url`); everything else posts the OpenAI shape to
+`{base_url}/chat/completions`, with no auth header when there is no key, which is what makes
+keyless local runtimes work. It uses one shared `reqwest` client with connect and request
 timeouts. Callers: `ai_complete`, `nl_to_command` (⌘K; adds cwd/git from `shell_context_line`
 and the last five blocks from `journal_context`, then `strip_fences` and `is_dangerous`),
 `explain_last_error` / `explain_output` (⌘E, ⌘B), and `ai_call_abortable` for the agent.
 Request and response shaping are pure functions (`build_*_body`, `parse_*_response`) so they
-test without a network.
+test without a network. A failed completion is worded by `local_models::completion_error`
+from the status and body already in hand: a 404 / `model_not_found` / `model_decommissioned`
+becomes "model looks unavailable — /models, then /model", with the key redacted and the body
+truncated.
+
+## Local and open models (`local_models.rs`)
+
+Blocking `ureq`, like the MCP client. `discover(probes)` GETs `{base}/models` on Ollama,
+LM Studio, llama.cpp, vLLM and Jan (`LOCAL_RUNTIMES`) concurrently with a 600 ms connect /
+2 s total timeout; a runtime counts as up only if it returns a model list, so an unrelated
+dev server on :8080 is ignored. `/local` prints the result, `/local <id> [model]` registers
+one (`resolve_runtime`), and the `local_discover` command feeds the palette the runtimes not
+yet registered (`unregistered`). `/models [id]` is `list_models` + `render_models`: it
+accepts `{data:[{id}]}` and Ollama's `{models:[{name}]}`, uses `GET /v1/models` with
+`x-api-key` for the anthropic kind, marks the configured model, and says when it is not
+served. Errors carry the provider id and status or transport error kind — never the URL or key.
 
 Slash commands (`/key`, `/use`, `/mcp …`) are parsed in `run_slash_inner` and return an ANSI
 string the frontend paints with `term_write`.
@@ -127,7 +156,7 @@ tools plus per-server errors. There is no stdio transport and no server mode.
 
 | File | Contents | Written by |
 |---|---|---|
-| `providers.json` | provider list, active id, **plaintext API keys** | `/key`, `/use`, `/model`, `/local` |
+| `providers.json` | provider list, active id, hidden built-ins, **plaintext API keys** (env-var keys are never written) | `/key`, `/use`, `/model`, `/local`, `/url`, `/remove` |
 | `mcp.json` | MCP server names and URLs | `/mcp add`, `/mcp remove` |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 
@@ -156,6 +185,7 @@ status bar · `settings.rs`, `theme.rs` appearance · `bridge.rs` IPC.
 |---|---|---|
 | `src-tauri/src/lib.rs` `mod tests` | OSC scanner (split marks, ANSI stripping), provider registry and redaction, config round-trip and corruption, request/response shaping, agent reply parsing, danger gate, slash parsing | `cd src-tauri && cargo test` |
 | `src-tauri/src/engine.rs` `mod tests` | damage diffing, colours, scroll, resize | same |
+| `src-tauri/src/local_models.rs` `mod tests` | discovery and model listing against an in-test `TcpListener` stub, env-key precedence, error hints, key never in an error | same |
 | `ui/src/*.rs` | key encoding, selection, vim motions, keymap parsing/matching — pure logic, runs on the host | `cd ui && cargo test` |
 | `evals/` | model-facing behaviour; the keyless checks run in CI | see README → Evaluation |
 
