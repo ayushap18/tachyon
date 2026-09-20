@@ -28,30 +28,57 @@ struct ShellContext {
     shell_pid: Option<u32>,
 }
 
+// `Command::output()` waits forever. These run on every journal block (status bar) and on
+// every ⌘K, and `lsof`/`git status` both block indefinitely on a wedged network mount or a
+// huge repo — which would pile up processes with nothing reaping them. Poll try_wait and
+// kill on overrun.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn output_with_timeout(mut cmd: std::process::Command) -> Option<std::process::Output> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait(); // reap, don't leave a zombie
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn parse_lsof_cwd(output: &str) -> Option<String> {
     output.lines().find(|l| l.starts_with('n')).map(|l| l[1..].to_string())
 }
 
 fn cwd_of_pid(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("lsof");
+    cmd.args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]);
+    let out = output_with_timeout(cmd)?;
     parse_lsof_cwd(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn git_info(cwd: &str) -> (Option<String>, u32) {
-    let branch = std::process::Command::new("git")
-        .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let branch = {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
+        output_with_timeout(cmd)
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
     let dirty = if branch.is_some() {
-        std::process::Command::new("git")
-            .args(["-C", cwd, "status", "--porcelain"])
-            .output()
-            .ok()
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["-C", cwd, "status", "--porcelain"]);
+        output_with_timeout(cmd)
             .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as u32)
             .unwrap_or(0)
     } else {
@@ -812,11 +839,33 @@ fn parse_openai_response(body: &str) -> Result<String, String> {
         .ok_or_else(|| "no choices[0].message.content in response".into())
 }
 
+// One shared client with timeouts. Without them a provider that accepts the connection and
+// never answers — a wedged local Ollama is the realistic case — hung ai_call forever, and
+// the agent loop could not be aborted out of it. The request timeout is generous because a
+// large model on slow hardware is legitimately slow; the point is that it is finite.
+static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn http_client() -> Result<reqwest::Client, String> {
+    if let Some(c) = HTTP.get() {
+        return Ok(c.clone());
+    }
+    let c = reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(HTTP.get_or_init(|| c).clone())
+}
+
 // The key appears ONLY in request headers — never in any error/log string.
 // Shared core for ai_complete / nl_to_command / explain_last_error — one HTTP path.
 async fn ai_call(system: &str, user: &str) -> Result<String, String> {
     let p = load_state()?.active_provider();
-    let client = reqwest::Client::new(); // ponytail: per-call client; OnceLock<Client> if profiling ever cares
+    let client = http_client()?;
     let is_anthropic = p.kind == "anthropic";
     let req = if is_anthropic {
         if p.key.is_empty() {
@@ -1073,7 +1122,10 @@ fn mcp_post(
 // Streamable HTTP handshake: initialize → notifications/initialized → the actual request.
 // ponytail: fresh 3-POST session per call, no session cache — add one if latency matters
 fn mcp_rpc_session(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
+    // Per-request, and a session is three requests (initialize, initialized, the call) —
+    // so this is the per-server worst case × 3. It was 15s, which meant one unreachable
+    // server could stall an agent run for 45s before its first step.
+    let agent = ureq::AgentBuilder::new().timeout(MCP_TIMEOUT).build();
     let init = jsonrpc_request(
         1,
         "initialize",
@@ -1125,32 +1177,56 @@ fn mcp_servers() -> Result<Vec<McpServer>, String> {
     Ok(load_mcp()?.servers)
 }
 
-// blocking (ureq) — call from a command thread or spawn_blocking, never the main thread
-fn mcp_list_tools_inner() -> Result<Vec<McpServerTool>, String> {
+// blocking (ureq) — call from a command thread or spawn_blocking, never the main thread.
+// Returns (tools, per-server errors). Errors come back even on partial success: they used
+// to be discarded whenever any other server answered, so a broken server was invisible
+// during an agent run. Servers are queried concurrently — serially, N dead servers cost
+// N × the full timeout before the agent's first step.
+fn mcp_list_tools_inner() -> Result<(Vec<McpServerTool>, Vec<String>), String> {
     let servers = load_mcp()?.servers;
+    if servers.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let results: Vec<(String, Result<serde_json::Value, String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = servers
+            .iter()
+            .map(|s| {
+                scope.spawn(move || {
+                    (s.name.clone(), mcp_rpc_session(&s.url, "tools/list", serde_json::json!({})))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| (String::new(), Err("server thread panicked".into()))))
+            .collect()
+    });
+
     let mut out = Vec::new();
     let mut errs = Vec::new();
-    for s in &servers {
-        match mcp_rpc_session(&s.url, "tools/list", serde_json::json!({})) {
-            Ok(result) => out.extend(parse_tools(&result).into_iter().map(|t| McpServerTool {
-                server: s.name.clone(),
+    for (name, result) in results {
+        match result {
+            Ok(value) => out.extend(parse_tools(&value).into_iter().map(|t| McpServerTool {
+                server: name.clone(),
                 name: t.name,
                 description: t.description,
                 input_schema: t.input_schema,
             })),
-            Err(e) => errs.push(format!("{}: {e}", s.name)), // one bad server doesn't break the list
+            Err(e) => errs.push(format!("{name}: {e}")),
         }
     }
-    if out.is_empty() && !errs.is_empty() && !servers.is_empty() {
-        return Err(errs.join("; "));
-    }
-    Ok(out)
+    Ok((out, errs))
 }
 
 // (async): blocking HTTP must not run on the main thread
 #[tauri::command(async)]
 fn mcp_list_tools() -> Result<Vec<McpServerTool>, String> {
-    mcp_list_tools_inner()
+    let (tools, errs) = mcp_list_tools_inner()?;
+    // every server failed -> that is an error for a caller that asked for the tool list
+    if tools.is_empty() && !errs.is_empty() {
+        return Err(errs.join("; "));
+    }
+    Ok(tools)
 }
 
 // blocking (ureq) — call from a command thread or spawn_blocking, never the main thread
@@ -1287,10 +1363,8 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                     if servers.is_empty() {
                         return Ok("\r\n\x1b[36m[tachyon] no mcp servers — /mcp add <name> <url>\x1b[0m\r\n".into());
                     }
-                    let (tools, tool_err) = match mcp_list_tools_inner() {
-                        Ok(t) => (t, String::new()),
-                        Err(e) => (Vec::new(), e), // per-server errors; never blanks the list
-                    };
+                    let (tools, tool_errs) = mcp_list_tools_inner()?;
+                    let tool_err = tool_errs.join("; ");
                     let mut out = String::from("\r\n\x1b[36m[tachyon] mcp servers\x1b[0m\r\n");
                     for s in &servers {
                         out.push_str(&format!("  {:<12} \x1b[90m{}\x1b[0m\r\n", s.name, s.url));
@@ -1421,7 +1495,38 @@ async fn agent_propose(app: &AppHandle, payload: serde_json::Value) -> bool {
     rx.await.unwrap_or(false)
 }
 
+/// Clears `running` (and any parked proposal) however agent_loop leaves — return, break,
+/// or panic. Before this, a panic anywhere in the loop left `running` true forever and
+/// every later ⌘J answered "agent already running" until the app was restarted.
+struct AgentRunGuard(AppHandle);
+
+impl Drop for AgentRunGuard {
+    fn drop(&mut self) {
+        let a = self.0.state::<AgentState>();
+        a.running.store(false, SeqCst);
+        a.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
+/// `ai_call` that gives up the moment the abort flag is set. Dropping the future cancels
+/// the HTTP request. Without this, ⌘J-abort could not interrupt a slow or wedged provider:
+/// the flag is only read between steps, so the loop sat inside `ai_call` indefinitely.
+async fn ai_call_abortable(app: &AppHandle, system: &str, user: &str) -> Result<String, String> {
+    // ponytail: 100ms poll rather than a Notify — the abort flag has exactly one writer
+    // and this is a human-scale interaction, not a hot loop.
+    let abort = async {
+        while !app.state::<AgentState>().abort.load(SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        r = ai_call(system, user) => r,
+        _ = abort => Err("aborted".into()),
+    }
+}
+
 async fn agent_loop(app: AppHandle, task: String) {
+    let _reset = AgentRunGuard(app.clone());
     let aborted = |app: &AppHandle| app.state::<AgentState>().abort.load(SeqCst);
 
     // transcript seed: same shape as the old TS runAgent (context + recent journal)
@@ -1430,11 +1535,15 @@ async fn agent_loop(app: AppHandle, task: String) {
     let mut transcript = format!("Task: {task}\n\nContext:\n{}\n{jctx}\n", shell_context_line(pid));
 
     // tool discovery is best-effort; ureq is blocking → spawn_blocking
-    let tools = tauri::async_runtime::spawn_blocking(mcp_list_tools_inner)
+    let (tools, tool_errs) = tauri::async_runtime::spawn_blocking(mcp_list_tools_inner)
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
+    // a server that failed to answer used to be silently invisible for the whole run
+    for e in &tool_errs {
+        let _ = app.emit("agent-output", serde_json::json!({ "step": 0, "text": format!("mcp {e}") }));
+    }
     let system = if tools.is_empty() {
         AI_AGENT.to_string()
     } else {
@@ -1450,7 +1559,7 @@ async fn agent_loop(app: AppHandle, task: String) {
             break;
         }
         let _ = app.emit("agent-status", serde_json::json!({ "step": step, "status": "thinking" }));
-        let reply = match ai_call(&system, &transcript).await {
+        let reply = match ai_call_abortable(&app, &system, &transcript).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = app.emit("agent-done", serde_json::json!({ "summary": e }));
@@ -1550,9 +1659,7 @@ async fn agent_loop(app: AppHandle, task: String) {
         let summary = if aborted(&app) { "aborted" } else { "step limit reached" };
         let _ = app.emit("agent-done", serde_json::json!({ "summary": summary }));
     }
-    let a = app.state::<AgentState>();
-    a.running.store(false, SeqCst);
-    a.decision.lock().unwrap().take();
+    // `running` and the parked proposal are cleared by AgentRunGuard's Drop.
 }
 
 #[tauri::command]
