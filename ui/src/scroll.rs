@@ -15,10 +15,10 @@ impl ScrollAccumulator {
             2 => delta * f64::from(page_rows),
             _ => delta / cell_height,
         };
-        // Reversing a gesture should respond immediately, without paying off the
-        // previous direction's fractional remainder.
+        // Discard only the previous direction's fractional remainder. Whole rows
+        // may still be waiting for IPC and must cancel against a reverse gesture.
         if self.rows.signum() == rows.signum() {
-            self.rows = 0.0;
+            self.rows = self.rows.trunc();
         }
         self.rows = (self.rows - rows).clamp(-5000.0, 5000.0);
     }
@@ -60,6 +60,17 @@ mod tests {
         assert_eq!(scroll.take(), 30);
         scroll.push(0.0, 0, 16.0, 30);
         assert_eq!(scroll.take(), 0);
+    }
+
+    #[test]
+    fn reversal_preserves_queued_whole_rows() {
+        let mut scroll = ScrollAccumulator::default();
+        scroll.push(17.0, 0, 17.0, 30);
+        scroll.push(-17.0, 0, 17.0, 30);
+        assert_eq!(scroll.take(), 0);
+        scroll.push(-5.5, 1, 17.0, 30);
+        scroll.push(2.0, 1, 17.0, 30);
+        assert_eq!(scroll.take(), 3);
     }
 
     #[test]
