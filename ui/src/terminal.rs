@@ -623,7 +623,21 @@ fn setup() {
     let (cols, rows) = term.borrow_mut().fit();
     let theme = settings_theme();
     wasm_bindgen_futures::spawn_local(async move {
-        let _ = invoke("pty_spawn", SpawnArgs { rows, cols }).await;
+        // pty_spawn's Result used to be discarded: a failed shell spawn left a blank canvas
+        // with no feedback anywhere. It also returns an optional warning (no shell
+        // integration => no command journal), which is otherwise invisible.
+        match invoke("pty_spawn", SpawnArgs { rows, cols }).await {
+            Err(e) => {
+                let msg = e.as_string().unwrap_or_else(|| "failed to start the shell".into());
+                crate::bridge::term_write(format!("\r\n\x1b[31m[tachyon] {msg}\x1b[0m\r\n"));
+                return;
+            }
+            Ok(v) => {
+                if let Some(warning) = v.as_string() {
+                    crate::bridge::term_write(format!("\r\n\x1b[33m[tachyon] {warning}\x1b[0m\r\n"));
+                }
+            }
+        }
         // Apply the persisted theme to the engine now that it exists (fixes the grid rendering
         // default colors until the user re-touches the theme select). term_set_theme also emits
         // the initial full grid-damage repaint, so no separate term_full_repaint is needed.

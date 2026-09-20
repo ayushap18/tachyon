@@ -130,7 +130,9 @@ pub fn BlocksPanel() -> Element {
                     if more {
                         button {
                             class: "block-expand",
-                            onclick: move |_| { let mut j = state.journal; if let Some(b) = j.write().get_mut(i) { b.expanded = !b.expanded; }; },
+                            // by stable id, not Vec index: the journal is a ring that shifts
+                            // under us, so `i` can point at a different block by click time.
+                            onclick: move |_| { let mut j = state.journal; if let Some(b) = j.write().iter_mut().find(|b| b.id == bid) { b.expanded = !b.expanded; }; },
                             if expanded { "▾ collapse" } else { "▸ expand" }
                         }
                     }
@@ -146,7 +148,8 @@ pub fn BlocksPanel() -> Element {
                         button {
                             disabled: !has_cmd,
                             onclick: move |_| {
-                                let cmd = state.journal.read().get(i).map(|b| b.command.clone()).unwrap_or_default();
+                                // by stable id — rerunning the WRONG command is the one that bites
+                                let cmd = state.journal.read().iter().find(|b| b.id == bid).map(|b| b.command.clone()).unwrap_or_default();
                                 let cmd = cmd.replace(['\r', '\n'], " ").trim().to_string();
                                 if cmd.is_empty() { return; }
                                 state.close();
@@ -157,7 +160,7 @@ pub fn BlocksPanel() -> Element {
                         }
                         button {
                             onclick: move |_| {
-                                let out = state.journal.read().get(i).map(|b| b.output.clone()).unwrap_or_default();
+                                let out = state.journal.read().iter().find(|b| b.id == bid).map(|b| b.output.clone()).unwrap_or_default();
                                 clipboard_write(&out);
                                 copied.set(Some(i));
                             },

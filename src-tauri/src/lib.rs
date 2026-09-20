@@ -3,7 +3,6 @@ mod engine;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -16,7 +15,7 @@ struct PtyState {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
     shell_pid: Mutex<Option<u32>>,
-    // owns the grid: fed the same PTY bytes the base64 path emits, painted as "grid-damage"
+    // owns the grid: fed the raw PTY bytes, painted as "grid-damage"
     engine: Mutex<Option<engine::TerminalEngine>>,
 }
 
@@ -54,6 +53,13 @@ fn output_with_timeout(mut cmd: std::process::Command) -> Option<std::process::O
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+// Grid dimensions come from the webview and size a rows*cols allocation in the engine
+// and the vt100 parser, so they are a trust boundary: pty_spawn(65535, 65535) would try to
+// allocate ~4.3e9 cells. Nothing legitimate is outside this range.
+fn clamp_dim(v: u16) -> u16 {
+    v.clamp(1, 1000)
 }
 
 fn parse_lsof_cwd(output: &str) -> Option<String> {
@@ -102,8 +108,8 @@ fn shell_integration_script() -> String {
 }
 
 // ---- OSC 133 journal ----
-// The pty reader thread scans the RAW bytes (an ADDITIONAL consumer — the base64
-// pty-output emission is untouched, term.write stays byte-identical) for the OSC 133
+// The pty reader thread scans the RAW bytes (an ADDITIONAL consumer alongside the
+// grid engine, which is fed the same immutable slice) for the OSC 133
 // marks the injected zsh hooks emit: A (prompt start), C (output start), D;<code>
 // (command end). Finalized blocks live in a ring of 50 and are pushed to the webview
 // via "journal-block" events.
@@ -352,7 +358,7 @@ impl Default for JournalState {
 }
 
 fn journal_push(blocks: &Mutex<VecDeque<Block>>, block: &Block) {
-    let mut q = blocks.lock().unwrap();
+    let mut q = blocks.lock().unwrap_or_else(|e| e.into_inner());
     q.push_back(block.clone());
     if q.len() > 50 {
         q.pop_front();
@@ -365,24 +371,26 @@ fn last_failed(q: &VecDeque<Block>) -> Option<Block> {
 
 #[tauri::command]
 fn set_typed_command(journal: State<JournalState>, line: String) {
-    journal.scanner.lock().unwrap().set_typed(line);
+    journal.scanner.lock().unwrap_or_else(|e| e.into_inner()).set_typed(line);
 }
 
 #[tauri::command]
 fn journal_blocks(journal: State<JournalState>) -> Vec<Block> {
-    journal.blocks.lock().unwrap().iter().cloned().collect()
+    journal.blocks.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
 }
 
 #[tauri::command]
 fn last_failed_block(journal: State<JournalState>) -> Option<Block> {
-    last_failed(&journal.blocks.lock().unwrap())
+    last_failed(&journal.blocks.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 #[tauri::command]
-fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
-    let mut master_slot = state.master.lock().unwrap();
+fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<Option<String>, String> {
+    // rows/cols arrive raw from the webview and size a rows*cols allocation; clamp them.
+    let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
+    let mut master_slot = state.master.lock().unwrap_or_else(|e| e.into_inner());
     if master_slot.is_some() {
-        return Ok(()); // already running (e.g. frontend hot-reload)
+        return Ok(None); // already running (e.g. frontend hot-reload)
     }
 
     let pair = native_pty_system()
@@ -400,15 +408,24 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
     let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    // Without these hooks there is no OSC 133 journal at all — ⌘B is empty, ⌘E has nothing
+    // to explain, and every agent step waits out its full timeout. That used to happen
+    // silently; hand the reason back so the frontend can say so once.
+    let mut warning = None;
     if shell.ends_with("zsh") {
-        // best-effort: frontend falls back to buffer scraping if hooks never load
-        let _ = writer.write_all(shell_integration_script().as_bytes());
+        if let Err(e) = writer.write_all(shell_integration_script().as_bytes()) {
+            warning = Some(format!("shell integration failed to load ({e}) — no command journal"));
+        }
+    } else {
+        warning = Some(format!(
+            "shell integration is zsh-only; {shell} gets no command journal (⌘B/⌘E disabled)"
+        ));
     }
-    *state.writer.lock().unwrap() = Some(writer);
-    *state.shell_pid.lock().unwrap() = child.process_id();
-    *state.child.lock().unwrap() = Some(child);
+    *state.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+    *state.shell_pid.lock().unwrap_or_else(|e| e.into_inner()) = child.process_id();
+    *state.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
     *master_slot = Some(pair.master);
-    *state.engine.lock().unwrap() = Some(engine::TerminalEngine::new(cols, rows));
+    *state.engine.lock().unwrap_or_else(|e| e.into_inner()) = Some(engine::TerminalEngine::new(cols, rows));
 
     std::thread::spawn(move || {
         let journal = app.state::<JournalState>();
@@ -418,11 +435,8 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // live output — always first, base64, byte-identical; the OSC scan
-                    // below is an ADDITIONAL consumer of the same immutable slice
-                    let _ = app.emit("pty-output", STANDARD.encode(&buf[..n]));
                     // grid engine: same bytes -> screen model -> only changed cells painted.
-                    if let Some(eng) = pty.engine.lock().unwrap().as_mut() {
+                    if let Some(eng) = pty.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                         eng.feed(&buf[..n]); // always advance history
                         // Only repaint when at the live bottom. If the user is scrolled up reading
                         // history, freeze their view (the grid underneath is shifting as output
@@ -432,7 +446,7 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
                             let _ = app.emit("grid-damage", eng.take_damage());
                         }
                     }
-                    let finalized = journal.scanner.lock().unwrap().feed(&buf[..n]);
+                    let finalized = journal.scanner.lock().unwrap_or_else(|e| e.into_inner()).feed(&buf[..n]);
                     for block in finalized {
                         journal_push(&journal.blocks, &block); // no lock held across emit
                         let _ = journal.tx.send(block.clone()); // agent output capture (sync, no subscribers = Err, fine)
@@ -444,13 +458,13 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
         let _ = app.emit("pty-exit", ());
     });
 
-    Ok(())
+    Ok(warning)
 }
 
 // The ONLY two callers: the pty_write command (user keystrokes / prefill without newline)
 // and the agent loop's approved==true branch. Nothing else may write to the pty.
 fn pty_write_internal(state: &PtyState, data: &str) -> Result<(), String> {
-    match state.writer.lock().unwrap().as_mut() {
+    match state.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         Some(w) => w.write_all(data.as_bytes()).map_err(|e| e.to_string()),
         None => Err("pty not spawned".into()),
     }
@@ -462,7 +476,7 @@ fn pty_write(app: AppHandle, state: State<PtyState>, data: String) -> Result<(),
     // here (not just on the echo) so it snaps even when the foreground program doesn't echo
     // (sudo/ssh password prompts). Guarded on scrollback != 0 so normal typing at the bottom
     // stays an incremental diff, not a full repaint per keystroke.
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         if eng.scrollback() != 0 {
             eng.scroll_to_bottom();
             let _ = app.emit("grid-damage", eng.full_repaint());
@@ -474,7 +488,7 @@ fn pty_write(app: AppHandle, state: State<PtyState>, data: String) -> Result<(),
 // Scroll the native grid by `delta` rows (delta > 0 = up into history) and repaint.
 #[tauri::command]
 fn term_scroll(app: AppHandle, state: State<PtyState>, delta: i32) {
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         eng.scroll_by(delta);
         let _ = app.emit("grid-damage", eng.full_repaint());
     }
@@ -490,13 +504,14 @@ fn clipboard_set(text: String) -> Result<(), String> {
 
 #[tauri::command]
 fn pty_resize(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         eng.resize(cols, rows);
         // repaint immediately — the child may not write anything after a resize (a static
         // prompt, a paused pager), and the canvas was just blanked to the new dimensions.
         let _ = app.emit("grid-damage", eng.full_repaint());
     }
-    match state.master.lock().unwrap().as_ref() {
+    match state.master.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         Some(m) => m
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string()),
@@ -509,7 +524,7 @@ fn pty_resize(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> R
 // same grid-damage listener paints it (the caller need not apply the return value).
 #[tauri::command]
 fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         let _ = app.emit("grid-damage", eng.full_repaint());
     }
 }
@@ -519,7 +534,7 @@ fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
 // this only paints; it must not call pty_write_internal or write to the shell.
 #[tauri::command]
 fn term_write(app: AppHandle, state: State<PtyState>, text: String) {
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         eng.feed(text.as_bytes());
         let _ = app.emit("grid-damage", eng.take_damage());
     }
@@ -528,7 +543,7 @@ fn term_write(app: AppHandle, state: State<PtyState>, text: String) {
 // Settings panel: switch the terminal color table (chrome CSS is handled frontend-side).
 #[tauri::command]
 fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String) {
-    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         eng.set_theme(&name);
         let _ = app.emit("grid-damage", eng.full_repaint());
     }
@@ -848,6 +863,9 @@ static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// How long one approved agent command may take before the loop stops waiting for its
+// journal block. It does NOT kill the command — the shell keeps running it.
+const AGENT_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn http_client() -> Result<reqwest::Client, String> {
     if let Some(c) = HTTP.get() {
@@ -966,8 +984,8 @@ async fn nl_to_command(
     request: String,
 ) -> Result<NlCommand, String> {
     // extract everything guarded before the first .await — MutexGuard is !Send
-    let pid = *pty.shell_pid.lock().unwrap();
-    let jctx = journal_context(&journal.blocks.lock().unwrap());
+    let pid = *pty.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
+    let jctx = journal_context(&journal.blocks.lock().unwrap_or_else(|e| e.into_inner()));
     let user = format!("{request}\n\nContext:\n{}\n{jctx}", shell_context_line(pid));
     let command = strip_fences(&ai_call(AI_SYSTEM, &user).await?);
     if command.is_empty() {
@@ -981,7 +999,7 @@ async fn nl_to_command(
 async fn explain_last_error(journal: State<'_, JournalState>) -> Result<String, String> {
     // clone the block and drop the guard before the .await
     let block = {
-        let q = journal.blocks.lock().unwrap();
+        let q = journal.blocks.lock().unwrap_or_else(|e| e.into_inner());
         last_failed(&q).or_else(|| q.back().cloned())
     };
     let Some(b) = block else {
@@ -1466,7 +1484,7 @@ fn agent_start(app: AppHandle, task: String) -> Result<(), String> {
         }
         a.abort.store(false, SeqCst);
         // drop any stale sender — a decision from a previous run must never approve this one
-        a.decision.lock().unwrap().take();
+        a.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
     tauri::async_runtime::spawn(agent_loop(app, task));
     Ok(())
@@ -1474,7 +1492,7 @@ fn agent_start(app: AppHandle, task: String) -> Result<(), String> {
 
 #[tauri::command]
 fn agent_decide(agent: State<AgentState>, approved: bool) {
-    if let Some(tx) = agent.decision.lock().unwrap().take() {
+    if let Some(tx) = agent.decision.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = tx.send(approved);
     }
 }
@@ -1483,14 +1501,14 @@ fn agent_decide(agent: State<AgentState>, approved: bool) {
 fn agent_abort(agent: State<AgentState>) {
     agent.abort.store(true, SeqCst);
     // dropping the parked sender resolves the pending rx as Err → deny (fail-closed)
-    agent.decision.lock().unwrap().take();
+    agent.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
 }
 
 // park a fresh oneshot, emit the proposal, block until agent_decide. Every failure
 // mode (dropped sender, abort) resolves to false — fail-closed.
 async fn agent_propose(app: &AppHandle, payload: serde_json::Value) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    *app.state::<AgentState>().decision.lock().unwrap() = Some(tx);
+    *app.state::<AgentState>().decision.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     let _ = app.emit("agent-propose", payload);
     rx.await.unwrap_or(false)
 }
@@ -1530,8 +1548,8 @@ async fn agent_loop(app: AppHandle, task: String) {
     let aborted = |app: &AppHandle| app.state::<AgentState>().abort.load(SeqCst);
 
     // transcript seed: same shape as the old TS runAgent (context + recent journal)
-    let pid = *app.state::<PtyState>().shell_pid.lock().unwrap();
-    let jctx = journal_context(&app.state::<JournalState>().blocks.lock().unwrap());
+    let pid = *app.state::<PtyState>().shell_pid.lock().unwrap_or_else(|e| e.into_inner());
+    let jctx = journal_context(&app.state::<JournalState>().blocks.lock().unwrap_or_else(|e| e.into_inner()));
     let mut transcript = format!("Task: {task}\n\nContext:\n{}\n{jctx}\n", shell_context_line(pid));
 
     // tool discovery is best-effort; ureq is blocking → spawn_blocking
@@ -1596,8 +1614,12 @@ async fn agent_loop(app: AppHandle, task: String) {
                 }
                 // subscribe BEFORE writing so the finalized block can't slip past
                 let mut rx_block = app.state::<JournalState>().tx.subscribe();
+                // ...and drop anything already queued: a command from an earlier step that
+                // outran its timeout finalizes late, and used to be consumed as THIS step's
+                // result, making the agent reason over the wrong exit code and output.
+                while rx_block.try_recv().is_ok() {}
                 // clean journal label — agent commands have no typed line to scrape
-                app.state::<JournalState>().scanner.lock().unwrap().set_typed(cmd.clone());
+                app.state::<JournalState>().scanner.lock().unwrap_or_else(|e| e.into_inner()).set_typed(cmd.clone());
                 let _ = app.emit("agent-status", serde_json::json!({ "step": step, "status": "running" }));
                 // INVARIANT: the ONLY pty write in the agent path — lexically inside the
                 // approved==true branch, reachable only via agent_decide(true).
@@ -1607,12 +1629,25 @@ async fn agent_loop(app: AppHandle, task: String) {
                     done = true;
                     break;
                 }
-                // output + exit come from the L1 OSC journal; 20s ceiling like the old sentinel
-                let (output, code) =
-                    match tokio::time::timeout(std::time::Duration::from_secs(20), rx_block.recv()).await {
-                        Ok(Ok(b)) => (b.output, b.exit_code),
-                        _ => (String::new(), -1),
-                    };
+                // Output + exit come from the OSC 133 journal. Wait for the block whose
+                // command is the one we just wrote, not merely the next block to arrive:
+                // the 20s ceiling does not kill the shell command, so a straggler from an
+                // earlier step can still show up here. `Lagged` means the broadcast buffer
+                // overflowed (many commands finished at once) — resync rather than give up.
+                // ponytail: matches on the command text; two identical commands in
+                // consecutive steps can still alias. A per-block id would close that.
+                let (output, code) = {
+                    let deadline = tokio::time::Instant::now() + AGENT_STEP_TIMEOUT;
+                    let want = cmd.trim();
+                    loop {
+                        match tokio::time::timeout_at(deadline, rx_block.recv()).await {
+                            Ok(Ok(b)) if b.command.trim() == want => break (b.output, b.exit_code),
+                            Ok(Ok(_)) => continue,
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                            Ok(Err(_)) | Err(_) => break (String::new(), -1),
+                        }
+                    }
+                };
                 let _ = app.emit("agent-output", serde_json::json!({ "step": step, "text": format!("exit {code}") }));
                 let out = if code == -1 && output.is_empty() { "(no exit marker)".into() } else { truncate_chars(&output, 2000) };
                 transcript.push_str(&format!("\nCommand: {cmd}\nExit code: {code}\nOutput:\n{out}\n"));
@@ -1664,7 +1699,7 @@ async fn agent_loop(app: AppHandle, task: String) {
 
 #[tauri::command]
 async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String> {
-    let pid = *state.shell_pid.lock().unwrap();
+    let pid = *state.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
     let cwd = pid.and_then(cwd_of_pid);
     let (branch, dirty) = cwd.as_deref().map(git_info).unwrap_or((None, 0));
     Ok(ShellContext { cwd, branch, dirty, shell_pid: pid })
@@ -2149,7 +2184,7 @@ mod tests {
             let b = Block { command: format!("c{i}"), exit_code: 0, output: String::new(), duration_ms: 0 };
             journal_push(&blocks, &b);
         }
-        let q = blocks.lock().unwrap();
+        let q = blocks.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(q.len(), 50);
         assert_eq!(q.front().unwrap().command, "c5");
         assert_eq!(q.back().unwrap().command, "c54");
@@ -2266,14 +2301,5 @@ mod tests {
     fn agent_multibyte_reply_no_panic() {
         // strip_prefix_ci must not slice mid-codepoint
         assert_eq!(parse_agent_reply("échо"), AgentAction::Run("échо".into()));
-    }
-
-    #[test]
-    fn pty_output_base64_roundtrip() {
-        // bytes exercise non-ASCII + padding, like real pty chunks
-        let bytes: &[u8] = b"hi\x1b]133;A\x07\xff\x00";
-        let enc = STANDARD.encode(bytes);
-        assert_eq!(enc, "aGkbXTEzMztBB/8A");
-        assert_eq!(STANDARD.decode(&enc).unwrap(), bytes);
     }
 }
