@@ -1,3 +1,5 @@
+> **Historical, superseded.** This is the pre-implementation spec. The shipped engine is `vt100` (`src-tauri/src/engine.rs`), not `alacritty_terminal`; the command list and event names below are also out of date. Current design: [docs/architecture.md](../../architecture.md).
+
 # Tachyon v0.1.5-beta — Pure-Rust Frontend (Dioxus + alacritty_terminal)
 
 **Status:** approved 2026-07-18. Branch `v0.1.5-rust-frontend`.

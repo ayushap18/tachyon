@@ -8,9 +8,29 @@ on:
 
 jobs:
   test:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # Tauri v2 on Linux links WebKitGTK 4.1 + GTK 3 through pkg-config.
+      # libwebkit2gtk-4.1-dev pulls in libsoup-3.0 and javascriptcoregtk. Checked against
+      # src-tauri/Cargo.lock: there is no openssl-sys (reqwest/ureq use rustls), no
+      # libxdo-sys, and arboard 3 talks X11 through x11rb (pure Rust, no libxcb headers),
+      # so libssl-dev / libxdo-dev / libxcb-* are deliberately absent. librsvg2-dev and
+      # patchelf are bundling-only; see release.yml.
+      # zsh is not a build dep: evals/agent.mjs runs each step under /bin/zsh (the shell
+      # the app's prompts target) and the Ubuntu runner image does not ship it.
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev build-essential pkg-config zsh
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -25,8 +45,8 @@ jobs:
         run: cargo test
         working-directory: src-tauri
 
-      # The ui crate's tests are pure logic (key encoding, vim motions, selection)
-      # and run on the host; only the real build needs the wasm target.
+      # The ui crate's tests are pure logic (key encoding, keybindings, vim motions,
+      # selection) and run on the host; only the real build needs the wasm target.
       - name: Frontend tests
         run: cargo test
         working-directory: ui
@@ -35,10 +55,14 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
         working-directory: ui
 
-      # Keyless, deterministic, exits non-zero on failure: verifies evals/danger.mjs
-      # still mirrors the Rust danger gate. No npm install — it uses node stdlib only.
+      # Keyless, deterministic, exit non-zero on failure. No npm install: the eval
+      # scripts use the node stdlib only. If one ever imports a package, add `npm ci`.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Danger-gate mirror self-test
         run: npm run eval:selftest
+      - name: Danger-gate corpus (recall / false-positive rate)
+        run: npm run eval:gate
+      - name: Agent-loop eval self-test (scripted mock model)
+        run: npm run eval:agent:selftest
