@@ -172,11 +172,32 @@ CORS; servers persist to `~/.config/tachyon/mcp.json`. In a run the agent may an
 On launch, Tachyon injects zsh `precmd`/`preexec` hooks that emit OSC 133 marks, so it tracks real command
 boundaries and exit codes off the PTY stream (a journal of `{command, exitCode, output}` blocks, plus wall-clock duration per block) instead of
 scraping the screen. ⌘E error autopsy uses the exact failed command + exit code + output; the status bar shows a
-`✗ <code>` badge on failure. Falls back to buffer scraping if the hooks don't load (non-zsh shells, etc.).
+`✗ <code>` badge on failure. **zsh only today** — under bash/fish the hooks don't load, so the journal stays empty and ⌘B/⌘E have nothing to work with. bash and fish hooks are planned.
 
 ## Run it
 
+Prerequisites: **Rust** (stable), **Node 22+**, and **dioxus-cli** — the frontend is a Dioxus
+WASM crate, so `dx` has to be on your PATH before Tauri can build it.
+
 ```sh
+rustup target add wasm32-unknown-unknown
+cargo binstall dioxus-cli@0.7.9      # or: cargo install dioxus-cli --version 0.7.9 --locked
 npm install
 npm run tauri dev
 ```
+
+`cargo binstall` fetches a prebuilt binary; prefer it if you have it, since building dioxus-cli
+from source can fail on current stable. `npm run tauri build` produces the release bundle.
+
+## Tests
+
+```sh
+cd src-tauri && cargo test          # backend: PTY, OSC journal, providers, danger gate, agent parsing
+cd ui && cargo test                 # frontend logic: key encoding, vim motions, selection
+cd ui && cargo check --target wasm32-unknown-unknown
+npm run eval:selftest               # danger-gate mirror check, no API key needed
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -11,16 +11,34 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # two independent workspaces (ui/Cargo.toml declares its own), so two caches
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+            ui
+
+      - name: Backend tests
+        run: cargo test
+        working-directory: src-tauri
+
+      # The ui crate's tests are pure logic (key encoding, vim motions, selection)
+      # and run on the host; only the real build needs the wasm target.
+      - name: Frontend tests
+        run: cargo test
+        working-directory: ui
+
+      - name: Frontend compiles to wasm
+        run: cargo check --target wasm32-unknown-unknown
+        working-directory: ui
+
+      # Keyless, deterministic, exits non-zero on failure: verifies evals/danger.mjs
+      # still mirrors the Rust danger gate. No npm install — it uses node stdlib only.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - run: npm install
-      - run: npx tsc --noEmit
-      - run: npm run build
-      - run: cargo test
-        working-directory: src-tauri
+      - name: Danger-gate mirror self-test
+        run: npm run eval:selftest
