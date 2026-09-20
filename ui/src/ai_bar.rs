@@ -17,7 +17,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
 use crate::bridge::{invoke, listen, term_write, NoArgs, WriteArgs};
-use crate::complete::{accept_text, list_key, list_open, slash_rows, tab_prefix, ListOp};
+use crate::complete::{accept_text, list_key, list_open, rows, tab_prefix, wants_models, Ctx, ListOp};
 
 // ---- invoke arg shapes ----
 #[derive(Serialize)]
@@ -35,6 +35,11 @@ struct DecideArgs {
 #[derive(Serialize)]
 struct SlashArgs {
     input: String,
+}
+/// one word, so serde's camelCase mapping is a no-op
+#[derive(Serialize)]
+struct IdArgs {
+    id: String,
 }
 
 // ---- response / event shapes ----
@@ -55,6 +60,16 @@ struct Provider {
     has_key: bool,
     #[serde(default)]
     kind: String,
+}
+/// PublicProviderState: ids only. `hidden` holds removed built-ins, which `/use` revives.
+#[derive(Deserialize)]
+struct ProviderList {
+    #[serde(default)]
+    active: String,
+    #[serde(default)]
+    providers: Vec<Provider>,
+    #[serde(default)]
+    hidden: Vec<String>,
 }
 #[derive(Deserialize)]
 struct AgentOutput {
@@ -144,6 +159,10 @@ pub fn AiBar() -> Element {
     // highlighted suggestion row. None by default and on every edit, so Enter keeps its
     // submit meaning unless the user deliberately arrowed/tabbed onto a row.
     let mut sel = use_signal(|| None::<usize>);
+    // everything the completer may know: ids only, filled on open from two disk reads.
+    let mut ctx = use_signal(Ctx::default);
+    // one model fetch in flight at a time — Tab repeats must not fan out into N requests.
+    let mut models_busy = use_signal(|| false);
     // the input's editability is derived from pending_gate || agent_running at render —
     // never a separate signal, so no code path can leave an armed gate editable.
     let mut pending_gate = use_signal(|| false);
@@ -227,6 +246,33 @@ pub fn AiBar() -> Element {
                             Err(e) => status.set(err_str(e)),
                         }
                     });
+                    // the component stays mounted across close/open, so the model cache
+                    // MUST be cleared here or a stale provider's models outlive their slot
+                    ctx.set(Ctx::default());
+                    spawn_local(async move {
+                        // both are disk reads (load_state / load_mcp): no network on bar
+                        // open, and none on a keystroke. Errors are ignored, as in
+                        // palette.rs — the status line belongs to the gate, not to this.
+                        let mut c = Ctx::default();
+                        if let Ok(v) = invoke("provider_state", NoArgs {}).await {
+                            if let Ok(ps) = serde_wasm_bindgen::from_value::<ProviderList>(v) {
+                                c.active = ps.active;
+                                c.providers = ps.providers.into_iter().map(|p| p.id).collect();
+                                c.hidden = ps.hidden;
+                            }
+                        }
+                        if let Ok(v) = invoke("mcp_names", NoArgs {}).await {
+                            if let Ok(n) = serde_wasm_bindgen::from_value::<Vec<String>>(v) {
+                                c.mcp = n;
+                            }
+                        }
+                        ctx.set(c);
+                        // the rows under the cursor may have just been replaced by argument
+                        // rows: a highlight from before would now point at a different
+                        // command, so it is dropped rather than moved. Same rule as the
+                        // model fetch below; Enter falls back to submitting.
+                        sel.set(None);
+                    });
                 }
             }
             _ => {
@@ -251,7 +297,7 @@ pub fn AiBar() -> Element {
     let agent = overlay == Overlay::Agent;
     // plain values, not guards: a read()/peek() guard alive across a .set panics, and the
     // key branch below writes input/sel
-    let rows = slash_rows(&input.read());
+    let rows = rows(&input.read(), &ctx.read());
     let open = list_open(*pending_gate.read(), *agent_running.read(), rows.len());
     let sel_eff = (*sel.read()).filter(|i| *i < rows.len());
     let rows_for_key = rows.clone();
@@ -342,7 +388,7 @@ pub fn AiBar() -> Element {
                             ListOp::Accept(i) => {
                                 e.prevent_default();
                                 e.stop_propagation();
-                                if let Some(a) = accept_text(rows_for_key[i].0, &cur) {
+                                if let Some(a) = accept_text(&rows_for_key[i].0, &cur) {
                                     input.set(a);
                                 }
                                 sel.set(None);
@@ -351,6 +397,37 @@ pub fn AiBar() -> Element {
                             ListOp::Prefix => {
                                 e.prevent_default();
                                 e.stop_propagation();
+                                // the ONLY network path in this feature, and it is a
+                                // deliberate Tab — never a keystroke, never oninput.
+                                if let Some(id) = wants_models(&cur, &ctx.peek()) {
+                                    if !*models_busy.peek() {
+                                        models_busy.set(true);
+                                        let prev = status.peek().to_string();
+                                        let mine = format!("listing models from {id}…");
+                                        status.set(mine.clone());
+                                        spawn_local(async move {
+                                            let got = invoke("provider_models", IdArgs { id: id.clone() }).await;
+                                            let list = got
+                                                .ok()
+                                                .and_then(|v| serde_wasm_bindgen::from_value::<Vec<String>>(v).ok())
+                                                .unwrap_or_default();
+                                            ctx.with_mut(|c| c.models = Some((id, list)));
+                                            models_busy.set(false);
+                                            sel.set(None); // the row count just changed under the user
+                                            // a gate or run that began during the round trip
+                                            // owns the status line — leave it theirs. So does
+                                            // a NEW bar session: `prev` is a provider line
+                                            // captured before the close, so restore it only if
+                                            // our own "listing…" is still the thing on screen.
+                                            if !agent_owns_bar(*pending_gate.peek(), *agent_running.peek())
+                                                && *status.peek() == mine
+                                            {
+                                                status.set(prev);
+                                            }
+                                        });
+                                    }
+                                    return;
+                                }
                                 match tab_prefix(&rows_for_key, &cur) {
                                     Some(p) => {
                                         input.set(p);
@@ -395,7 +472,16 @@ pub fn AiBar() -> Element {
                                         if *pending_gate.peek() {
                                             return;
                                         }
-                                        status.set(err_str(err));
+                                        // "terminal busy" means the claim went to SOMEONE ELSE,
+                                        // who may already be past their gate and writing to the
+                                        // pty. Clearing agent_running here would re-open the
+                                        // list, un-readonly the input and turn ⌘J back from
+                                        // abort into toggle mid-run. Their agent-done resets us.
+                                        let msg = err_str(err);
+                                        if msg.starts_with("terminal busy") {
+                                            return;
+                                        }
+                                        status.set(msg);
                                         agent_running.set(false);
                                     }
                                 });
@@ -439,7 +525,9 @@ pub fn AiBar() -> Element {
             if open {
                 ul { id: "ai-list",
                     for (i, (form, detail)) in rows.into_iter().enumerate() {
-                        li { key: "{form}", class: if Some(i) == sel_eff { "sel" } else { "" },
+                        // a hand-edited providers.json can hold two entries with the same
+                        // id, so the row text alone is not a unique key
+                        li { key: "{i}-{form}", class: if Some(i) == sel_eff { "sel" } else { "" },
                             span { class: "label", "{form}" }
                             span { class: "hint", "{detail}" }
                         }

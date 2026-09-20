@@ -27,8 +27,6 @@ const MAX_BODY: u64 = 1 << 20;
 // in any meaningful sense.
 const MAX_COMMAND_CHARS: usize = 4096;
 const OUTPUT_CHARS: usize = 4000;
-// an approval sooner than this after the bar appeared was a stray keystroke, not a decision
-const MIN_REVIEW: std::time::Duration = std::time::Duration::from_secs(1);
 // newest first: an unknown requested version is answered with our latest, per the spec
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const BUSY: &str = "terminal busy: the built-in agent is running or another run_command is awaiting approval \u{2014} retry when it finishes";
@@ -407,23 +405,14 @@ async fn run_gated(app: &AppHandle, cmd: &str) -> Result<String, String> {
 
     // Unlike the built-in agent's, these proposals are UNSOLICITED: the bar takes focus while
     // the user is typing in the shell, so the Enter that ends their own command would land
-    // on it and approve a command they never read — and a hostile token holder could spam
-    // proposals to catch one. An approval faster than a human can read is therefore not a
-    // decision: show the proposal again. Never approves early; a held-down Enter just loops.
-    // ponytail: a time floor only covers a keystroke already in flight. Someone typing
-    // blind for longer than MIN_REVIEW still approves. The real fix is a distinct chord for
-    // external approvals (danger-gate.md, "What would make it stronger" #2).
-    let approved = loop {
-        let shown = std::time::Instant::now();
-        let ok = agent_propose(
-            app,
-            json!({ "step": 0, "kind": "run", "text": cmd, "args": null, "danger": is_dangerous(cmd), "external": true }),
-        )
-        .await;
-        if !(ok && shown.elapsed() < MIN_REVIEW) || aborted() {
-            break ok;
-        }
-    };
+    // on it and approve a command they never read. `external: true` makes the bar demand a
+    // chord instead of a bare Enter; the MIN_REVIEW floor that used to loop here now lives
+    // in agent_propose itself, so the built-in agent's proposals get it too.
+    let approved = agent_propose(
+        app,
+        json!({ "step": 0, "kind": "run", "text": cmd, "args": null, "danger": is_dangerous(cmd), "external": true }),
+    )
+    .await;
 
     let result = async {
         // re-check abort between the await and the write, as agent_loop does

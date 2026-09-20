@@ -698,7 +698,10 @@ struct ProviderState {
 struct PublicProvider {
     id: String,
     kind: String,
-    base_url: String,
+    // NO base_url: it is user-set and credential-bearing (`/url <id> https://gw/v1?api-key=…`,
+    // `/local <id> https://user:tok@host/v1 …`), and mcp_names already refuses to send an MCP
+    // url across for exactly that reason. Nothing in the webview reads it. If it must ever be
+    // shown, send a host-only derivation, never the raw string.
     model: String,
     has_key: bool,
     // "saved" | "env" | "none" — where the key comes from, never the key
@@ -712,7 +715,6 @@ impl From<&Provider> for PublicProvider {
         PublicProvider {
             id: p.id.clone(),
             kind: p.kind.clone(),
-            base_url: p.base_url.clone(),
             model: p.model.clone(),
             has_key: source != "none",
             key_source: source,
@@ -724,11 +726,18 @@ impl From<&Provider> for PublicProvider {
 struct PublicProviderState {
     active: String,
     providers: Vec<PublicProvider>,
+    // built-in ids the user removed — use_provider revives them, so the completer must be
+    // able to offer them. Ids only; SLASH_HELP already prints this list.
+    hidden: Vec<String>,
 }
 
 impl From<&ProviderState> for PublicProviderState {
     fn from(s: &ProviderState) -> Self {
-        PublicProviderState { active: s.active.clone(), providers: s.providers.iter().map(PublicProvider::from).collect() }
+        PublicProviderState {
+            active: s.active.clone(),
+            providers: s.providers.iter().map(PublicProvider::from).collect(),
+            hidden: s.hidden.clone(),
+        }
     }
 }
 
@@ -913,9 +922,28 @@ fn mutate<F: FnOnce(&mut ProviderState) -> Result<(), String>>(f: F) -> Result<P
     Ok(state)
 }
 
+/// Ceiling on the ids provider_models hands the completer. Same order as local_models'
+/// MODELS_SHOWN — a suggestion list nobody scrolls past 200 of.
+const MODELS_SUGGESTED: usize = 200;
+
 #[tauri::command]
 fn provider_state() -> Result<PublicProviderState, String> {
     Ok((&load_state()?).into())
+}
+
+// (async): list_models does a blocking GET — must not run on the main thread.
+/// The model ids a provider actually serves, as DATA. /models only returns rendered ANSI.
+#[tauri::command(async)]
+fn provider_models(id: String) -> Result<Vec<String>, String> {
+    let st = load_state()?;
+    let p = st.providers.iter().find(|p| p.id == id).ok_or_else(|| format!("unknown provider: {id}"))?;
+    // A hostile /url gateway can answer with a 10 MB body — hundreds of thousands of ids —
+    // and the completer formats a row per candidate on every keystroke. Completion is a
+    // filtered list, not a catalogue: /models is the catalogue and keeps the true count.
+    local_models::list_models(p).map(|mut m| {
+        m.truncate(MODELS_SUGGESTED);
+        m
+    })
 }
 
 #[tauri::command]
@@ -1087,8 +1115,25 @@ fn strip_fences(s: &str) -> String {
 // Cf, not Cc: `char::is_control` is category Cc only, so a bidi override can reorder what the
 // approver reads while the bytes written to the pty stay unchanged, and a zero-width char can
 // sit inside a DANGER_PATTERNS substring to defeat `is_dangerous`.
+// KEEP IN SYNC BY HAND with safe_row, ui/src/complete.rs (ui is outside this workspace).
 pub(crate) fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+    matches!(
+        c,
+        // enumerated rather than a unicode-properties crate: this is every Cf block that
+        // exists today, and U+061C (the Arabic twin of the RLM already listed) and the
+        // U+E0000 tag block are the ones a hand-written four-range list keeps missing.
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 fn one_line(cmd: &str) -> String {
@@ -1520,6 +1565,13 @@ fn mcp_remove(name: String) -> Result<(), String> {
 #[tauri::command]
 fn mcp_servers() -> Result<Vec<McpServer>, String> {
     Ok(load_mcp()?.servers.into_iter().map(McpServer::redacted).collect())
+}
+
+/// Names only. McpServer::redacted() blanks header VALUES but still carries `url`, and an
+/// HTTP MCP url can carry a token in its query string — that must not cross IPC for a list.
+#[tauri::command]
+fn mcp_names() -> Result<Vec<String>, String> {
+    Ok(load_mcp()?.servers.into_iter().map(|s| s.name).collect())
 }
 
 impl McpPool {
@@ -2028,13 +2080,36 @@ fn agent_abort(agent: State<AgentState>) {
     agent.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
 }
 
+// an approval sooner than this after the bar appeared was a keystroke already in flight,
+// not a decision. Lives here, not in mcp_server, because BOTH drivers route through
+// agent_propose: the built-in agent's proposals are solicited but still land mid-keystroke
+// (⌘J, type, Enter, and the second Enter of an impatient user meets the gate ~0ms old).
+// ponytail: a time floor only covers a keystroke already in flight. Someone typing blind
+// for longer than MIN_REVIEW still approves. The real fix is a distinct chord for every
+// approval (danger-gate.md, "What would make it stronger" #2).
+pub(crate) const MIN_REVIEW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Does this decision stand, or must the proposal be shown again? Only an APPROVAL faster
+/// than MIN_REVIEW is re-shown: denial and abort resolve immediately, so fail-closed is
+/// never delayed and a held-down Enter just loops here approving nothing. Pure, so the rule
+/// is checkable without an AppHandle.
+fn decision_stands(approved: bool, elapsed: std::time::Duration, aborted: bool) -> bool {
+    !approved || aborted || elapsed >= MIN_REVIEW
+}
+
 // park a fresh oneshot, emit the proposal, block until agent_decide. Every failure
 // mode (dropped sender, abort) resolves to false — fail-closed.
 async fn agent_propose(app: &AppHandle, payload: serde_json::Value) -> bool {
-    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    *app.state::<AgentState>().decision.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-    let _ = app.emit("agent-propose", payload);
-    rx.await.unwrap_or(false)
+    loop {
+        let shown = std::time::Instant::now();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        *app.state::<AgentState>().decision.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        let _ = app.emit("agent-propose", payload.clone());
+        let ok = rx.await.unwrap_or(false);
+        if decision_stands(ok, shown.elapsed(), app.state::<AgentState>().abort.load(SeqCst)) {
+            return ok;
+        }
+    }
 }
 
 /// Clears `running` (and any parked proposal) however agent_loop leaves — return, break,
@@ -2275,6 +2350,7 @@ pub fn run() {
             get_context,
             check_dangerous,
             provider_state,
+            provider_models,
             provider_active,
             provider_set_key,
             provider_set_model,
@@ -2291,6 +2367,7 @@ pub fn run() {
             mcp_add,
             mcp_remove,
             mcp_servers,
+            mcp_names,
             mcp_list_tools,
             mcp_call,
             run_slash,
@@ -2887,6 +2964,25 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(!serde_json::to_string(&s).unwrap().contains("hidden"));
     }
 
+    /// The review floor lives in agent_propose, so BOTH drivers get it — the built-in
+    /// agent's Enter is bare, so it is the one that needed it most.
+    #[test]
+    fn only_a_too_fast_approval_is_re_shown() {
+        use std::time::Duration;
+        let fast = Duration::from_millis(20);
+        let slow = MIN_REVIEW + Duration::from_millis(1);
+        for (approved, elapsed, aborted, stands) in [
+            (true, fast, false, false), // the only re-show: approved before it could be read
+            (true, slow, false, true),
+            (true, fast, true, true),  // abort resolves now; never loop a user out of quitting
+            (false, fast, false, true), // denial is never delayed
+            (false, slow, false, true),
+            (false, fast, true, true),
+        ] {
+            assert_eq!(decision_stands(approved, elapsed, aborted), stands, "{approved} {elapsed:?} {aborted}");
+        }
+    }
+
     #[test]
     fn public_provider_reports_key_source_not_key() {
         // ids whose env var cannot plausibly be set on a dev machine
@@ -2896,9 +2992,13 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert_eq!(public.key_source, "none");
 
         p.key = "sk-saved-secret".into();
+        // a gateway url is a credential too — `/url` and `/local` both let the user put a
+        // token in it, so neither the value nor the field may cross the bridge
+        p.base_url = "https://gw.example/v1?api-key=URLSECRET".into();
         let json = serde_json::to_string(&PublicProvider::from(&p)).unwrap();
         assert!(json.contains(r#""has_key":true"#) && json.contains(r#""key_source":"saved""#));
         assert!(!json.contains("sk-saved-secret"));
+        assert!(!json.contains("URLSECRET") && !json.contains("base_url"), "{json}");
 
         let mut s = ProviderState::defaults();
         s.providers.push(p);
@@ -3392,5 +3492,25 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
     fn agent_multibyte_reply_no_panic() {
         // strip_prefix_ci must not slice mid-codepoint
         assert_eq!(parse_agent_reply("échо"), AgentAction::Run("échо".into()));
+    }
+
+    #[test]
+    fn public_state_carries_hidden_ids_only() {
+        let mut st = ProviderState {
+            active: "openai".into(),
+            providers: vec![builtin("openai", "openai", "https://api.openai.com/v1", "gpt-4o")],
+            hidden: vec!["groq".into()],
+        };
+        st.providers[0].key = "sk-saved-secret".into();
+
+        let json = serde_json::to_string(&PublicProviderState::from(&st)).unwrap();
+        assert!(json.contains(r#""hidden":["groq"]"#), "{json}");
+        assert!(!json.contains("sk-saved-secret") && !json.contains("\"key\""), "{json}");
+
+        // the bridge view must not grow a field: only these three ever cross
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let mut keys: Vec<&str> = v.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["active", "hidden", "providers"]);
     }
 }
