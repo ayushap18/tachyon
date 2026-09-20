@@ -76,12 +76,12 @@ All business logic lives Rust-side: the PTY, the vt100 terminal engine, AI compl
 
 ## Status
 
-**v0.1.5-beta** — everything on the roadmap below is built and working: a real PTY terminal
+**v0.1.5** — everything on the roadmap below is built and working: a real PTY terminal
 with a Rust `vt100` engine, ⌘K natural language → command, ⌘J agent mode with per-step
 approval gates, ⌘E error autopsy, MCP tool calls, and an eval harness (104 NL + 22
 adversarial safety cases) whose latest numbers are in [Eval results](#eval-results).
 
-Beta software: it drives your real shell, so the danger gate and the approval gates are the
+Still early software: it drives your real shell, so the danger gate and the approval gates are the
 parts to trust least and read first (`is_dangerous` in `src-tauri/src/lib.rs`).
 
 ## Roadmap
