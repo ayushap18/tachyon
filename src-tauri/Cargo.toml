@@ -31,4 +31,7 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 vt100 = "0.15"
 # system clipboard from Rust (webview navigator.clipboard is blocked in the Tauri webview)
 arboard = "3"
-
+# MCP server mode (mcp_server.rs): a blocking, thread-based HTTP/1.1 listener. Chosen over
+# hyper (already in the tree via reqwest) because that needs the server feature plus
+# hyper-util and an async accept loop; this is 4 tiny transitive crates, no TLS, no runtime.
+tiny_http = "0.12"
