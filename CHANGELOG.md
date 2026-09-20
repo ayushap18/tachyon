@@ -4,7 +4,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 Only `v0.1.3` exists as a git tag, and no commit is labelled 0.1.2.
 
-## Unreleased
+## 0.2.0 — 2026-09-20
+
+First tagged release of the Rust-frontend line: 0.1.5 shipped the Dioxus/WASM rewrite but was
+never tagged, so this release contains it as well as everything below.
 
 ### Added
 - Linux support: the backend builds and runs on Linux, CI tests macOS and Ubuntu, and tagged
