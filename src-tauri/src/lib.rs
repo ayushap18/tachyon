@@ -734,7 +734,10 @@ impl ProviderState {
             providers: vec![
                 builtin("claude", "anthropic", "", "claude-opus-5"),
                 builtin("openai", "openai", "https://api.openai.com/v1", "gpt-4o"),
-                builtin("groq", "openai", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+                // Chosen from evals/baseline, not by guess: on the agent-loop eval qwen3.8-27b
+                // completed 11/11 tasks; gpt-oss-120b 4/11 (it answers DONE having run
+                // nothing) and gpt-oss-20b 1/11 (Groq rejects its replies as tool calls).
+                builtin("groq", "openai", "https://api.groq.com/openai/v1", "qwen/qwen3.8-27b"),
                 builtin("gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
                 builtin("kimi", "openai", "https://api.moonshot.ai/v1", "moonshot-v1-8k"),
                 builtin("deepseek", "openai", "https://api.deepseek.com", "deepseek-chat"),

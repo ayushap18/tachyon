@@ -183,6 +183,13 @@ fn tool_list() -> Value {
 /// overrides that reorder what the approver reads.
 fn parse_run_args(args: &Value) -> Result<String, String> {
     let raw = args.get("command").and_then(Value::as_str).ok_or("run_command: `command` (string) is required")?;
+    // Checked on the RAW input, before one_line: one_line sanitizes control characters out of
+    // a model's reply (a model cannot be refused), but an external client that sends a bare
+    // CR, a tab or an escape sequence is refused outright rather than quietly cleaned up.
+    // Line breaks (\n, \r\n) are legitimate — they are folded and shown, like the agent's.
+    if raw.replace("\r\n", "\n").chars().any(|c| c.is_control() && c != '\n') {
+        return Err("run_command: `command` contains control or bidi-override characters".into());
+    }
     let cmd = one_line(raw);
     if cmd.is_empty() {
         return Err("run_command: `command` is empty".into());
@@ -766,7 +773,8 @@ mod tests {
         assert!(parse_run_args(&json!({ "command": "echo hi\rrm -rf ~" })).is_err());
         assert!(parse_run_args(&json!({ "command": "ls\u{1b}[2J" })).is_err());
         assert!(parse_run_args(&json!({ "command": "ls\tsrc" })).is_err()); // tab = completion
-        assert_eq!(parse_run_args(&json!({ "command": "ls\t" })).unwrap(), "ls"); // edges are trimmed by one_line
+        assert!(parse_run_args(&json!({ "command": "ls\t" })).is_err()); // even at the edge: refused, not trimmed
+        assert_eq!(parse_run_args(&json!({ "command": "echo a\r\necho b" })).unwrap(), "echo a; echo b"); // CRLF is a line break
         assert!(parse_run_args(&json!({ "command": "ls \u{202e}~ fr- mr" })).is_err());
         assert!(parse_run_args(&json!({ "command": "x".repeat(MAX_COMMAND_CHARS + 1) })).is_err());
         assert!(parse_run_args(&json!({ "command": "x".repeat(MAX_COMMAND_CHARS) })).is_ok());

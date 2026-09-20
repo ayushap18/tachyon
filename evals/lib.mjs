@@ -55,7 +55,7 @@ export function loadProviders(keylessHint) {
   const ENV_FALLBACKS = [
     {
       env: "GROQ_API_KEY",
-      def: { id: "groq", kind: "openai", base_url: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b" },
+      def: { id: "groq", kind: "openai", base_url: "https://api.groq.com/openai/v1", model: "qwen/qwen3.8-27b" },
     },
     { env: "ANTHROPIC_API_KEY", def: { id: "claude", kind: "anthropic", model: "claude-opus-4-8" } },
   ];
