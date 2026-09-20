@@ -4,6 +4,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.3 — 2026-09-21
+
+### Security
+- **Approval-gate bypass.** Pressing ⌘K (or ⌘P, ⌘, ⌘B) while an agent proposal was awaiting
+  your decision unmounted the bar without clearing the gate, leaving the backend parked. The
+  close path then blanked the text and made the input editable again. Reopening gave an empty,
+  editable bar with the gate still armed, and the next Enter approved a command that was no
+  longer on screen. `readonly` is now derived from the gate rather than a signal any path can
+  clear, and closing preserves the proposal so reopening shows what Enter approves.
+- **Gate races in async continuations.** Continuations re-checked the gate only once, after
+  their first await, so a proposal arriving during a later round trip could have its status
+  overwritten or its pending decision discarded. One predicate, re-checked after every await,
+  with a table test over all four states.
+- **Passwords could reach the AI provider.** Input typed at an unechoed prompt (sudo, ssh) was
+  captured and, because it was never cleared at a prompt mark, became the *next* command's
+  journal label — visible in ⌘B, returned by the MCP `read_journal` tool, and interpolated into
+  the context sent to the model. Reachable by re-running a recalled command with ^O or ^X^E,
+  which send no typed line. Cleared at the prompt mark now.
+- Bidi and zero-width characters survived command folding, so a displayed command could be
+  visually reordered; and remote MCP tool names and descriptions were painted through the
+  terminal writer, which interprets escape sequences. Both are neutralised at ingest.
+
+### Added
+- ⌘K suggests slash commands as you type, with each command's usage as the detail. Nothing is
+  selected by default, so Enter keeps its submit meaning unless you arrow or Tab onto a row;
+  accepting only fills the input and never writes to the shell. Composing and auto-repeating
+  keys are ignored. Pure logic lives in `ui/src/complete.rs` and is host-tested.
+
+### Fixed
+- The command palette could jump its highlight to a row you never selected when late results
+  arrived, because the selection was clamped for display but never written back.
+
+### Not built
+- ⌘K history. Excluding lines starting with `/` is not sufficient protection: the bar's main
+  use is free text, so `deploy with GITHUB_TOKEN=...` is an ordinary non-slash line that would
+  have been persisted in plaintext.
+
 ## 0.2.2 — 2026-09-20
 
 ### Fixed
