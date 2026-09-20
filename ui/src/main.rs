@@ -4,6 +4,7 @@ mod blocks;
 mod bridge;
 mod keymap;
 mod palette;
+mod scroll;
 mod settings;
 mod status;
 mod terminal;

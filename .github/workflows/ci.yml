@@ -66,3 +66,5 @@ jobs:
         run: npm run eval:gate
       - name: Agent-loop eval self-test (scripted mock model)
         run: npm run eval:agent:selftest
+      - name: Release artifact validation
+        run: npm run test:release

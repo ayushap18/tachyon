@@ -575,8 +575,9 @@ fn pty_write(app: AppHandle, state: State<PtyState>, data: String) -> Result<(),
 #[tauri::command]
 fn term_scroll(app: AppHandle, state: State<PtyState>, delta: i32) {
     if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        eng.scroll_by(delta);
-        let _ = app.emit("grid-damage", eng.full_repaint());
+        if eng.scroll_by(delta) {
+            let _ = app.emit("grid-damage", eng.take_damage());
+        }
     }
 }
 

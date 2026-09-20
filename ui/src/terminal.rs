@@ -343,6 +343,11 @@ impl Term {
     }
 
     fn apply(&mut self, d: GridDamage) {
+        // Erase the entire selection before incremental damage. Then erase the
+        // old cursor as usual, including when the new view hides it.
+        if self.sel.take().is_some() {
+            self.redraw();
+        }
         // Dimension change => this is a full frame (mount / resize repaint).
         if d.cols != self.cols || d.rows != self.rows || self.buf.is_empty() {
             self.resize(d.cols, d.rows);
@@ -425,6 +430,31 @@ thread_local! {
 /// Snapshot the current visible grid. Cheap enough (a handful of KB) to clone per keypress.
 pub fn grid_view() -> GridView {
     GRID.with(|g| g.borrow().clone())
+}
+
+/// Batch wheel events at display cadence, and wait for each native scroll to
+/// finish before submitting the next. The accumulator remains live while waiting.
+fn schedule_scroll(
+    pending: Rc<RefCell<crate::scroll::ScrollAccumulator>>,
+    scheduled: Rc<std::cell::Cell<bool>>,
+) {
+    if !pending.borrow().has_rows() || scheduled.replace(true) {
+        return;
+    }
+    let scheduled_on_error = scheduled.clone();
+    let flush = Closure::once_into_js(move || {
+        let delta = pending.borrow_mut().take();
+        wasm_bindgen_futures::spawn_local(async move {
+            if delta != 0 {
+                let _ = invoke("term_scroll", ScrollArgs { delta }).await;
+            }
+            scheduled.set(false);
+            schedule_scroll(pending, scheduled);
+        });
+    });
+    if win().request_animation_frame(flush.as_ref().unchecked_ref()).is_err() {
+        scheduled_on_error.set(false);
+    }
 }
 
 // ---- key encoding (pure, tested below) ----
@@ -725,36 +755,28 @@ fn setup(mut keys_loaded: Signal<bool>) {
         cb.forget();
     }
 
-    // --- mouse wheel: scroll native scrollback. Up (delta_y<0) goes BACK in history. ---
-    // A gesture fires many wheel events; doing one IPC round-trip + full repaint per event is what
-    // made scrolling laggy. Coalesce all deltas within a frame into ONE term_scroll via rAF.
+    // Keep fractional trackpad motion and respect pixel/line/page wheel units.
+    // One outstanding IPC request prevents a slow backend building a stale queue.
     {
         let term = term.clone();
         let canvas_el = term.borrow().canvas.clone();
-        let pending = std::rc::Rc::new(std::cell::Cell::new(0i32));
-        let scheduled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pending = Rc::new(RefCell::new(crate::scroll::ScrollAccumulator::default()));
+        let scheduled = Rc::new(std::cell::Cell::new(false));
         let cb = Closure::wrap(Box::new(move |ev: web_sys::WheelEvent| {
             ev.prevent_default();
-            let dy = ev.delta_y();
-            let ch = term.borrow().cell_h; // live: stays correct after a font-size change
-            let mag = (dy.abs() / ch).round().max(1.0) as i32;
-            pending.set(pending.get() + if dy < 0.0 { mag } else { -mag });
-            if !scheduled.replace(true) {
-                let pending = pending.clone();
-                let scheduled = scheduled.clone();
-                let flush = Closure::once_into_js(move || {
-                    scheduled.set(false);
-                    let delta = pending.replace(0);
-                    if delta != 0 {
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let _ = invoke("term_scroll", ScrollArgs { delta }).await;
-                        });
-                    }
-                });
-                let _ = win().request_animation_frame(flush.as_ref().unchecked_ref());
+            if ev.delta_y() == 0.0 || ev.ctrl_key() || OVERLAY_OPEN.with(|o| o.get()) {
+                return;
             }
+            let t = term.borrow();
+            pending.borrow_mut().push(ev.delta_y(), ev.delta_mode(), t.cell_h, t.rows);
+            drop(t);
+            schedule_scroll(pending.clone(), scheduled.clone());
         }) as Box<dyn FnMut(web_sys::WheelEvent)>);
-        let _ = canvas_el.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
+        let options = web_sys::AddEventListenerOptions::new();
+        options.set_passive(false);
+        let _ = canvas_el.add_event_listener_with_callback_and_add_event_listener_options(
+            "wheel", cb.as_ref().unchecked_ref(), &options,
+        );
         cb.forget();
     }
 

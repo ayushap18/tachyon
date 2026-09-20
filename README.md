@@ -1,16 +1,65 @@
 <p align="center">
-  <img src="assets/tachyon-wordmark.png" alt="Tachyon" width="520">
+  <img src="assets/tachyon-logo.png" alt="Tachyon terminal logo" width="160">
 </p>
 
-# Tachyon
+<h1 align="center">Tachyon</h1>
+<p align="center">A native terminal with AI commands you review before running.</p>
+<p align="center">
+  <a href="https://github.com/ayushap18/tachyon/releases/latest">Download</a> ·
+  <a href="#keyboard">Shortcuts</a> ·
+  <a href="#providers--slash-commands">Configure AI</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
 
-An AI-native terminal, inspired by Warp — built from scratch to learn how modern terminals and AI agents actually work. Named for the hypothetical particle that outruns light.
+Tachyon combines a real shell with natural-language command generation, an agent that asks
+before each step, and explanations of failed commands. Built with Rust, Tauri and Dioxus/WASM.
+Named after the hypothetical particle that travels faster than light.
 
-> **Speak to your shell.** Natural language in, reviewed commands out — with real command blocks, an agent with approval gates, and a safety eval that measures how well that holds.
+**macOS · Apple Silicon** and **Linux · x86_64**. MIT licensed. Early software; Windows,
+Intel Mac installers, and Linux ARM installers are not currently provided.
 
-<!-- demo GIF: assets/demo.gif -->
+## Install
 
-Runs on **macOS and Linux**. Windows is not supported yet. MIT-licensed; see [Docs](#docs) and [CONTRIBUTING.md](CONTRIBUTING.md).
+Download the installer for your machine from [GitHub Releases](https://github.com/ayushap18/tachyon/releases/latest).
+
+| Platform | Installer | Installation |
+| --- | --- | --- |
+| macOS · Apple Silicon | `Tachyon_0.2.1_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.1_amd64.deb` | `sudo apt install ./Tachyon_0.2.1_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.1_amd64.AppImage` | Make executable, then launch (below). |
+
+```sh
+chmod +x Tachyon_0.2.1_amd64.AppImage
+./Tachyon_0.2.1_amd64.AppImage
+```
+
+Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
+through apt; AppImage compatibility still depends on the host distribution. If AppImage
+reports a FUSE error, try:
+
+```sh
+./Tachyon_0.2.1_amd64.AppImage --appimage-extract-and-run
+```
+
+Builds are **unsigned**. If macOS blocks first launch, use **System Settings → Privacy &
+Security → Open Anyway**. Download `SHA256SUMS` alongside your installer to verify integrity:
+
+```sh
+# Linux: verifies the downloaded installers; skips those you did not download.
+sha256sum --ignore-missing -c SHA256SUMS
+# macOS: compare the printed digest with the corresponding SHA256SUMS entry.
+shasum -a 256 Tachyon_0.2.1_aarch64.dmg
+```
+
+### First launch
+
+1. Open Tachyon; your shell works immediately without an AI key.
+2. Press **⌘K** on macOS or **Ctrl+Shift+K** on Linux, then type `/keys` to see providers.
+3. Configure a provider with `/key <id> <apikey>`, or use `/local` to discover a local model.
+4. Ask for a command, review the proposed text, then choose whether to run it.
+
+**v0.2.1** improves trackpad scrolling, reduces repaint traffic, fixes deep scrollback,
+and repairs Linux packaging. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ### Keyboard
 
@@ -43,7 +92,7 @@ uninvited and take focus, so a stray Enter must not approve one. The built-in ag
 
 Slash commands (`/keys`, `/model`, `/models`, `/local`, `/mcp …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
 
-## What I'm building
+## Features
 
 A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 
@@ -64,7 +113,7 @@ A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 | Rendering | canvas 2D painter, per-cell |
 | Frontend | Rust + Dioxus (WASM) |
 
-The entire frontend is Rust: Dioxus components compiled to WASM host the chrome and paint a `<canvas>`. VT100/ANSI parsing lives Rust-side (`vt100`, the same engine family as many Rust terminals) — the app feeds PTY bytes to it and ships only the changed cells (`grid-damage`) to the painter. No JavaScript, no xterm.js.
+The entire frontend is Rust: Dioxus components compiled to WASM host the chrome and paint a `<canvas>`. VT100/ANSI parsing lives Rust-side (`vt100`, the same engine family as many Rust terminals) — the app feeds PTY bytes to it and ships only the changed cells (`grid-damage`) to the painter. The terminal renderer does not use xterm.js.
 
 ## Architecture
 
@@ -102,48 +151,16 @@ flowchart LR
 
 All business logic lives Rust-side: the PTY, the vt100 terminal engine, AI completion (`ai_call` over `reqwest` — keys never touch the webview), shell hook injection, the agent loop and danger gate, and the MCP client. The Dioxus/WASM frontend paints, forwards input, and renders the approval gate. Function-level map: [docs/architecture.md](docs/architecture.md).
 
-## Status
+## Project status
 
-**v0.1.5** — everything on the roadmap below is built and working: a real PTY terminal
-with a Rust `vt100` engine, ⌘K natural language → command, ⌘J agent mode with per-step
-approval gates, ⌘E error autopsy, MCP tools in and out, and an eval harness (NL accuracy,
-adversarial safety, the danger gate's own recall, and the agent loop) whose latest numbers
-are in [Eval results](#eval-results).
+Tachyon supports zsh, bash and fish integration, command history blocks, Vim navigation,
+configurable keyboard shortcuts, hosted and local AI providers, and MCP tools in both directions.
+The approval gate is enforced in Rust. The destructive-command detector is a **warning-only
+lexical check**, with known misses measured below; it is not a sandbox.
+Read [the safety design and limitations](docs/danger-gate.md) before relying on AI workflows.
 
-Still early software: it drives your real shell, so the danger gate and the approval gates are the
-parts to trust least and read first — [docs/danger-gate.md](docs/danger-gate.md) lists what is
-enforced and, candidly, what is not.
-
-## Roadmap
-
-- [x] Project scaffold (Tauri + portable-pty)
-- [x] **v0.1.5: pure-Rust frontend** — Dioxus/WASM chrome + a Rust `vt100` engine painting a canvas; xterm.js, Vite, and all TypeScript removed
-- [x] Working terminal: PTY spawn, output streaming, input handling
-- [x] Context collector (cwd, git branch/dirty state, shell pid) + status bar
-- [x] Natural language → command generation (⌘K bar; any configured provider)
-- [x] Error autopsy (⌘E explains recent terminal errors, printed in-place)
-- [x] Agent mode with permission gates (⌘J: multi-step task loop, approve/deny each command, destructive commands flagged)
-- [x] Eval harness: accuracy + safety benchmarks
-- [x] MCP client: remote Streamable-HTTP **and local stdio** servers; tool input schemas are sent to the model; agent calls tools behind the approval gate
-- [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
-- [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
-- [x] Block navigator (⌘B): session blocks with per-block AI explain, rerun/copy, health minimap, AI session summary
-- [x] Faster PTY I/O: 64 KB reads + base64 transfer (v0.1.1)
-- [x] Vim mode (⌘⇧V): normal/visual navigation over the buffer — `hjkl w b 0 $ gg G ⌃d ⌃u`, `/ n N` search, `v`+`y` yank (v0.1.1, hardened in v0.1.3)
-- [x] CI/CD: GitHub Actions run tests on every push; tagging `v*` auto-builds and publishes the release DMG (v0.1.3)
-- [x] Linux support: CI on macOS + Ubuntu; releases build an AppImage and a `.deb` next to the DMG
-- [x] bash and fish shell integration (OSC 133), alongside zsh
-- [x] Configurable, platform-aware keybindings (`keybindings.json`)
-- [x] Agent-loop eval with a keyless mock-model self-test; danger-gate corpus reporting recall and false-positive rate; gated / refused / unsafe safety outcomes; JSON artifacts with baseline diff
-- [x] MCP **server** mode: external agents drive this terminal through the same human approval gate (`/mcp serve`)
-- [x] Local models first-class: `/local` discovers Ollama · LM Studio · llama.cpp · vLLM · Jan; `/models` lists what a provider really serves; env-var keys are used without being written to disk
-- [x] Open-source groundwork: MIT licence, CONTRIBUTING, SECURITY, architecture and danger-gate docs, issue/PR templates, changelog
-
-Not yet:
-
-- [ ] Windows
-- [ ] Signed / notarised builds (macOS and Linux bundles are unsigned)
-- [ ] A danger gate that parses commands instead of substring-matching, and an IPC surface scoped so webview script cannot call `pty_write` — see [docs/danger-gate.md](docs/danger-gate.md#what-would-make-it-stronger)
+Current limitations include unsigned installers, one terminal session per window, and incomplete
+terminal compatibility for some applications. Contributions and reproducible bug reports are welcome.
 
 ## Eval results
 
@@ -314,40 +331,50 @@ boundaries and exit codes off the PTY stream (a journal of `{command, exitCode, 
 scraping the screen. ⌘E error autopsy uses the exact failed command + exit code + output; the status bar shows a
 `✗ <code>` badge on failure. **zsh, bash and fish are supported.** Under any other shell the hooks don't load, so there is no journal — ⌘B and ⌘E have nothing to work with and agent steps wait out their timeout — and Tachyon says so once at startup instead of failing silently.
 
-## Run it
+## Build from source
 
-Platforms: **macOS** and **Linux**. Windows is not supported yet. Tagged releases publish an
-unsigned `.dmg` (Apple Silicon), and an `.AppImage` and `.deb` (x86_64).
-
-Prerequisites: **Rust** (stable), **Node 22+**, and **dioxus-cli** — the frontend is a Dioxus
-WASM crate, so `dx` has to be on your PATH before Tauri can build it. On Linux, also the
-WebKitGTK/GTK development packages (Debian/Ubuntu names shown; other distros: see the
-[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)):
+Prerequisites: **Rust stable**, **Node 22+**, the **wasm32-unknown-unknown** Rust target,
+and **Dioxus CLI 0.7.9** (`dx`). Clone the repository and run commands from its root.
+On Linux, install the development dependencies first:
 
 ```sh
+sudo apt-get update
 sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev build-essential pkg-config
-sudo apt-get install librsvg2-dev patchelf     # only for `npm run tauri build`
+sudo apt-get install librsvg2-dev patchelf libfuse2 xdg-utils # for packaging on Ubuntu 22.04
 ```
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo binstall dioxus-cli@0.7.9      # or: cargo install dioxus-cli --version 0.7.9 --locked
-npm install
+cargo binstall --no-confirm dioxus-cli@0.7.9
+npm ci
 npm run tauri dev
+# Build an installer:
+npm run tauri build
 ```
 
-`cargo binstall` fetches a prebuilt binary; prefer it if you have it, since building dioxus-cli
-from source can fail on current stable. `npm run tauri build` produces the release bundle.
+The prebuilt Linux `dx` 0.7.9 requires **GLIBC 2.39** (Ubuntu 24.04). On older build hosts,
+build the web frontend on a compatible host, copy `ui/dist` to the native build host, then run:
+
+```sh
+npm run tauri build -- --config '{"build":{"beforeBuildCommand":""}}'
+```
+
+This is the arrangement used by [the release workflow](.github/workflows/release.yml): web
+assets built on Ubuntu 24.04, native Linux packages built on Ubuntu 22.04, and macOS packages
+built on Apple Silicon. A new release publishes only after all three installers are present,
+with SHA-256 checksums. Maintainers can rebuild an existing tag through the workflow's
+**Run workflow** form; tags must match the versions in both Cargo manifests and app config.
 
 ## Tests
 
 ```sh
-cd src-tauri && cargo test          # backend: PTY, OSC journal, providers, danger gate, agent parsing
-cd ui && cargo test                 # frontend logic: key encoding, keymap, vim motions, selection
-cd ui && cargo check --target wasm32-unknown-unknown
+cargo test --locked --manifest-path src-tauri/Cargo.toml          # backend: PTY, OSC journal, providers, danger gate, agent parsing
+cargo test --locked --manifest-path ui/Cargo.toml                 # frontend logic: key encoding, keymap, vim motions, selection
+cargo check --locked --manifest-path ui/Cargo.toml --target wasm32-unknown-unknown
 npm run eval:selftest               # gate extraction + matcher vs lib.rs's test vectors
 npm run eval:gate                   # gate recall / false-positive rate on the corpus
 npm run eval:agent:selftest         # agent-loop eval against a scripted mock model
+npm run test:release                # rejects missing/empty/duplicate installers
 ```
 
 All keyless; CI runs exactly these on macOS and Ubuntu.

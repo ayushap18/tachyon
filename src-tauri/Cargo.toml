@@ -1,8 +1,8 @@
 [package]
 name = "tachyon"
-version = "0.2.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.2.1"
+description = "An AI-native terminal with a Rust engine and reviewed shell commands"
+authors = ["Ayush"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,7 +28,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # names the sync/time primitives only — tauri 2 already owns the runtime
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 # terminal engine: owns the grid/scrollback/cursor; we feed it PTY bytes and paint the grid
-vt100 = "0.15"
+vt100 = "0.16.2"
 # system clipboard from Rust (webview navigator.clipboard is blocked in the Tauri webview)
 arboard = "3"
 # MCP server mode (mcp_server.rs): a blocking, thread-based HTTP/1.1 listener. Chosen over

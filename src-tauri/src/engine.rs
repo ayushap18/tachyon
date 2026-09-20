@@ -199,7 +199,7 @@ impl TerminalEngine {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         self.snapshot = vec![None; rows as usize * cols as usize]; // force full repaint next
     }
 
@@ -211,15 +211,13 @@ impl TerminalEngine {
     }
 
     /// Scroll the view by `delta` rows: delta > 0 scrolls UP into history, delta < 0 toward the
-    /// live bottom. set_scrollback clamps to available history; we clear the snapshot so the next
-    /// emit is a full frame of the scrolled view.
-    pub fn scroll_by(&mut self, delta: i32) {
+    /// live bottom. Keep the snapshot so scrolling ships only changed cells.
+    /// Return false at either boundary, where no repaint is necessary.
+    pub fn scroll_by(&mut self, delta: i32) -> bool {
         let cur = self.parser.screen().scrollback() as i32;
-        let next = (cur + delta).max(0) as usize;
-        self.parser.set_scrollback(next);
-        for s in &mut self.snapshot {
-            *s = None;
-        }
+        let next = cur.saturating_add(delta).max(0) as usize;
+        self.parser.screen_mut().set_scrollback(next);
+        self.parser.screen().scrollback() != cur as usize
     }
 
     /// Current scrollback offset (0 = live bottom).
@@ -233,7 +231,7 @@ impl TerminalEngine {
         if self.parser.screen().scrollback() == 0 {
             return;
         }
-        self.parser.set_scrollback(0);
+        self.parser.screen_mut().set_scrollback(0);
         for s in &mut self.snapshot {
             *s = None;
         }
@@ -248,7 +246,7 @@ impl TerminalEngine {
             Some(c) => {
                 let s = c.contents();
                 (
-                    if s.is_empty() { " ".to_string() } else { s },
+                    if s.is_empty() { " ".to_string() } else { s.to_string() },
                     self.colors.resolve(c.fgcolor(), default_fg),
                     self.colors.resolve(c.bgcolor(), default_bg),
                     c.bold(),
@@ -382,6 +380,31 @@ mod tests {
         // already at the live bottom; scrolling further toward bottom stays at 0.
         e.scroll_by(-100);
         assert_eq!(e.parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn scrolling_diffs_match_full_frames_and_boundaries_are_noops() {
+        let mut e = TerminalEngine::new(80, 6);
+        for n in 0..40 {
+            e.feed(format!("line {n}\r\n").as_bytes());
+        }
+        let mut frame = e.full_repaint().cells;
+        for delta in [1, 3, -2, i32::MAX, i32::MAX, i32::MIN, -1] {
+            let moved = e.scroll_by(delta);
+            let damage = e.take_damage();
+            if !moved {
+                assert!(damage.cells.is_empty());
+            }
+            // Blank columns should not be resent on every scroll.
+            assert!(damage.cells.len() < 80 * 6);
+            for cell in damage.cells {
+                let idx = cell.line as usize * 80 + cell.col as usize;
+                frame[idx] = cell;
+            }
+            let expected = e.full_repaint();
+            assert!(frame == expected.cells);
+            assert_eq!(expected.cursor.visible, e.scrollback() == 0);
+        }
     }
 
     #[test]

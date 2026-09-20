@@ -2,7 +2,27 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries before
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
-Only `v0.1.3` exists as a git tag, and no commit is labelled 0.1.2.
+No commit is labelled 0.1.2.
+
+## 0.2.1 — 2026-09-20
+
+### Fixed
+- Trackpad movement preserves fractional deltas and respects pixel, line and page wheel
+  units. Horizontal gestures no longer scroll vertically. Scroll IPC is batched per frame
+  with at most one request in flight to prevent a backlog.
+- Scrollback sends changed cells instead of a full screen; gestures at either boundary
+  cause no redraw. Selection highlights are cleared correctly before incremental updates.
+- Updated vt100 to 0.16.2 to fix deep-scrollback overflow and cursor restore after resize.
+- Linux releases: Dioxus CLI 0.7.9 requires GLIBC 2.39 and could not run on Ubuntu 22.04.
+  Build portable frontend assets on 24.04 and package native binaries on 22.04.
+- Releases wait for the complete macOS DMG, Linux AppImage and Debian package set before
+  publication, include SHA256SUMS, validate versions and support rebuilding existing tags.
+- Refreshed npm lockfile to match the Rust frontend's dependencies and app version.
+
+### Changed
+- New Tachyon logo and desktop application icons.
+- README with direct download guidance, first-launch setup, Linux FUSE troubleshooting,
+  checksum verification and reproducible build instructions.
 
 ## 0.2.0 — 2026-09-20
 
