@@ -24,6 +24,9 @@ struct AiArgs {
 #[derive(Serialize)]
 struct ExplainArgs {
     command: String,
+    // Tauri matches command arguments by their camelCase name, so `exit_code` was rejected
+    // as a missing `exitCode` and per-block explain never worked in the Rust frontend.
+    #[serde(rename = "exitCode")]
     exit_code: i64,
     output: String,
 }
