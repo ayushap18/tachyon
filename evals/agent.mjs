@@ -43,6 +43,14 @@ function parseAgentReply(reply) {
   return cmd ? { kind: "run", text: cmd } : { kind: "done", text: "no command returned" };
 }
 
+// Top-level directories a real absolute path starts with, on either OS. Fixed on purpose —
+// see the note in blockReason. Superset of macOS and Linux; unknown roots are treated as not
+// a path, which is why `awk '/ERROR/'` still runs.
+const SYSTEM_ROOTS = new Set(
+  ("bin boot dev etc home lib lib64 media mnt opt private proc root run sbin srv sys tmp usr var " +
+   "Applications Library System Users Volumes data").split(" ").map((d) => `/${d}`),
+);
+
 // Why a command may not run, or null. Textual, so deliberately over-strict
 // (`git log HEAD~1` and `{1..3}` are refused too): a false block costs the model
 // one step, a false allow touches the user's machine.
@@ -56,10 +64,12 @@ function blockReason(cmd, scratch) {
   // a `/` that starts a word: an absolute path (not src/a.c, s/x/y/, #!/bin/sh)
   for (const [, p] of cmd.matchAll(/(?:^|[\s=<>('"`:,{])(\/[^\s'"`;|&<>(){},:]*)/g)) {
     if (p === "/dev/null" || p === scratch || p.startsWith(scratch + "/")) continue;
-    // awk '/ERROR/' looks like a path; it is one only if its top-level dir exists
-    // (every real file outside the scratch dir has one). Globs/vars could build one.
+    // awk '/ERROR/' looks like a path. Discriminate on a FIXED list of system roots, not on
+    // what exists on this host: existsSync made the verdict machine-dependent, so
+    // `/private/tmp/...` was blocked on macOS and allowed on Linux, which is exactly the kind
+    // of difference a security control must not have. Globs/vars could build a path.
     const top = "/" + p.split("/")[1];
-    if (top === "/" || existsSync(top) || /[*?[\]$\\]/.test(p)) return "absolute path outside the scratch dir";
+    if (top === "/" || SYSTEM_ROOTS.has(top) || /[*?[\]$\\]/.test(p)) return "absolute path outside the scratch dir";
   }
   return null;
 }
@@ -280,10 +290,12 @@ if (flag("--selftest")) {
     check(same(parseAgentReply(reply), want), `parse   ${JSON.stringify(reply)}`);
 
   const S = "/private/tmp/scratch/work";
-  for (const cmd of ["rm -rf build", "sudo ls", "ls ~", "cat $HOME/x", "echo ${HOME}", "cd ..", "cat /etc/passwd", "cat '/etc/passwd'", "ls /", "echo hi > /tmp/x", "x=/etc; ls $x", "cat /e*c/passwd", "cat /private/tmp/scratch/other"])
+  for (const cmd of ["rm -rf build", "sudo ls", "ls ~", "cat $HOME/x", "echo ${HOME}", "cd ..", "cat /etc/passwd", "cat '/etc/passwd'", "ls /", "echo hi > /tmp/x", "x=/etc; ls $x", "cat /e*c/passwd", "cat /private/tmp/scratch/other", "cat /tmp/other/x", "cat /home/someone/.ssh/id_rsa", "cat /Users/someone/.aws/credentials"])
     check(blockReason(cmd, S) != null, `blocks  ${cmd}`);
   for (const cmd of ["ls -la", "cat a.txt > /dev/null", "awk '/ERROR/ {n++} END {print n}' app.log", "sed 's/a/b/' f.txt", `cat ${S}/a.txt`, "printf '#!/bin/sh\\n' > x.sh", "tar -czf src.tar.gz src/", "./hello.sh"])
     check(blockReason(cmd, S) == null, `allows  ${cmd}`);
+  // the verdict must not depend on which OS is running the harness
+  check(blockReason("cat /private/tmp/scratch/other", S) === blockReason("cat /tmp/other/x", S), "policy  macOS- and Linux-shaped paths are judged the same");
 
   for (const r of mockRun) {
     check(!r.precheck, `task    ${r.id}: checks fail before the agent runs`);
