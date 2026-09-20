@@ -652,44 +652,97 @@ impl ProviderState {
     }
 }
 
-fn providers_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/tachyon/providers.json")
+// ---- config file I/O ----
+// Both config files (providers.json, which holds plaintext API keys, and mcp.json) go
+// through here. Three properties, none of which held before:
+//   1. a corrupt file is an ERROR, never a silent fall back to defaults — otherwise the
+//      next mutate() persists those defaults straight over the user's real keys;
+//   2. writes are atomic (temp file + rename), so a crash mid-write can't truncate the
+//      key file;
+//   3. the files are 0600, not the umask default of 0644.
+
+fn config_dir() -> Result<PathBuf, String> {
+    let non_empty = |v: std::ffi::OsString| if v.is_empty() { None } else { Some(v) };
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").and_then(non_empty) {
+        return Ok(PathBuf::from(x).join("tachyon"));
+    }
+    let home = std::env::var_os("HOME")
+        .and_then(non_empty)
+        .ok_or("neither XDG_CONFIG_HOME nor HOME is set \u{2014} cannot locate the config directory")?;
+    Ok(PathBuf::from(home).join(".config/tachyon"))
 }
 
-fn load_state() -> ProviderState {
-    let mut state = std::fs::read_to_string(providers_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<ProviderState>(&s).ok())
-        .unwrap_or_else(ProviderState::defaults);
+fn providers_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("providers.json"))
+}
+
+/// Read and parse a config file. A missing file is `Ok(None)`; a file that exists but
+/// does not parse is an `Err` — the caller must not overwrite what it could not read.
+fn read_config<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Option<T>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    serde_json::from_str(&text).map(Some).map_err(|e| {
+        format!(
+            "{} is corrupt ({e}) \u{2014} fix or delete it; refusing to overwrite it",
+            path.display()
+        )
+    })
+}
+
+/// Serialize to a temp file in the same directory, chmod 0600, then rename over the
+/// target. Rename within a directory is atomic, so readers see old or new, never partial.
+fn write_config<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+    let dir = path.parent().ok_or("config path has no parent directory")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+fn load_state() -> Result<ProviderState, String> {
+    let mut state = read_config::<ProviderState>(&providers_path()?)?.unwrap_or_else(ProviderState::defaults);
     state.merge_defaults();
-    state
+    Ok(state)
 }
 
 fn save_state(state: &ProviderState) -> Result<(), String> {
-    let path = providers_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    write_config(&providers_path()?, state)
 }
 
+// Serializes the read-modify-write below. run_slash and the provider_* commands are all
+// async, so two concurrent /key calls would otherwise race and lose one of the writes.
+static CONFIG_WRITE: Mutex<()> = Mutex::new(());
+
 fn mutate<F: FnOnce(&mut ProviderState) -> Result<(), String>>(f: F) -> Result<ProviderState, String> {
-    let mut state = load_state();
+    let _guard = CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = load_state()?;
     f(&mut state)?;
     save_state(&state)?;
     Ok(state)
 }
 
 #[tauri::command]
-fn provider_state() -> PublicProviderState {
-    (&load_state()).into()
+fn provider_state() -> Result<PublicProviderState, String> {
+    Ok((&load_state()?).into())
 }
 
 #[tauri::command]
-fn provider_active() -> PublicProvider {
-    (&load_state().active_provider()).into()
+fn provider_active() -> Result<PublicProvider, String> {
+    Ok((&load_state()?.active_provider()).into())
 }
 
 #[tauri::command]
@@ -762,7 +815,7 @@ fn parse_openai_response(body: &str) -> Result<String, String> {
 // The key appears ONLY in request headers — never in any error/log string.
 // Shared core for ai_complete / nl_to_command / explain_last_error — one HTTP path.
 async fn ai_call(system: &str, user: &str) -> Result<String, String> {
-    let p = load_state().active_provider();
+    let p = load_state()?.active_provider();
     let client = reqwest::Client::new(); // ponytail: per-call client; OnceLock<Client> if profiling ever cares
     let is_anthropic = p.kind == "anthropic";
     let req = if is_anthropic {
@@ -929,25 +982,16 @@ struct McpServerTool {
     input_schema: serde_json::Value,
 }
 
-fn mcp_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/tachyon/mcp.json")
+fn mcp_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("mcp.json"))
 }
 
-fn load_mcp() -> McpConfig {
-    std::fs::read_to_string(mcp_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_mcp() -> Result<McpConfig, String> {
+    Ok(read_config::<McpConfig>(&mcp_path()?)?.unwrap_or_default())
 }
 
 fn save_mcp(cfg: &McpConfig) -> Result<(), String> {
-    let path = mcp_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    write_config(&mcp_path()?, cfg)
 }
 
 fn jsonrpc_request(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -1054,7 +1098,8 @@ fn mcp_rpc_session(url: &str, method: &str, params: serde_json::Value) -> Result
 
 #[tauri::command]
 fn mcp_add(name: String, url: String) -> Result<(), String> {
-    let mut cfg = load_mcp();
+    let _guard = CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = load_mcp()?;
     let s = McpServer { name: name.clone(), url };
     match cfg.servers.iter_mut().find(|x| x.name == name) {
         Some(existing) => *existing = s,
@@ -1065,7 +1110,8 @@ fn mcp_add(name: String, url: String) -> Result<(), String> {
 
 #[tauri::command]
 fn mcp_remove(name: String) -> Result<(), String> {
-    let mut cfg = load_mcp();
+    let _guard = CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = load_mcp()?;
     let before = cfg.servers.len();
     cfg.servers.retain(|s| s.name != name);
     if cfg.servers.len() == before {
@@ -1075,13 +1121,13 @@ fn mcp_remove(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn mcp_servers() -> Vec<McpServer> {
-    load_mcp().servers
+fn mcp_servers() -> Result<Vec<McpServer>, String> {
+    Ok(load_mcp()?.servers)
 }
 
 // blocking (ureq) — call from a command thread or spawn_blocking, never the main thread
 fn mcp_list_tools_inner() -> Result<Vec<McpServerTool>, String> {
-    let servers = load_mcp().servers;
+    let servers = load_mcp()?.servers;
     let mut out = Vec::new();
     let mut errs = Vec::new();
     for s in &servers {
@@ -1109,7 +1155,7 @@ fn mcp_list_tools() -> Result<Vec<McpServerTool>, String> {
 
 // blocking (ureq) — call from a command thread or spawn_blocking, never the main thread
 fn mcp_call_inner(server: &str, tool: &str, args: serde_json::Value) -> Result<String, String> {
-    let url = load_mcp()
+    let url = load_mcp()?
         .servers
         .iter()
         .find(|s| s.name == server)
@@ -1179,7 +1225,7 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
     let rest: Vec<&str> = parts.collect();
     match cmd.as_str() {
         "" | "help" => Ok(SLASH_HELP.into()),
-        "keys" | "providers" => Ok(render_providers(&load_state())),
+        "keys" | "providers" => Ok(render_providers(&load_state()?)),
         "key" => match rest.split_first() {
             Some((id, key)) if !key.is_empty() => {
                 mutate(|s| s.set_key(id, key.join(" ")))?;
@@ -1205,7 +1251,7 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                 return Err("usage: /model <model>".into());
             }
             let model = rest.join(" ");
-            let active = load_state().active;
+            let active = load_state()?.active;
             mutate(|s| s.set_model(&active, model.clone()))?;
             Ok(format!("\r\n\x1b[36m[tachyon] {active} model: {model}\x1b[0m\r\n"))
         }
@@ -1237,7 +1283,7 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                     Ok(format!("\r\n\x1b[36m[tachyon] removed mcp server {name}\x1b[0m\r\n"))
                 }
                 "list" => {
-                    let servers = load_mcp().servers;
+                    let servers = load_mcp()?.servers;
                     if servers.is_empty() {
                         return Ok("\r\n\x1b[36m[tachyon] no mcp servers — /mcp add <name> <url>\x1b[0m\r\n".into());
                     }
@@ -1670,6 +1716,42 @@ mod tests {
         let mut s = ProviderState::defaults();
         assert!(s.use_provider("nope").is_err());
         assert!(s.set_key("nope", "x".into()).is_err());
+    }
+
+    // The bug this guards: load_state() used to swallow a parse error and hand back
+    // defaults, so the next mutate() wrote those defaults straight over the user's keys.
+    // read_config must now refuse, and write_config must land atomically at 0600.
+    #[test]
+    fn config_roundtrip_survives_corruption() {
+        let dir = std::env::temp_dir().join(format!("tachyon-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+
+        // missing file reads as None, not an error
+        assert!(read_config::<ProviderState>(&path).unwrap().is_none());
+
+        let mut state = ProviderState::defaults();
+        state.set_key("groq", "sk-secret".into()).unwrap();
+        write_config(&path, &state).unwrap();
+
+        let back = read_config::<ProviderState>(&path).unwrap().unwrap();
+        assert_eq!(back.providers.iter().find(|p| p.id == "groq").unwrap().key, "sk-secret");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "API keys must not be group/world readable");
+        }
+
+        // a corrupt file is an error, NOT a silent default — that is what kept the old
+        // code from noticing before it overwrote the real keys
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(read_config::<ProviderState>(&path).is_err());
+        // and the bytes are still there to recover by hand
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

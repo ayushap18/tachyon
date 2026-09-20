@@ -165,15 +165,21 @@ pub fn AiBar() -> Element {
                     readonly.set(false);
                     let mut status = status;
                     spawn_local(async move {
-                        if let Ok(v) = invoke("provider_active", NoArgs {}).await {
-                            if let Ok(p) = serde_wasm_bindgen::from_value::<Provider>(v) {
-                                let suffix = if p.has_key || p.kind != "anthropic" {
-                                    ""
-                                } else {
-                                    " · no key"
-                                };
-                                status.set(format!("{} · {}{}", p.id, p.model, suffix));
+                        // provider_active now fails loudly on a corrupt providers.json
+                        // rather than silently handing back defaults — show that here,
+                        // since this bar is where the user looks for provider state.
+                        match invoke("provider_active", NoArgs {}).await {
+                            Ok(v) => {
+                                if let Ok(p) = serde_wasm_bindgen::from_value::<Provider>(v) {
+                                    let suffix = if p.has_key || p.kind != "anthropic" {
+                                        ""
+                                    } else {
+                                        " · no key"
+                                    };
+                                    status.set(format!("{} · {}{}", p.id, p.model, suffix));
+                                }
                             }
+                            Err(e) => status.set(err_str(e)),
                         }
                     });
                 }
