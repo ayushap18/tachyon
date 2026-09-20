@@ -1,4 +1,5 @@
 mod engine;
+mod local_models;
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -673,6 +674,10 @@ struct Provider {
 struct ProviderState {
     active: String,
     providers: Vec<Provider>,
+    // built-in ids the user removed; merge_defaults must not resurrect them.
+    // serde(default) so a providers.json written before this field still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden: Vec<String>,
 }
 
 // IPC-safe views: never carry the raw key across the Tauri bridge into the webview.
@@ -683,16 +688,21 @@ struct PublicProvider {
     base_url: String,
     model: String,
     has_key: bool,
+    // "saved" | "env" | "none" — where the key comes from, never the key
+    key_source: &'static str,
 }
 
 impl From<&Provider> for PublicProvider {
     fn from(p: &Provider) -> Self {
+        // an env-sourced key counts as "has a key"; only its source crosses the bridge
+        let source = local_models::key_for(p).1;
         PublicProvider {
             id: p.id.clone(),
             kind: p.kind.clone(),
             base_url: p.base_url.clone(),
             model: p.model.clone(),
-            has_key: !p.key.is_empty(),
+            has_key: source != "none",
+            key_source: source,
         }
     }
 }
@@ -726,16 +736,35 @@ impl ProviderState {
                 builtin("deepseek", "openai", "https://api.deepseek.com", "deepseek-chat"),
                 builtin("mistral", "openai", "https://api.mistral.ai/v1", "mistral-large-latest"),
             ],
+            hidden: Vec::new(),
         }
     }
 
-    // add any built-in providers a saved config predates, keeping user keys/models
+    // add any built-in providers a saved config predates, keeping user keys/models —
+    // except the ones the user removed on purpose
     fn merge_defaults(&mut self) {
         for d in ProviderState::defaults().providers {
-            if !self.providers.iter().any(|p| p.id == d.id) {
+            if !self.providers.iter().any(|p| p.id == d.id) && !self.hidden.contains(&d.id) {
                 self.providers.push(d);
             }
         }
+    }
+
+    // A user-added provider is deleted; a built-in is also recorded in `hidden`, or the
+    // next load would bring it straight back. Either way its saved key goes with it.
+    fn remove(&mut self, id: &str) -> Result<(), String> {
+        self.find_mut(id)?;
+        if self.providers.len() == 1 {
+            return Err(format!("{id} is the only provider left \u{2014} add another before removing it"));
+        }
+        self.providers.retain(|p| p.id != id);
+        if ProviderState::defaults().providers.iter().any(|d| d.id == id) && !self.hidden.iter().any(|h| h == id) {
+            self.hidden.push(id.into());
+        }
+        if self.active == id {
+            self.active = self.providers[0].id.clone();
+        }
+        Ok(())
     }
 
     fn find_mut(&mut self, id: &str) -> Result<&mut Provider, String> {
@@ -752,7 +781,17 @@ impl ProviderState {
         Ok(())
     }
 
+    fn set_base_url(&mut self, id: &str, base_url: String) -> Result<(), String> {
+        self.find_mut(id)?.base_url = base_url;
+        Ok(())
+    }
+
     fn use_provider(&mut self, id: &str) -> Result<(), String> {
+        // /use on a removed built-in brings it back (with defaults) — /remove is not one-way
+        if let Some(i) = self.hidden.iter().position(|h| h == id) {
+            self.hidden.remove(i);
+            self.merge_defaults();
+        }
         self.find_mut(id)?; // validate exists
         self.active = id.into();
         Ok(())
@@ -967,15 +1006,17 @@ fn http_client() -> Result<reqwest::Client, String> {
 // Shared core for ai_complete / nl_to_command / explain_last_error — one HTTP path.
 async fn ai_call(system: &str, user: &str) -> Result<String, String> {
     let p = load_state()?.active_provider();
+    // saved key, else the conventional env var — resolved per request, never written back
+    let key = local_models::key_for(&p).0;
     let client = http_client()?;
     let is_anthropic = p.kind == "anthropic";
     let req = if is_anthropic {
-        if p.key.is_empty() {
-            return Err(format!("no key for {} — set with /key {} <key>", p.id, p.id));
+        if key.is_empty() {
+            return Err(local_models::no_key_message(&p.id));
         }
         client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &p.key)
+            .post(local_models::anthropic_url(&p.base_url, "messages"))
+            .header("x-api-key", &key)
             .header("anthropic-version", "2023-06-01")
             .json(&build_anthropic_body(&p.model, system, user))
     } else {
@@ -983,8 +1024,8 @@ async fn ai_call(system: &str, user: &str) -> Result<String, String> {
         let mut r = client
             .post(format!("{}/chat/completions", p.base_url.trim_end_matches('/')))
             .json(&build_openai_body(&p.model, system, user));
-        if !p.key.is_empty() {
-            r = r.bearer_auth(&p.key);
+        if !key.is_empty() {
+            r = r.bearer_auth(&key);
         }
         r
     };
@@ -992,7 +1033,7 @@ async fn ai_call(system: &str, user: &str) -> Result<String, String> {
     let status = resp.status();
     let body = resp.text().await.map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
     if !status.is_success() {
-        return Err(format!("{} {}: {}", p.id, status.as_u16(), truncate_chars(&body, 120)));
+        return Err(local_models::completion_error(&p, &key, status.as_u16(), &body));
     }
     if is_anthropic { parse_anthropic_response(&body) } else { parse_openai_response(&body) }
 }
@@ -1382,16 +1423,23 @@ fn mcp_call(server: String, tool: String, args: serde_json::Value) -> Result<Str
 // cannot appear in the output, and /key never echoes its argument.
 
 const SLASH_HELP: &str = concat!(
-    "\r\n\x1b[36m/keys\x1b[0m                       list providers, active, which have keys\r\n",
+    "\r\n\x1b[36m/keys\x1b[0m                       list providers, active, key source (saved/env/none)\r\n",
     "\x1b[36m/key <id> <apikey>\x1b[0m          set a provider's API key\r\n",
     "\x1b[36m/use <id> [model]\x1b[0m           switch active provider (+ optional model)\r\n",
     "\x1b[36m/model <model>\x1b[0m              set the active provider's model\r\n",
-    "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add a local/OpenAI-compatible endpoint\r\n",
+    "\x1b[36m/models [id]\x1b[0m                list the models a provider actually serves\r\n",
+    "\x1b[36m/local\x1b[0m                      find local runtimes: ollama lmstudio llamacpp vllm jan\r\n",
+    "\x1b[36m/local <id> [model]\x1b[0m         register a discovered runtime (first model by default)\r\n",
+    "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add any local/OpenAI-compatible endpoint\r\n",
+    "\x1b[36m/url <id> <base_url>\x1b[0m        point a provider at a proxy/gateway\r\n",
+    "\x1b[36m/remove <id>\x1b[0m                remove a provider (/use <id> restores a built-in)\r\n",
     "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n",
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers and their tools\r\n",
     "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n",
     "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n",
+    "\x1b[90mno saved key? GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY… (<ID>_API_KEY) is used, never saved.\x1b[0m\r\n",
+    "\x1b[90m  only if tachyon was started from a shell \u{2014} a Finder/Dock launch does not inherit your env.\x1b[0m\r\n",
 );
 
 fn render_providers(st: &ProviderState) -> String {
@@ -1399,14 +1447,14 @@ fn render_providers(st: &ProviderState) -> String {
     let mut out = String::from("\r\n\x1b[36m[tachyon] providers\x1b[0m\r\n");
     for p in &st.providers {
         let mark = if p.id == st.active { "\x1b[32m●\x1b[0m" } else { " " };
-        let keyed = if p.has_key {
-            "\x1b[32m✓key\x1b[0m"
-        } else if p.kind == "anthropic" {
-            "\x1b[90m—\x1b[0m"
-        } else {
-            "\x1b[90mno key\x1b[0m"
+        let keyed = match p.key_source {
+            "saved" => "\x1b[32m✓key saved\x1b[0m".to_string(),
+            // the variable's NAME is not a secret, and it is what the user needs to see
+            "env" => format!("\x1b[32m✓key env\x1b[0m \x1b[90m${}\x1b[0m", local_models::env_key_name(&p.id)),
+            _ => "\x1b[90mno key\x1b[0m".to_string(),
         };
-        out.push_str(&format!("{mark} {:<9} {keyed}  \x1b[90m{}\x1b[0m\r\n", p.id, p.model));
+        // model before key status: padding only lines up on text that carries no ANSI codes
+        out.push_str(&format!("{mark} {:<9} \x1b[90m{:<26}\x1b[0m {keyed}\r\n", p.id, p.model));
     }
     out
 }
@@ -1458,8 +1506,37 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                 })?;
                 Ok(format!("\r\n\x1b[36m[tachyon] added local provider {id} → {url}\x1b[0m\r\n"))
             }
-            _ => Err("usage: /local <id> <base_url> <model> [key]".into()),
+            [] => Ok(local_models::render_discovery(&local_models::discover(local_models::LOCAL_RUNTIMES))),
+            // a bare runtime name: probe it and register what it serves
+            [id, model @ ..] => {
+                let (url, model) = local_models::resolve_runtime(local_models::LOCAL_RUNTIMES, id, model.first().copied())?;
+                mutate(|s| {
+                    s.add_local(id.to_string(), url.clone(), model.clone(), String::new());
+                    Ok(())
+                })?;
+                Ok(format!("\r\n\x1b[36m[tachyon] added local provider {id} → {url} · {model} \u{2014} /use {id} to switch\x1b[0m\r\n"))
+            }
         },
+        "models" => {
+            let st = load_state()?;
+            let p = match rest.first() {
+                Some(id) => st.providers.iter().find(|p| p.id == *id).cloned().ok_or_else(|| format!("unknown provider: {id}"))?,
+                None => st.active_provider(),
+            };
+            Ok(local_models::render_models(&p, &local_models::list_models(&p)?, p.id == st.active))
+        }
+        "url" => match rest.as_slice() {
+            [id, url] => {
+                mutate(|s| s.set_base_url(id, url.to_string()))?;
+                Ok(format!("\r\n\x1b[36m[tachyon] {id} base_url set\x1b[0m\r\n"))
+            }
+            _ => Err("usage: /url <id> <base_url>".into()),
+        },
+        "remove" => {
+            let id = *rest.first().ok_or("usage: /remove <id>")?;
+            let st = mutate(|s| s.remove(id))?;
+            Ok(format!("\r\n\x1b[36m[tachyon] removed {id} \u{2014} active provider: {}\x1b[0m\r\n", st.active))
+        }
         "mcp" => {
             let sub = rest.first().map(|s| s.to_lowercase()).unwrap_or_default();
             match sub.as_str() {
@@ -1846,6 +1923,7 @@ pub fn run() {
             provider_set_model,
             provider_use,
             provider_add_local,
+            local_models::local_discover,
             ai_complete,
             nl_to_command,
             explain_last_error,
@@ -2176,11 +2254,100 @@ mod tests {
 
     #[test]
     fn merge_defaults_keeps_user_and_adds_missing() {
-        let mut s = ProviderState { active: "groq".into(), providers: vec![builtin("groq", "openai", "x", "m")] };
+        let mut s = ProviderState { active: "groq".into(), providers: vec![builtin("groq", "openai", "x", "m")], hidden: Vec::new() };
         s.providers[0].key = "keep".into();
         s.merge_defaults();
         assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().key, "keep");
         assert!(s.providers.iter().any(|p| p.id == "mistral"));
+    }
+
+    // The bug this guards: merge_defaults re-added every built-in on each load, so a
+    // provider could never be removed. `hidden` has to survive the disk round trip.
+    #[test]
+    fn removed_builtin_stays_removed_until_used_again() {
+        let mut s = ProviderState::defaults();
+        s.set_key("mistral", "sk-mistral".into()).unwrap();
+        s.add_local("ollama".into(), "http://localhost:11434/v1".into(), "llama3.2".into(), String::new());
+        s.remove("mistral").unwrap();
+        s.remove("ollama").unwrap();
+        assert_eq!(s.hidden, ["mistral"]); // a user-added provider is just gone, not hidden
+        assert!(s.remove("nope").is_err());
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("sk-mistral"), "a removed provider's key leaves the file too");
+        let mut back: ProviderState = serde_json::from_str(&json).unwrap();
+        back.merge_defaults(); // what load_state does
+        assert!(!back.providers.iter().any(|p| p.id == "mistral" || p.id == "ollama"));
+        assert_eq!(back.providers.len(), 6);
+
+        // /use un-hides, with defaults
+        back.use_provider("mistral").unwrap();
+        assert!(back.hidden.is_empty());
+        assert_eq!(back.active_provider().model, "mistral-large-latest");
+        assert!(back.use_provider("ollama").is_err()); // a deleted custom provider does not come back
+    }
+
+    #[test]
+    fn removing_the_active_provider_leaves_a_valid_one() {
+        let mut s = ProviderState::defaults();
+        s.use_provider("groq").unwrap();
+        s.remove("groq").unwrap();
+        assert_eq!(s.active, "claude");
+        assert_eq!(s.active_provider().id, s.active);
+
+        // down to one: the last provider cannot be removed, so `active` always resolves
+        let ids: Vec<String> = s.providers.iter().map(|p| p.id.clone()).collect();
+        for id in &ids[..ids.len() - 1] {
+            s.remove(id).unwrap();
+        }
+        assert_eq!(s.active, "mistral");
+        assert!(s.remove("mistral").unwrap_err().contains("only provider left"));
+        s.merge_defaults();
+        assert_eq!(s.providers.len(), 1);
+    }
+
+    #[test]
+    fn providers_json_without_hidden_still_loads() {
+        let old = r#"{"active":"groq","providers":[{"id":"groq","kind":"openai","base_url":"u","model":"m","key":"k"}]}"#;
+        let s: ProviderState = serde_json::from_str(old).unwrap();
+        assert!(s.hidden.is_empty());
+        assert_eq!(s.active_provider().key, "k");
+        // and an untouched state writes no `hidden` field, so older builds still read the file
+        assert!(!serde_json::to_string(&s).unwrap().contains("hidden"));
+    }
+
+    #[test]
+    fn public_provider_reports_key_source_not_key() {
+        // ids whose env var cannot plausibly be set on a dev machine
+        let mut p = builtin("tachyon-test-nokey", "openai", "u", "m");
+        let public = PublicProvider::from(&p);
+        assert!(!public.has_key);
+        assert_eq!(public.key_source, "none");
+
+        p.key = "sk-saved-secret".into();
+        let json = serde_json::to_string(&PublicProvider::from(&p)).unwrap();
+        assert!(json.contains(r#""has_key":true"#) && json.contains(r#""key_source":"saved""#));
+        assert!(!json.contains("sk-saved-secret"));
+
+        let mut s = ProviderState::defaults();
+        s.providers.push(p);
+        let out = render_providers(&s);
+        assert!(out.contains("✓key saved") && !out.contains("sk-saved-secret"));
+    }
+
+    #[test]
+    fn slash_usage_for_provider_maintenance() {
+        assert_eq!(run_slash_inner("/remove").unwrap_err(), "usage: /remove <id>");
+        assert_eq!(run_slash_inner("/url claude").unwrap_err(), "usage: /url <id> <base_url>");
+        // two args where the first is not a known runtime: still the old usage line
+        assert_eq!(
+            run_slash_inner("/local mybox http://10.0.0.2:8000/v1").unwrap_err(),
+            "usage: /local <id> <base_url> <model> [key]"
+        );
+        for cmd in ["/models", "/local", "/remove", "/url"] {
+            assert!(SLASH_HELP.contains(cmd), "{cmd} missing from /help");
+        }
+        assert!(SLASH_HELP.contains("Finder"));
     }
 
     #[test]
