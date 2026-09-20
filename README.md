@@ -37,7 +37,11 @@ shortcuts by their macOS chord. Defaults live in `ui/src/keymap.rs`; override an
 Modifiers are `cmd`, `ctrl`, `shift`, `alt`. Unknown ids and unparseable chords are ignored and that
 action keeps its default.
 
-Slash commands (`/keys`, `/key`, `/use`, `/model`, `/local`, `/mcp add|remove|list`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
+One more chord, deliberately not in the table: when an **external** agent proposes a command through
+MCP server mode, approving it takes **⌘⏎** (`Ctrl+⏎` on Linux), not Enter — those proposals arrive
+uninvited and take focus, so a stray Enter must not approve one. The built-in agent keeps plain Enter.
+
+Slash commands (`/keys`, `/model`, `/models`, `/local`, `/mcp …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
 
 ## What I'm building
 
@@ -77,7 +81,8 @@ flowchart LR
     INJ["zsh · bash · fish<br/>OSC 133 hook injection"]
     REG["provider registry + ai_call<br/>keys · models · the one HTTP path"]
     GATE["agent loop + danger gate<br/>agent_propose · is_dangerous"]
-    MCP["MCP client<br/>JSON-RPC / Streamable HTTP"]
+    MCP["MCP client<br/>JSON-RPC over HTTP · stdio"]
+    SRV2["MCP server (opt-in)<br/>127.0.0.1 · bearer token"]
   end
   XT <-- "pty_write / grid-damage (Tauri IPC)" --> ENG
   ENG --- PTY
@@ -90,7 +95,9 @@ flowchart LR
   GATE --> REG
   GATE -- "approved TOOL: calls" --> MCP
   REG -- "HTTPS: /v1/messages · /chat/completions" --> EXT[("AI providers<br/>Claude · Groq · Gemini · local …")]
-  MCP --> SRV[("remote MCP servers")]
+  MCP --> SRV[("MCP servers<br/>remote HTTP · local stdio")]
+  EXTAG[("external agents<br/>Claude Code · …")] -- "run_command · read_journal" --> SRV2
+  SRV2 -- "every command through the same gate" --> GATE
 ```
 
 All business logic lives Rust-side: the PTY, the vt100 terminal engine, AI completion (`ai_call` over `reqwest` — keys never touch the webview), shell hook injection, the agent loop and danger gate, and the MCP client. The Dioxus/WASM frontend paints, forwards input, and renders the approval gate. Function-level map: [docs/architecture.md](docs/architecture.md).
@@ -99,7 +106,7 @@ All business logic lives Rust-side: the PTY, the vt100 terminal engine, AI compl
 
 **v0.1.5** — everything on the roadmap below is built and working: a real PTY terminal
 with a Rust `vt100` engine, ⌘K natural language → command, ⌘J agent mode with per-step
-approval gates, ⌘E error autopsy, MCP tool calls, and an eval harness (NL accuracy,
+approval gates, ⌘E error autopsy, MCP tools in and out, and an eval harness (NL accuracy,
 adversarial safety, the danger gate's own recall, and the agent loop) whose latest numbers
 are in [Eval results](#eval-results).
 
@@ -117,7 +124,7 @@ enforced and, candidly, what is not.
 - [x] Error autopsy (⌘E explains recent terminal errors, printed in-place)
 - [x] Agent mode with permission gates (⌘J: multi-step task loop, approve/deny each command, destructive commands flagged)
 - [x] Eval harness: accuracy + safety benchmarks
-- [x] MCP client: remote Streamable-HTTP servers, agent calls tools behind the approval gate
+- [x] MCP client: remote Streamable-HTTP **and local stdio** servers; tool input schemas are sent to the model; agent calls tools behind the approval gate
 - [x] OSC 133 shell integration: real command boundaries + exit codes off the PTY stream
 - [x] Command palette (⌘P): fuzzy-search AI actions, provider switches, and recent commands
 - [x] Block navigator (⌘B): session blocks with per-block AI explain, rerun/copy, health minimap, AI session summary
@@ -128,19 +135,21 @@ enforced and, candidly, what is not.
 - [x] bash and fish shell integration (OSC 133), alongside zsh
 - [x] Configurable, platform-aware keybindings (`keybindings.json`)
 - [x] Agent-loop eval with a keyless mock-model self-test; danger-gate corpus reporting recall and false-positive rate; gated / refused / unsafe safety outcomes; JSON artifacts with baseline diff
+- [x] MCP **server** mode: external agents drive this terminal through the same human approval gate (`/mcp serve`)
+- [x] Local models first-class: `/local` discovers Ollama · LM Studio · llama.cpp · vLLM · Jan; `/models` lists what a provider really serves; env-var keys are used without being written to disk
 - [x] Open-source groundwork: MIT licence, CONTRIBUTING, SECURITY, architecture and danger-gate docs, issue/PR templates, changelog
 
 Not yet:
 
 - [ ] Windows
-- [ ] stdio MCP transport (only remote Streamable-HTTP servers today)
-- [ ] MCP server mode (Tachyon as a tool provider)
 - [ ] Signed / notarised builds (macOS and Linux bundles are unsigned)
 - [ ] A danger gate that parses commands instead of substring-matching, and an IPC surface scoped so webview script cannot call `pty_write` — see [docs/danger-gate.md](docs/danger-gate.md#what-would-make-it-stronger)
 
 ## Eval results
 
-Run `npm run eval:write` to populate this section. The harness reads provider keys from `~/.config/tachyon/providers.json` (set them in-app via `/key <id> <apikey>`) and benchmarks every provider that has a key; `GROQ_API_KEY` / `ANTHROPIC_API_KEY` env vars fill in for `groq` / `claude` if the config lacks them. Use `--provider <id>` or `--limit <n>` for quick runs.
+Every number below is rendered from the run artifacts committed in `evals/baseline/` — none is typed by hand, and `npm run eval:selftest` fails if this block and those artifacts disagree. Regenerate with `npm run eval:write` (a full keyed run) or re-render with `npm run eval:readme`. The harness reads provider keys from `~/.config/tachyon/providers.json` (set them in-app with `/key <id> <apikey>`) or from the conventional env vars.
+
+The three models below are open-weight models on Groq, benchmarked on identical cases. Note how little single-command accuracy separates them, and how much the agent loop does.
 
 <!--EVAL:START-->
 **NL → command and safety** (`npm run eval`)
@@ -216,40 +225,87 @@ Every keyed run writes a JSON artifact to `evals/results/`; copy one to `evals/b
 
 ## Providers & slash commands
 
-Open the AI bar (⌘K) and type a `/` command to manage models — no key needed to configure:
+Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 
 ```
-/keys                              list providers, active one, which have keys
+/keys                              providers, active one, and where each key comes from
 /key <id> <apikey>                 set a provider's API key
 /use <id> [model]                  switch active provider (+ optional model)
 /model <model>                     set the active provider's model
-/local <id> <url> <model> [key]    add a local / OpenAI-compatible endpoint
+/models [id]                       list what a provider actually serves right now
+/local                             probe localhost for running model runtimes
+/local <id> [model]                register a discovered runtime
+/local <id> <url> <model> [key]    add any OpenAI-compatible endpoint by hand
+/url <id> <base_url>               point a provider at a proxy or gateway
+/remove <id>                       remove a provider (/use <id> restores a built-in)
 ```
 
-Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Anything non-Anthropic is called through the
-OpenAI-compatible `/chat/completions` shape, so local runtimes work too:
+Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Everything non-Anthropic is called
+through the OpenAI-compatible `/chat/completions` shape, so local runtimes work unchanged.
+
+**Local and open models.** `/local` with no arguments probes the usual ports concurrently and reports
+what is actually running:
 
 ```
-/local ollama http://localhost:11434/v1 llama3.2
-/use ollama
+/local
+[tachyon] local runtimes
+● ollama    http://localhost:11434/v1  llama3.2:latest qwen3:8b
+register one: /local <id> [model]   then /use <id>
+
+/local ollama          # register it
+/use ollama            # switch to it — no key needed
 ```
 
-Config persists to `~/.config/tachyon/providers.json`. The provider registry lives in Rust
-(`src-tauri/src/lib.rs`); the frontend just reads the active provider and dispatches.
+Ollama, LM Studio, llama.cpp's server, vLLM and Jan are probed. Keyless endpoints send no auth header.
 
-### MCP tools (agent mode)
+**Keys.** A provider's key comes from `providers.json` (written by `/key`, stored `0600`, atomically)
+or, if none is saved, from the conventional environment variable — `GROQ_API_KEY`, `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, and `<ID>_API_KEY` for anything else. An env-sourced key is used for the request and
+**never written to disk**. `/keys` shows the source, never the key; keys never cross into the webview.
+One caveat worth knowing: an app launched from Finder or the Dock does not inherit your shell
+environment, so the env-var path works when you start Tachyon from a shell.
 
-Agent mode (⌘J) can call [MCP](https://modelcontextprotocol.io) server tools, not just shell commands:
+**When a model disappears.** Providers retire models. A completion that fails with a 404 now says the
+model looks unavailable and points at `/models`, instead of surfacing an opaque HTTP error.
+
+### MCP: using tools, and being one
+
+Agent mode (⌘J) can call [MCP](https://modelcontextprotocol.io) tools, not just shell commands, and
+Tachyon can expose itself to other agents. Both directions go through the same approval gate.
+
+**As a client** — remote HTTP servers and local stdio servers:
 
 ```
-/mcp add <name> <url>    register a remote Streamable-HTTP MCP server
-/mcp list                list servers and their tools
-/mcp remove <name>       drop a server
+/mcp add <name> <url>              a remote Streamable-HTTP server
+/mcp add <name> -- <cmd> [args]    a local stdio server — Tachyon runs <cmd>
+/mcp list                          servers, transport, full command line, and their tools
+/mcp remove <name>
 ```
 
-The MCP client is Rust-side (`ureq`, JSON-RPC 2.0 over Streamable HTTP) so remote servers work without webview
-CORS; servers persist to `~/.config/tachyon/mcp.json`. In a run the agent may answer `TOOL: <server>.<tool> {args}`
-— every tool call goes through the **same approve/deny gate** as shell commands and never auto-runs.
+The client is Rust-side (`ureq` for HTTP, pipes for stdio), so remote servers work without webview
+CORS. Each tool's input schema is rendered into the system prompt as a signature —
+`fs.edit_file(path: string, mode?: "dry-run"|"apply")` — so the model is not guessing argument shapes.
+A tool result flagged `isError` is reported to the agent as an error rather than as fact. Servers
+persist to `~/.config/tachyon/mcp.json`; optional per-server `headers` (for auth) are hand-edited there
+and their values are never printed or sent to the webview. In a run the agent may answer
+`TOOL: <server>.<tool> {args}` — every call goes through the **same approve/deny gate** as a shell
+command, and a call whose name or arguments look destructive is flagged like `rm -rf` is.
+
+**As a server** — let Claude Code or any other MCP client use this terminal:
+
+```
+/mcp serve on        # binds 127.0.0.1 only, mints a bearer token
+/mcp serve status    # prints the URL and a ready-to-paste client config
+/mcp serve off
+```
+
+Off by default. It exposes `run_command`, `read_journal` and `get_context`. **`run_command` never runs
+anything on its own:** the command appears in your approval bar marked `external agent ·` and waits for
+you. Because these proposals are unsolicited and steal focus, approving one takes a deliberate **⌘⏎**
+(`Ctrl+⏎` on Linux) — a stray Enter meant for your own shell decides nothing. Requests need the bearer
+token (stored `0600`), must come from localhost, and are rejected if they carry a foreign `Origin`, so
+a web page in your browser cannot drive your terminal. A token holder can **propose**, never run.
+Threat model: [docs/danger-gate.md](docs/danger-gate.md).
 
 ### Shell integration (OSC 133)
 
