@@ -1,18 +1,7 @@
-// MUST stay in sync with DANGER_PATTERNS + is_dangerous in src-tauri/src/lib.rs.
-// This is the JS mirror of the Rust trust boundary — if you edit one, edit both.
-// `npm run eval:selftest` checks this mirror against lib.rs's own test vectors.
-export const DANGER_PATTERNS = [
-  "rm -rf",
-  "rm -fr",
-  "sudo rm",
-  "of=/dev",
-  "mkfs",
-  "> /dev/sd",
-  "chmod -r 777 /",
-  ":(){",
-  "shutdown",
-  "reboot",
-];
+// JS port of is_dangerous in src-tauri/src/lib.rs. The pattern list itself is
+// extracted from lib.rs (rust-source.mjs), so only this one-line matcher can
+// drift — and `npm run eval:selftest` runs it against lib.rs's own test vectors.
+import { DANGER_PATTERNS } from "./rust-source.mjs";
 
 export function isDangerous(cmd) {
   const lower = cmd.toLowerCase();

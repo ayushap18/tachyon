@@ -327,7 +327,8 @@ pub fn VimSearch() -> Element {
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
         let cb = Closure::wrap(Box::new(move |ev: KeyboardEvent| {
             let key = ev.key();
-            let is_toggle = ev.meta_key() && ev.shift_key() && key.eq_ignore_ascii_case("v");
+            let action = crate::keymap::action_for(&ev);
+            let is_toggle = action == Some(crate::keymap::Action::VimToggle);
             let mode = *state.vim_mode.read();
 
             if is_toggle {
@@ -340,8 +341,9 @@ pub fn VimSearch() -> Element {
                 }
                 return;
             }
-            // Other ⌘-chords pass through to the app/terminal shortcut handlers.
-            if ev.meta_key() {
+            // Other app chords (on macOS: every ⌘-chord) pass through to the app/terminal
+            // shortcut handlers.
+            if action.is_some() || (crate::keymap::is_mac() && ev.meta_key()) {
                 return;
             }
             // Search box (`/`) owns Enter/Escape; other keys type into it but must

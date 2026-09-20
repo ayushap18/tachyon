@@ -11,6 +11,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::{AppState, Overlay, VimMode};
 use crate::bridge::{invoke, NoArgs, WriteArgs};
+use crate::keymap::{label, Action};
 
 #[wasm_bindgen]
 extern "C" {
@@ -23,6 +24,26 @@ extern "C" {
 #[derive(Serialize)]
 struct IdArgs {
     id: String,
+}
+
+/// `provider_add_local` args — registers a discovered local runtime (keyless).
+#[derive(Serialize)]
+struct AddLocalArgs {
+    id: String,
+    // Tauri matches command arguments by their camelCase name
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    model: String,
+    key: String,
+}
+
+/// One row of `local_discover`: a local runtime that is up and not registered yet.
+#[derive(Deserialize)]
+struct LocalRuntime {
+    id: String,
+    base_url: String,
+    #[serde(default)]
+    models: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +70,8 @@ enum Act {
     Vim,
     Settings,
     Provider(String),
+    /// register + switch to a discovered local runtime: (id, base_url, model)
+    Local(String, String, String),
     Run(String),
 }
 
@@ -88,6 +111,16 @@ fn run(state: AppState, act: Act) {
             // active provider, so painting it would just duplicate that.
             state.close();
         }
+        Act::Local(id, base_url, model) => {
+            state.provider_active.clone().set(id.clone());
+            spawn_local(async move {
+                let add = AddLocalArgs { id: id.clone(), base_url, model, key: String::new() };
+                if invoke("provider_add_local", add).await.is_ok() {
+                    let _ = invoke("provider_use", IdArgs { id }).await;
+                }
+            });
+            state.close();
+        }
         Act::Run(cmd) => {
             spawn_local(async move {
                 let _ = invoke("pty_write", WriteArgs { data: cmd }).await;
@@ -103,6 +136,7 @@ pub fn Palette() -> Element {
     let mut query = use_signal(String::new);
     let mut sel = use_signal(|| 0usize);
     let mut providers = use_signal(Vec::<(String, String, bool)>::new);
+    let mut locals = use_signal(Vec::<LocalRuntime>::new);
     let mut version = use_signal(String::new);
 
     // App version (bottom-right), fetched once — best-effort cosmetic.
@@ -138,6 +172,16 @@ pub fn Palette() -> Element {
                     }
                 }
             });
+            // Local-runtime discovery runs as its own task: the probes take up to their
+            // timeout, and the palette must not wait on them — entries appear when they land.
+            locals.set(Vec::new());
+            spawn_local(async move {
+                if let Ok(v) = invoke("local_discover", NoArgs {}).await {
+                    if let Ok(found) = serde_wasm_bindgen::from_value::<Vec<LocalRuntime>>(v) {
+                        locals.set(found);
+                    }
+                }
+            });
         }
     });
 
@@ -147,12 +191,12 @@ pub fn Palette() -> Element {
 
     // ---- build the entry list (static + providers + recent commands) ----
     let mut entries: Vec<(String, String, Act)> = vec![
-        ("AI command".into(), "⌘K".into(), Act::AiBar),
-        ("Agent: run a task".into(), "⌘J".into(), Act::Agent),
-        ("Explain last error".into(), "⌘E".into(), Act::Explain),
-        ("Blocks: session navigator".into(), "⌘B".into(), Act::Blocks),
-        ("Vim mode".into(), "⌘⇧V".into(), Act::Vim),
-        ("Settings".into(), "⌘,".into(), Act::Settings),
+        ("AI command".into(), label(Action::AiBar), Act::AiBar),
+        ("Agent: run a task".into(), label(Action::Agent), Act::Agent),
+        ("Explain last error".into(), label(Action::Explain), Act::Explain),
+        ("Blocks: session navigator".into(), label(Action::Blocks), Act::Blocks),
+        ("Vim mode".into(), label(Action::VimToggle), Act::Vim),
+        ("Settings".into(), label(Action::Settings), Act::Settings),
     ];
     for (id, model, active) in providers.read().iter() {
         let hint = if *active { "active".to_string() } else { model.clone() };
@@ -172,6 +216,15 @@ pub fn Palette() -> Element {
             || c.len() > 120;
         if !noise && seen.insert(c.to_string()) {
             entries.push((c.to_string(), "history".into(), Act::Run(c.to_string())));
+        }
+    }
+
+    // Discovered local runtimes go LAST: they land after the list is already on screen, and
+    // anything inserted higher would shift the row under the user's selection mid-keystroke.
+    for r in locals.read().iter() {
+        if let Some(model) = r.models.first() {
+            let act = Act::Local(r.id.clone(), r.base_url.clone(), model.clone());
+            entries.push((format!("Use local: {} ({model})", r.id), "discovered".into(), act));
         }
     }
 

@@ -66,7 +66,35 @@ struct AgentPropose {
     text: String,
     #[serde(default)]
     danger: bool,
+    // true when the proposal came in over Tachyon's MCP server, not from the built-in agent
+    #[serde(default)]
+    external: bool,
 }
+
+/// The gate's status line. The approver must be able to tell a command THEY asked the
+/// built-in agent for from one an outside process is asking to run.
+fn gate_status(danger: bool, external: bool, is_mac: bool) -> String {
+    let who = if external { "external agent · " } else { "" };
+    let warn = if danger { "⚠ destructive · " } else { "" };
+    // External proposals are UNSOLICITED: the bar takes focus while the user may be typing
+    // in their shell, so a plain Enter meant for their own command must never approve one.
+    let approve = if !external {
+        "⏎"
+    } else if is_mac {
+        "⌘⏎"
+    } else {
+        "Ctrl+⏎"
+    };
+    format!("{who}{warn}run? {approve} approve · esc deny")
+}
+
+/// Does this Enter approve the pending proposal? The built-in agent's proposals are
+/// solicited (the user just asked for them), so Enter is enough. An external agent's arrive
+/// uninvited and steal focus, so they need a deliberate chord.
+fn enter_approves(external: bool, meta: bool, ctrl: bool) -> bool {
+    !external || meta || ctrl
+}
+
 #[derive(Deserialize)]
 struct AgentStatus {
     #[serde(default)]
@@ -107,6 +135,7 @@ pub fn AiBar() -> Element {
     let mut danger = use_signal(|| false);
     let mut readonly = use_signal(|| false);
     let mut pending_gate = use_signal(|| false);
+    let mut gate_external = use_signal(|| false);
     // agent_running is shared state (⌘J abort reads it) — this module owns writes.
     let mut agent_running = state.agent_running;
 
@@ -122,8 +151,8 @@ pub fn AiBar() -> Element {
                 input.set(p.text);
                 readonly.set(true);
                 danger.set(p.danger);
-                let prefix = if p.danger { "⚠ destructive · " } else { "" };
-                status.set(format!("{prefix}run? ⏎ approve · esc deny"));
+                status.set(gate_status(p.danger, p.external, crate::keymap::is_mac()));
+                gate_external.set(p.external);
                 pending_gate.set(true);
             }
         });
@@ -165,15 +194,21 @@ pub fn AiBar() -> Element {
                     readonly.set(false);
                     let mut status = status;
                     spawn_local(async move {
-                        if let Ok(v) = invoke("provider_active", NoArgs {}).await {
-                            if let Ok(p) = serde_wasm_bindgen::from_value::<Provider>(v) {
-                                let suffix = if p.has_key || p.kind != "anthropic" {
-                                    ""
-                                } else {
-                                    " · no key"
-                                };
-                                status.set(format!("{} · {}{}", p.id, p.model, suffix));
+                        // provider_active now fails loudly on a corrupt providers.json
+                        // rather than silently handing back defaults — show that here,
+                        // since this bar is where the user looks for provider state.
+                        match invoke("provider_active", NoArgs {}).await {
+                            Ok(v) => {
+                                if let Ok(p) = serde_wasm_bindgen::from_value::<Provider>(v) {
+                                    let suffix = if p.has_key || p.kind != "anthropic" {
+                                        ""
+                                    } else {
+                                        " · no key"
+                                    };
+                                    status.set(format!("{} · {}{}", p.id, p.model, suffix));
+                                }
                             }
+                            Err(e) => status.set(err_str(e)),
                         }
                     });
                 }
@@ -217,7 +252,12 @@ pub fn AiBar() -> Element {
                     let key = e.key().to_string();
                     // ---- approval gate: the ONLY place a proposal resolves ----
                     if *pending_gate.read() {
-                        if key == "Enter" {
+                        let mods = e.modifiers();
+                        if key == "Enter" && !enter_approves(*gate_external.peek(), mods.meta(), mods.ctrl()) {
+                            // a stray Enter on an external proposal: swallow it, decide nothing
+                            e.prevent_default();
+                            e.stop_propagation();
+                        } else if key == "Enter" {
                             e.prevent_default();
                             e.stop_propagation();
                             pending_gate.set(false);
@@ -308,5 +348,29 @@ pub fn AiBar() -> Element {
             }
             span { id: "ai-status", "{status}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enter_approves, gate_status};
+
+    #[test]
+    fn gate_status_names_an_external_requester() {
+        assert_eq!(gate_status(false, false, true), "run? ⏎ approve · esc deny");
+        assert_eq!(gate_status(true, false, true), "⚠ destructive · run? ⏎ approve · esc deny");
+        assert!(gate_status(false, true, true).starts_with("external agent · run? "));
+        assert!(gate_status(false, true, true).contains("⌘⏎ approve"));
+        assert!(gate_status(false, true, false).contains("Ctrl+⏎ approve"));
+        assert!(!gate_status(false, true, false).contains("run? ⏎ approve"), "external must not advertise a bare Enter");
+        assert!(gate_status(true, true, true).starts_with("external agent · ⚠ destructive"));
+    }
+
+    #[test]
+    fn a_bare_enter_never_approves_an_external_proposal() {
+        assert!(enter_approves(false, false, false)); // built-in agent: Enter, as before
+        assert!(!enter_approves(true, false, false)); // external: the stray Enter decides nothing
+        assert!(enter_approves(true, true, false)); // ⌘⏎
+        assert!(enter_approves(true, false, true)); // Ctrl+⏎
     }
 }

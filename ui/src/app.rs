@@ -12,6 +12,7 @@ use web_sys::KeyboardEvent;
 use crate::ai_bar::AiBar;
 use crate::blocks::BlocksPanel;
 use crate::bridge::{invoke, listen};
+use crate::keymap::{self, Action};
 use crate::palette::Palette;
 use crate::settings::SettingsPanel;
 use crate::status::StatusBar;
@@ -36,7 +37,7 @@ pub struct Settings {
 }
 
 fn default_theme() -> String { "Tokyo Night".into() }
-fn default_font() -> String { "Menlo".into() }
+fn default_font() -> String { theme::default_font().into() }
 fn default_size() -> u32 { 14 }
 
 impl Default for Settings {
@@ -103,6 +104,9 @@ pub struct AppState {
     pub vim_mode: Signal<VimMode>,
     /// Mirror of the Rust AgentState.running — driven by the ai_bar (agent) module.
     pub agent_running: Signal<bool>,
+    /// Flips once the user's keybinding overrides are merged, so shortcut labels rendered
+    /// before that (the settings gear tooltip) re-render with the active binding.
+    pub keys_loaded: Signal<bool>,
 }
 
 impl AppState {
@@ -156,10 +160,13 @@ pub fn next_block_id() -> u64 {
 }
 
 fn load_settings() -> Settings {
-    local_storage()
+    let mut s: Settings = local_storage()
         .and_then(|ls| ls.get_item("tachyon-settings").ok().flatten())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A font saved on another platform (Menlo on Linux) isn't in this platform's list.
+    s.font = theme::resolve_font(&s.font).into();
+    s
 }
 
 /// Fire a no-arg native command, ignoring the result. Used for ⌘J abort and ⌘E explain.
@@ -170,7 +177,7 @@ fn fire(cmd: &'static str) {
 }
 
 /// Global document keydown → overlay routing (main.ts lines 144-177).
-/// ⌘-chords route to overlay state; bare Esc closes plain overlays. The ai bar
+/// Keymap chords route to overlay state; bare Esc closes plain overlays. The ai bar
 /// (command/agent) owns its own Esc — the agent approval gate is the trust
 /// boundary, so this handler never closes AiBar/Agent on Esc.
 /// ⌘E / palette "Explain last error": run the autopsy, then paint the result cyan on the
@@ -187,23 +194,29 @@ pub fn explain_and_paint() {
 }
 
 fn handle_global_key(state: AppState, ev: KeyboardEvent) {
-    if ev.meta_key() {
-        match ev.key().as_str() {
-            "," => { ev.prevent_default(); state.toggle(Overlay::Settings); }
-            "k" => { ev.prevent_default(); state.toggle_bar(Overlay::AiBar); }
-            "j" => {
-                ev.prevent_default();
+    if let Some(action) = keymap::action_for(&ev) {
+        if matches!(action, Action::VimToggle | Action::Copy) {
+            return; // owned by vim.rs / terminal.rs (copy must stay un-prevented without a selection)
+        }
+        ev.prevent_default();
+        match action {
+            Action::Settings => state.toggle(Overlay::Settings),
+            Action::AiBar => state.toggle_bar(Overlay::AiBar),
+            Action::Agent => {
                 if *state.agent_running.read() {
-                    fire("agent_abort"); // ⌘J while running = dedicated abort
+                    fire("agent_abort"); // agent chord while running = dedicated abort
                 } else {
                     state.toggle_bar(Overlay::Agent);
                 }
             }
-            "e" => { ev.prevent_default(); explain_and_paint(); }
-            "p" => { ev.prevent_default(); state.toggle(Overlay::Palette); }
-            "b" => { ev.prevent_default(); state.toggle(Overlay::Blocks); }
-            _ => {}
+            Action::Explain => explain_and_paint(),
+            Action::Palette => state.toggle(Overlay::Palette),
+            Action::Blocks => state.toggle(Overlay::Blocks),
+            Action::VimToggle | Action::Copy => {}
         }
+        return;
+    }
+    if ev.meta_key() {
         return;
     }
     if ev.key() == "Escape"
@@ -223,6 +236,7 @@ pub fn App() -> Element {
         provider_active: Signal::new(String::new()),
         vim_mode: Signal::new(VimMode::Insert),
         agent_running: Signal::new(false),
+        keys_loaded: Signal::new(false),
     });
 
     // Apply theme + persist settings whenever they change (runs on mount too).

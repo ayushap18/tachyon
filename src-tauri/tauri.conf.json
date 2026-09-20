@@ -5,8 +5,8 @@
   "identifier": "com.ayush18.tachyon",
   "build": {
     "beforeDevCommand": "sh ui/build-web.sh",
-    "beforeBuildCommand": "sh ui/build-web.sh",
-    "frontendDist": "../ui/target/dx/tachyon-ui/debug/web/public"
+    "beforeBuildCommand": "sh ui/build-web.sh --release",
+    "frontendDist": "../ui/dist"
   },
   "app": {
     "withGlobalTauri": true,

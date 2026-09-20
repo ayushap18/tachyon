@@ -10,7 +10,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
 use crate::bridge::invoke;
-use crate::theme::{FONTS, THEME_NAMES};
+use crate::keymap::{self, Action};
+use crate::theme::{fonts, THEME_NAMES};
 
 #[derive(Serialize)]
 struct ThemeArg {
@@ -21,11 +22,13 @@ struct ThemeArg {
 pub fn SettingsPanel() -> Element {
     let state = use_context::<AppState>();
     let cur = state.settings.read().clone();
+    let _ = state.keys_loaded.read(); // reactive dep: the tooltip shows the active binding
+    let title = format!("Settings ({})", keymap::label(Action::Settings));
 
     rsx! {
         button {
             id: "settings-btn",
-            title: "Settings (⌘,)",
+            title: "{title}",
             onclick: move |_| state.toggle(Overlay::Settings),
             "⚙"
         }
@@ -54,7 +57,7 @@ pub fn SettingsPanel() -> Element {
                             let mut s = state.settings;
                             s.write().font = e.value();
                         },
-                        for f in FONTS {
+                        for f in fonts().iter().copied() {
                             option { selected: f == cur.font, "{f}" }
                         }
                     }
