@@ -19,6 +19,7 @@ serde_json = "1"
 version = "0.3"
 features = [
     "Window",
+    "Navigator",
     "Document",
     "Element",
     "HtmlElement",

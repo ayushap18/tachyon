@@ -2,6 +2,7 @@ mod ai_bar;
 mod app;
 mod blocks;
 mod bridge;
+mod keymap;
 mod palette;
 mod settings;
 mod status;

@@ -101,7 +101,7 @@ pub fn set_overlay_open(open: bool) {
 /// Falls back to the defaults when unset/unparseable — mirrors settings.rs's seed.
 fn settings_font() -> (f64, String) {
     let mut px = FONT_PX;
-    let mut family = "Menlo".to_string();
+    let mut family = crate::theme::default_font();
     if let Some(raw) = web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item("tachyon-settings").ok().flatten())
@@ -111,7 +111,7 @@ fn settings_font() -> (f64, String) {
                 px = s.clamp(9.0, 28.0);
             }
             if let Some(f) = v.get("font").and_then(|f| f.as_str()) {
-                family = f.to_string();
+                family = crate::theme::resolve_font(f);
             }
         }
     }
@@ -550,7 +550,7 @@ fn editable_focused() -> bool {
         .unwrap_or(false)
 }
 
-fn setup() {
+fn setup(mut keys_loaded: Signal<bool>) {
     let document = win().document().expect("no document");
     let canvas: HtmlCanvasElement = document
         .get_element_by_id("term")
@@ -623,6 +623,10 @@ fn setup() {
     let (cols, rows) = term.borrow_mut().fit();
     let theme = settings_theme();
     wasm_bindgen_futures::spawn_local(async move {
+        // Keybinding overrides load here, not in app.rs: a corrupt file is reported on the
+        // canvas, and term_write paints nothing until pty_spawn has created the engine.
+        let key_err = crate::keymap::load().await;
+        keys_loaded.set(true);
         // pty_spawn's Result used to be discarded: a failed shell spawn left a blank canvas
         // with no feedback anywhere. It also returns an optional warning (no shell
         // integration => no command journal), which is otherwise invisible.
@@ -638,6 +642,9 @@ fn setup() {
                 }
             }
         }
+        if let Some(e) = key_err {
+            crate::bridge::term_write(format!("\r\n\x1b[33m[tachyon] keybindings: {e} — using defaults\x1b[0m\r\n"));
+        }
         // Apply the persisted theme to the engine now that it exists (fixes the grid rendering
         // default colors until the user re-touches the theme select). term_set_theme also emits
         // the initial full grid-damage repaint, so no separate term_full_repaint is needed.
@@ -650,17 +657,26 @@ fn setup() {
         let typed = typed.clone();
         let term = term.clone();
         let cb = Closure::wrap(Box::new(move |ev: KeyboardEvent| {
-            // ⌘C with an active selection: copy it, don't fall through to the shell.
-            if ev.meta_key() && ev.key() == "c" {
+            let action = crate::keymap::action_for(&ev);
+            let is_mac = crate::keymap::is_mac();
+            // Copy chord with an active selection: copy it, don't fall through to the shell.
+            if action == Some(crate::keymap::Action::Copy) {
                 if let Some(text) = term.borrow().selection_text() {
                     crate::bridge::clipboard_write(&text);
                     ev.prevent_default();
                     return;
                 }
-                // no selection: fall through to the ⌘-chord return below (⌘C = default/no-op).
+                // no selection: fall through to the app-chord return below (default/no-op).
             }
-            // ⌘-chords are app shortcuts (settings/ai-bar/palette/…) — never PTY input.
-            if ev.meta_key() {
+            // Keymap chords are app shortcuts (settings/ai-bar/palette/…) — never PTY input.
+            // On macOS that covers every ⌘-chord; elsewhere only what the keymap binds is
+            // swallowed, so plain Ctrl+<key> still reaches the shell through encode_key.
+            if action.is_some() || (is_mac && ev.meta_key()) {
+                return;
+            }
+            // Ctrl+Shift+V is paste off macOS: leave it to the webview so its native `paste`
+            // event (handled below) fires, instead of encoding it as ^V.
+            if !is_mac && ev.ctrl_key() && ev.shift_key() && ev.key().eq_ignore_ascii_case("v") {
                 return;
             }
             // An overlay input (ai-bar / palette / settings / vim search) is focused: its own
@@ -685,7 +701,7 @@ fn setup() {
         cb.forget();
     }
 
-    // --- paste (Cmd+V): the native `paste` event fires even though keydown ignores ⌘-chords;
+    // --- paste (⌘V / Ctrl+Shift+V): the native `paste` event fires because keydown leaves those alone;
     // forward the clipboard text to the PTY, but not while an overlay input is focused. ---
     {
         let typed = typed.clone();
@@ -877,7 +893,8 @@ fn reconstruct_typed_line(typed: &Rc<RefCell<String>>, data: &str) {
 #[component]
 pub fn Terminal() -> Element {
     // use_effect runs after the canvas is mounted; no reactive reads => once.
-    use_effect(setup);
+    let keys_loaded = use_context::<crate::app::AppState>().keys_loaded;
+    use_effect(move || setup(keys_loaded));
     rsx! {
         canvas { id: "term" }
     }

@@ -11,6 +11,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::{AppState, Overlay, VimMode};
 use crate::bridge::{invoke, NoArgs, WriteArgs};
+use crate::keymap::{label, Action};
 
 #[wasm_bindgen]
 extern "C" {
@@ -147,12 +148,12 @@ pub fn Palette() -> Element {
 
     // ---- build the entry list (static + providers + recent commands) ----
     let mut entries: Vec<(String, String, Act)> = vec![
-        ("AI command".into(), "⌘K".into(), Act::AiBar),
-        ("Agent: run a task".into(), "⌘J".into(), Act::Agent),
-        ("Explain last error".into(), "⌘E".into(), Act::Explain),
-        ("Blocks: session navigator".into(), "⌘B".into(), Act::Blocks),
-        ("Vim mode".into(), "⌘⇧V".into(), Act::Vim),
-        ("Settings".into(), "⌘,".into(), Act::Settings),
+        ("AI command".into(), label(Action::AiBar), Act::AiBar),
+        ("Agent: run a task".into(), label(Action::Agent), Act::Agent),
+        ("Explain last error".into(), label(Action::Explain), Act::Explain),
+        ("Blocks: session navigator".into(), label(Action::Blocks), Act::Blocks),
+        ("Vim mode".into(), label(Action::VimToggle), Act::Vim),
+        ("Settings".into(), label(Action::Settings), Act::Settings),
     ];
     for (id, model, active) in providers.read().iter() {
         let hint = if *active { "active".to_string() } else { model.clone() };

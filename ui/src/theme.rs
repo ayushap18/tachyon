@@ -5,8 +5,9 @@
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
-/// Font choices for the settings dropdown (main.ts line 52).
-pub const FONTS: [&str; 6] = [
+/// Font choices for the settings dropdown (main.ts line 52). The first entry is the
+/// platform default.
+const FONTS_MAC: [&str; 6] = [
     "Menlo",
     "Monaco",
     "SF Mono",
@@ -14,6 +15,32 @@ pub const FONTS: [&str; 6] = [
     "JetBrains Mono",
     "Fira Code",
 ];
+
+/// Menlo/Monaco/SF Mono only ship with macOS. The canvas font string always ends in the
+/// generic `monospace`, so a listed family that isn't installed still measures as a
+/// fixed-width cell.
+const FONTS_OTHER: [&str; 6] = [
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Ubuntu Mono",
+    "JetBrains Mono",
+    "Fira Code",
+    "monospace",
+];
+
+pub fn fonts() -> &'static [&'static str] {
+    if crate::keymap::is_mac() { &FONTS_MAC } else { &FONTS_OTHER }
+}
+
+pub fn default_font() -> &'static str {
+    fonts()[0]
+}
+
+/// A saved font that isn't offered on this platform (settings carried over from another
+/// OS, or hand-edited) falls back to the default, so the dropdown and the canvas agree.
+pub fn resolve_font(name: &str) -> &'static str {
+    fonts().iter().copied().find(|f| *f == name).unwrap_or_else(default_font)
+}
 
 /// Theme names in display order (keys of THEMES in main.ts).
 pub const THEME_NAMES: [&str; 6] = [
