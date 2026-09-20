@@ -540,6 +540,14 @@ struct SpawnArgs {
     rows: u16,
     cols: u16,
 }
+/// pty_spawn only. The engine is built with this theme so the shell's first output is painted
+/// in the user's palette; it used to be born dark and corrected by a second round trip.
+#[derive(Serialize)]
+struct SpawnThemeArgs {
+    rows: u16,
+    cols: u16,
+    theme: String,
+}
 #[derive(Serialize)]
 struct TypedArgs {
     line: String,
@@ -678,7 +686,7 @@ fn setup(mut keys_loaded: Signal<bool>) {
         // pty_spawn's Result used to be discarded: a failed shell spawn left a blank canvas
         // with no feedback anywhere. It also returns an optional warning (no shell
         // integration => no command journal), which is otherwise invisible.
-        match invoke("pty_spawn", SpawnArgs { rows, cols }).await {
+        match invoke("pty_spawn", SpawnThemeArgs { rows, cols, theme: theme.clone() }).await {
             Err(e) => {
                 let msg = e.as_string().unwrap_or_else(|| "failed to start the shell".into());
                 crate::bridge::term_write(format!("\r\n\x1b[31m[tachyon] {msg}\x1b[0m\r\n"));
@@ -693,9 +701,8 @@ fn setup(mut keys_loaded: Signal<bool>) {
         if let Some(e) = key_err {
             crate::bridge::term_write(format!("\r\n\x1b[33m[tachyon] keybindings: {e} — using defaults\x1b[0m\r\n"));
         }
-        // Apply the persisted theme to the engine now that it exists (fixes the grid rendering
-        // default colors until the user re-touches the theme select). term_set_theme also emits
-        // the initial full grid-damage repaint, so no separate term_full_repaint is needed.
+        // The engine already has this theme (passed to pty_spawn), so this is no longer a
+        // colour correction — it is just the initial full repaint, and it is idempotent.
         let _ = invoke("term_set_theme", ThemeArgs { name: theme }).await;
     });
 

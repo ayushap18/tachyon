@@ -474,7 +474,7 @@ fn last_failed_block(journal: State<JournalState>) -> Option<Block> {
 }
 
 #[tauri::command]
-fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<Option<String>, String> {
+fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16, theme: String) -> Result<Option<String>, String> {
     // rows/cols arrive raw from the webview and size a rows*cols allocation; clamp them.
     let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
     let mut master_slot = state.master.lock().unwrap_or_else(|e| e.into_inner());
@@ -517,7 +517,7 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     *state.shell_pid.lock().unwrap_or_else(|e| e.into_inner()) = child.process_id();
     *state.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
     *master_slot = Some(pair.master);
-    *state.engine.lock().unwrap_or_else(|e| e.into_inner()) = Some(engine::TerminalEngine::new(cols, rows));
+    *state.engine.lock().unwrap_or_else(|e| e.into_inner()) = Some(engine::TerminalEngine::new(cols, rows, &theme));
 
     std::thread::spawn(move || {
         let journal = app.state::<JournalState>();

@@ -182,10 +182,14 @@ pub struct TerminalEngine {
 }
 
 impl TerminalEngine {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    /// `theme` is the user's saved theme, passed in at spawn. It used to be hardcoded to
+    /// Tokyo Night and corrected by a second IPC call (term_set_theme) right after — so every
+    /// cell the shell printed in that window was painted with the DARK palette and left on a
+    /// light background until something redamaged it. Unknown names fall back to Tokyo Night.
+    pub fn new(cols: u16, rows: u16, theme: &str) -> Self {
         Self {
             parser: Parser::new(rows, cols, 5000), // note: vt100 takes (rows, cols, scrollback)
-            colors: theme_colors("Tokyo Night"),
+            colors: theme_colors(theme),
             cols,
             rows,
             snapshot: vec![None; rows as usize * cols as usize],
@@ -306,9 +310,24 @@ impl TerminalEngine {
 mod tests {
     use super::*;
 
+    // The engine used to hardcode Tokyo Night and rely on a second IPC call to correct it,
+    // so everything the shell printed before that call landed was painted with the dark
+    // palette on a light background. The theme now arrives at construction; if this ever
+    // regresses to a fixed default, a light theme's first paint goes dark again.
+    #[test]
+    fn new_honours_the_theme_it_is_given() {
+        let light = TerminalEngine::new(8, 2, "Solarized Light").full_repaint();
+        let dark = TerminalEngine::new(8, 2, "Tokyo Night").full_repaint();
+        let bg = |d: &GridDamage| d.cells.first().map(|c| c.bg).unwrap();
+        assert_ne!(bg(&light), bg(&dark), "a light theme must not paint the dark background");
+        assert_eq!(bg(&light), theme_colors("Solarized Light").slots[257]);
+        // an unknown name still falls back rather than panicking
+        assert_eq!(bg(&TerminalEngine::new(8, 2, "nope").full_repaint()), bg(&dark));
+    }
+
     #[test]
     fn feed_and_full_repaint_reads_written_cells() {
-        let mut e = TerminalEngine::new(20, 5);
+        let mut e = TerminalEngine::new(20, 5, "Tokyo Night");
         e.feed(b"hi");
         let d = e.full_repaint();
         assert_eq!(d.cols, 20);
@@ -328,7 +347,7 @@ mod tests {
     // that such a payload actually lands on the grid, colored, and is reported as damage.
     #[test]
     fn feed_ansi_paints_colored_text_as_damage() {
-        let mut e = TerminalEngine::new(40, 5);
+        let mut e = TerminalEngine::new(40, 5, "Tokyo Night");
         let _ = e.full_repaint();
         let _ = e.take_damage();
         // exactly the shape run_slash / explain_and_paint emit: CRLF + cyan + text + reset
@@ -343,7 +362,7 @@ mod tests {
 
     #[test]
     fn partial_damage_only_reports_changed_cells() {
-        let mut e = TerminalEngine::new(20, 5);
+        let mut e = TerminalEngine::new(20, 5, "Tokyo Night");
         let _ = e.full_repaint(); // seed the snapshot
         let _ = e.take_damage(); // nothing changed since -> drains to empty
         e.feed(b"x");
@@ -356,7 +375,7 @@ mod tests {
 
     #[test]
     fn take_damage_is_empty_when_nothing_changes() {
-        let mut e = TerminalEngine::new(10, 3);
+        let mut e = TerminalEngine::new(10, 3, "Tokyo Night");
         e.feed(b"abc");
         let _ = e.take_damage(); // absorb the write
         let d = e.take_damage(); // no new bytes
@@ -365,7 +384,7 @@ mod tests {
 
     #[test]
     fn theme_switch_changes_default_bg() {
-        let mut e = TerminalEngine::new(4, 2);
+        let mut e = TerminalEngine::new(4, 2, "Tokyo Night");
         e.set_theme("Matrix");
         let d = e.full_repaint();
         // Matrix bg is pure black
@@ -375,7 +394,7 @@ mod tests {
 
     #[test]
     fn scroll_by_clamps_at_zero() {
-        let mut e = TerminalEngine::new(20, 5);
+        let mut e = TerminalEngine::new(20, 5, "Tokyo Night");
         e.feed(b"hello");
         // already at the live bottom; scrolling further toward bottom stays at 0.
         e.scroll_by(-100);
@@ -384,7 +403,7 @@ mod tests {
 
     #[test]
     fn scrolling_diffs_match_full_frames_and_boundaries_are_noops() {
-        let mut e = TerminalEngine::new(80, 6);
+        let mut e = TerminalEngine::new(80, 6, "Tokyo Night");
         for n in 0..40 {
             e.feed(format!("line {n}\r\n").as_bytes());
         }
@@ -409,7 +428,7 @@ mod tests {
 
     #[test]
     fn resize_updates_dimensions() {
-        let mut e = TerminalEngine::new(20, 5);
+        let mut e = TerminalEngine::new(20, 5, "Tokyo Night");
         e.resize(40, 10);
         let d = e.full_repaint();
         assert_eq!(d.cols, 40);
