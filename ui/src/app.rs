@@ -173,6 +173,19 @@ fn fire(cmd: &'static str) {
 /// ⌘-chords route to overlay state; bare Esc closes plain overlays. The ai bar
 /// (command/agent) owns its own Esc — the agent approval gate is the trust
 /// boundary, so this handler never closes AiBar/Agent on Esc.
+/// ⌘E / palette "Explain last error": run the autopsy, then paint the result cyan on the
+/// canvas (mirrors main.ts printing the explanation cyan). Errors are painted too so
+/// nothing is silently dropped. Display-only — never written to the pty.
+pub fn explain_and_paint() {
+    spawn_local(async move {
+        let text = match invoke("explain_last_error", NoArgs {}).await {
+            Ok(v) => v.as_string().unwrap_or_default(),
+            Err(e) => e.as_string().unwrap_or_else(|| "explain failed".into()),
+        };
+        crate::bridge::term_write(format!("\r\n\x1b[36m{text}\x1b[0m\r\n"));
+    });
+}
+
 fn handle_global_key(state: AppState, ev: KeyboardEvent) {
     if ev.meta_key() {
         match ev.key().as_str() {
@@ -186,9 +199,7 @@ fn handle_global_key(state: AppState, ev: KeyboardEvent) {
                     state.toggle_bar(Overlay::Agent);
                 }
             }
-            // ponytail: fire-and-forget; explain output rendering is the ai/terminal
-            // module's job (main.ts prints cyan to the term). Wire result there.
-            "e" => { ev.prevent_default(); fire("explain_last_error"); }
+            "e" => { ev.prevent_default(); explain_and_paint(); }
             "p" => { ev.prevent_default(); state.toggle(Overlay::Palette); }
             "b" => { ev.prevent_default(); state.toggle(Overlay::Blocks); }
             _ => {}
@@ -231,6 +242,14 @@ pub fn App() -> Element {
                 let _ = win.dispatch_event(&ev);
             }
         }
+    });
+
+    // Tell the terminal when any overlay is open so its document key/paste handlers stand down —
+    // defense-in-depth against a focus miss leaking the user's typing to the shell. Vim (vim_mode)
+    // is a separate mechanism with its own capture handler, so it isn't included here.
+    use_effect(move || {
+        let open = !matches!(*state.overlay.read(), Overlay::None);
+        crate::terminal::set_overlay_open(open);
     });
 
     // Journal mirror + provider seed + global keybindings — once on mount.

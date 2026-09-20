@@ -86,6 +86,15 @@ thread_local! {
     // DECCKM state from the latest grid-damage; read by the keydown handler (which doesn't
     // hold the Term) to pick SS3 vs CSI arrow encoding. Cell, not RefCell — it's a Copy bool.
     static APP_CURSOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // True while any chrome overlay (ai-bar/palette/settings/blocks) is open. Set from app.rs's
+    // overlay effect. Defense-in-depth: the document key/paste handlers early-return on it so a
+    // focus miss can never leak the user's typing to the shell.
+    static OVERLAY_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tell the terminal an overlay is (or isn't) open — see OVERLAY_OPEN.
+pub fn set_overlay_open(open: bool) {
+    OVERLAY_OPEN.with(|o| o.set(open));
 }
 
 /// Font family + pixel size from the persisted settings (localStorage "tachyon-settings").
@@ -643,7 +652,7 @@ fn setup() {
             // An overlay input (ai-bar / palette / settings / vim search) is focused: its own
             // handler owns the key. This document-level listener must NOT also write it to the
             // PTY — otherwise typing (and the agent-approval Enter) leaks straight to the shell.
-            if editable_focused() {
+            if editable_focused() || OVERLAY_OPEN.with(|o| o.get()) {
                 return;
             }
             let app_cursor = APP_CURSOR.with(|a| a.get());
@@ -667,7 +676,7 @@ fn setup() {
     {
         let typed = typed.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::ClipboardEvent| {
-            if editable_focused() {
+            if editable_focused() || OVERLAY_OPEN.with(|o| o.get()) {
                 return;
             }
             let Some(text) = ev.clipboard_data().and_then(|d| d.get_data("text/plain").ok()) else {

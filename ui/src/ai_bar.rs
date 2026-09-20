@@ -16,7 +16,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
-use crate::bridge::{invoke, listen, NoArgs, WriteArgs};
+use crate::bridge::{invoke, listen, term_write, NoArgs, WriteArgs};
 
 // ---- invoke arg shapes ----
 #[derive(Serialize)]
@@ -54,6 +54,11 @@ struct Provider {
     has_key: bool,
     #[serde(default)]
     kind: String,
+}
+#[derive(Deserialize)]
+struct AgentOutput {
+    #[serde(default)]
+    text: String,
 }
 #[derive(Deserialize)]
 struct AgentPropose {
@@ -132,10 +137,16 @@ pub fn AiBar() -> Element {
                 });
             }
         });
-        // agent-output: cyan `[agent] …` lines. ponytail: no client→grid write path
-        // exists (canvas is painted only from native grid-damage; palette hit the same
-        // wall). Deferred to the terminal module; the agent's real shell output still
-        // shows via the PTY. Not registered — nothing to render.
+        // agent-output: cyan `[agent] …` narrative (exit codes, MCP tool results). Shell
+        // output itself still arrives via the PTY; this is the part that has no other
+        // path to the screen, so it is painted display-only via term_write.
+        listen("agent-output", move |payload| {
+            if let Ok(o) = serde_wasm_bindgen::from_value::<AgentOutput>(payload) {
+                if !o.text.is_empty() {
+                    term_write(format!("\r\n\x1b[36m[agent] {}\x1b[0m\r\n", o.text));
+                }
+            }
+        });
         // agent-done: finish → clear running flag, close the bar.
         listen("agent-done", move |_| {
             reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
@@ -246,11 +257,16 @@ pub fn AiBar() -> Element {
                         e.stop_propagation();
                         let v = input.read().trim().to_string();
                         if v.starts_with('/') {
-                            // slash command: run_slash executes in Rust; result print
-                            // is a term-write (deferred, see above). Close the bar.
+                            // slash command: run_slash executes in Rust and returns its
+                            // already-ANSI-formatted output; paint it on the canvas
+                            // (display-only term_write, never the pty). Close the bar.
                             let cmd = v.clone();
                             spawn_local(async move {
-                                let _ = invoke("run_slash", SlashArgs { input: cmd }).await;
+                                if let Ok(out) = invoke("run_slash", SlashArgs { input: cmd }).await {
+                                    if let Some(text) = out.as_string() {
+                                        term_write(text);
+                                    }
+                                }
                             });
                             reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
                         } else if agent {

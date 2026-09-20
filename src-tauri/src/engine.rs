@@ -325,6 +325,24 @@ mod tests {
         assert_eq!(d.cursor.col, 2);
     }
 
+    // The `term_write` display path (slash results, ⌘E autopsy, agent narrative) paints by
+    // feeding pre-formatted ANSI straight into this engine — it never touches the pty. Guards
+    // that such a payload actually lands on the grid, colored, and is reported as damage.
+    #[test]
+    fn feed_ansi_paints_colored_text_as_damage() {
+        let mut e = TerminalEngine::new(40, 5);
+        let _ = e.full_repaint();
+        let _ = e.take_damage();
+        // exactly the shape run_slash / explain_and_paint emit: CRLF + cyan + text + reset
+        e.feed(b"\r\n\x1b[36m[tachyon] ok\x1b[0m\r\n");
+        let d = e.take_damage();
+        let t = d.cells.iter().find(|c| c.ch == "t").expect("painted text is on the grid");
+        // cyan, not the default foreground — the SGR travelled with the text
+        let table = theme_colors("Tokyo Night");
+        assert_eq!(t.fg, table.slots[6]);
+        assert_ne!(t.fg, table.slots[256]);
+    }
+
     #[test]
     fn partial_damage_only_reports_changed_cells() {
         let mut e = TerminalEngine::new(20, 5);

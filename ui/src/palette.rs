@@ -76,9 +76,7 @@ fn run(state: AppState, act: Act) {
             state.close();
         }
         Act::Explain => {
-            spawn_local(async move {
-                let _ = invoke("explain_last_error", NoArgs {}).await;
-            });
+            crate::app::explain_and_paint();
             state.close();
         }
         Act::Provider(id) => {
@@ -86,8 +84,8 @@ fn run(state: AppState, act: Act) {
             spawn_local(async move {
                 let _ = invoke("provider_use", IdArgs { id }).await;
             });
-            // ponytail: skipped the cyan "active provider" echo to the terminal —
-            // no term-write API exists on the Rust side (main.ts used term.write).
+            // ponytail: no cyan "active provider" echo — the status bar already shows the
+            // active provider, so painting it would just duplicate that.
             state.close();
         }
         Act::Run(cmd) => {

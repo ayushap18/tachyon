@@ -26,6 +26,13 @@ pub struct WriteArgs {
     pub data: String,
 }
 
+/// `{ text }` — text painted onto the canvas via the native `term_write` command
+/// (⌘E explanation, agent narrative, slash results). Display-only, never the pty.
+#[derive(Serialize)]
+pub struct TextArgs {
+    pub text: String,
+}
+
 /// `{ text }` — clipboard payload forwarded to the native `clipboard_set` command.
 #[derive(Serialize)]
 struct ClipArgs {
@@ -38,6 +45,15 @@ pub fn clipboard_write(text: &str) {
     let text = text.to_string();
     wasm_bindgen_futures::spawn_local(async move {
         let _ = invoke("clipboard_set", ClipArgs { text }).await;
+    });
+}
+
+/// Paint `text` onto the canvas via the native display-only `term_write`
+/// (⌘E explanation, agent narrative, slash results). NEVER touches the pty —
+/// nothing painted this way is sent to the shell. Fire-and-forget.
+pub fn term_write(text: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = invoke("term_write", TextArgs { text }).await;
     });
 }
 

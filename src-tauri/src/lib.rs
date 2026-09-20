@@ -487,6 +487,17 @@ fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
     }
 }
 
+// Frontend text-render path: feed text straight into the DISPLAY engine so it shows on the
+// canvas (⌘E explanations, agent narrative, slash-command results). NEVER touches the pty —
+// this only paints; it must not call pty_write_internal or write to the shell.
+#[tauri::command]
+fn term_write(app: AppHandle, state: State<PtyState>, text: String) {
+    if let Some(eng) = state.engine.lock().unwrap().as_mut() {
+        eng.feed(text.as_bytes());
+        let _ = app.emit("grid-damage", eng.take_damage());
+    }
+}
+
 // Settings panel: switch the terminal color table (chrome CSS is handled frontend-side).
 #[tauri::command]
 fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String) {
@@ -1521,6 +1532,7 @@ pub fn run() {
             pty_write,
             pty_resize,
             term_full_repaint,
+            term_write,
             term_set_theme,
             term_scroll,
             clipboard_set,
