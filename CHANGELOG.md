@@ -4,6 +4,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.4 — 2026-09-21
+
+### Security
+- **The review floor protected only external requests.** A one-second floor stops a stray
+  keystroke approving a proposal, but it lived in the MCP server path, so the built-in agent
+  had neither it nor the ⌘⏎ chord. Double-tapping Enter after submitting a ⌘J task could
+  approve its first proposal with no review time at all. The floor now lives in
+  `agent_propose`, which both drivers route through, as a pure `decision_stands()` with a
+  table test. Only a too-fast approval re-shows; denial and abort still resolve immediately.
+- A provider's `/models` endpoint could return unbounded rows into the suggestion list; capped
+  where the untrusted data enters. The invisible-character filter widened from four ranges to
+  the full set of format blocks, so U+061C, U+00AD, U+2060..2064 and the tag block can no
+  longer reach a suggestion row or a command.
+
+### Added
+- ⌘K completes command arguments, not just command names: provider ids for `/use`, `/key`,
+  `/models`, `/url` and `/remove`; the models a provider actually serves for `/model` and
+  `/use <id>`; configured server names for `/mcp remove`; discovered runtimes for `/local`.
+  An argument row is its command form with the arguments filled in, so accepting, Tab and the
+  key routing behave exactly as before.
+- Two argument positions suggest nothing, by design and by test: the argument of `/key` is an
+  API key, and argument 2 of `/local`'s three-token form is a base_url — the backend matches
+  `[id, url, model, key]` before `[id, model]`, so completing a model there would teach syntax
+  that does not parse.
+- Model lists are the only network fetch and are triggered by reaching a model position, never
+  by a keystroke. Provider and MCP server names come from disk-only calls made when the bar opens.
+
 ## 0.2.3 — 2026-09-21
 
 ### Security

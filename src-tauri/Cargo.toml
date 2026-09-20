@@ -1,6 +1,6 @@
 [package]
 name = "tachyon"
-version = "0.2.3"
+version = "0.2.4"
 description = "An AI-native terminal with a Rust engine and reviewed shell commands"
 authors = ["Ayush"]
 edition = "2021"
