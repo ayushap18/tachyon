@@ -108,18 +108,38 @@ sequenceDiagram
   end
 ```
 
-`parse_agent_reply` maps a reply to `AgentAction::{Run, Tool, Done, Invalid}`. At most 12
-steps. `TOOL:` actions take the same gate and then call `mcp_call_inner` under
-`spawn_blocking`. `AgentRunGuard` clears `running` and any parked proposal on every exit
+`parse_agent_reply` maps a reply to `AgentAction::{Run, Tool, Done, Invalid}`; tool
+arguments that are not one JSON object are `Invalid` (a transcript line telling the model so),
+never a call with `{}`. At most 12 steps. When MCP servers are configured the system prompt
+gains a TOOLS section from `render_tools`: one line per tool with a signature derived from
+its input schema (`TOOL fs.read_file(head?: number, path: string) — …`), capped per
+description, per signature, by tool count and by total bytes, and saying so when truncated.
+`TOOL:` actions take the same gate — `tool_is_dangerous` sets `danger` — and then run
+`McpPool::call` under `spawn_blocking`. `AgentRunGuard` clears `running` and any parked proposal on every exit
 path, including panic. Events out: `agent-status`, `agent-propose`, `agent-output`, `agent-done`.
 
 ## MCP client
 
-Remote servers only, JSON-RPC 2.0 over Streamable HTTP with blocking `ureq`.
-`mcp_rpc_session` does `initialize` → `notifications/initialized` → the request, a fresh
-session per call, each POST under `MCP_TIMEOUT`. `parse_rpc_result` accepts JSON or a
-single-response SSE body. `mcp_list_tools_inner` queries all servers concurrently and returns
-tools plus per-server errors. There is no stdio transport and no server mode.
+JSON-RPC 2.0 over two transports; an `McpServer` in `mcp.json` sets exactly one of `url` or
+`command` (`is_stdio`).
+
+- **Streamable HTTP** — `HttpConn`, blocking `ureq`, each POST under `MCP_TIMEOUT`. `open`
+  does `initialize` → `notifications/initialized` once and keeps the `Mcp-Session-Id`;
+  `request` re-initializes once on a 400/404 (lost session). Optional per-server `headers`
+  (hand-edited, for auth) go on every request; their values are never displayed, returned
+  over IPC, or left in an error string (`describe`, `redacted`, `scrub`).
+  `parse_rpc_result` accepts JSON or a single-response SSE body.
+- **stdio** — `mcp_stdio.rs`, `StdioConn`: spawns `command args…`, newline-delimited JSON-RPC
+  on stdin/stdout, stderr discarded. A reader thread feeds a channel so every read has a
+  deadline (`START_TIMEOUT` for the handshake, `MCP_TIMEOUT` per request); replies are
+  matched on `id` and anything else on stdout is skipped. Timeout, exit or drop closes stdin,
+  kills and reaps the child.
+
+`McpPool` holds live connections by server name. `agent_loop` owns one per run, so a server
+is initialized or spawned once per run rather than once per call; `/mcp list` and the IPC
+commands use a throwaway pool. `McpPool::list_tools` queries all servers concurrently and
+returns tools plus per-server errors. `tool_result_text` turns an `isError` result into an
+`Err`, which the agent loop records as `Tool error:`. There is no server mode.
 
 ## Config files
 
@@ -128,7 +148,7 @@ tools plus per-server errors. There is no stdio transport and no server mode.
 | File | Contents | Written by |
 |---|---|---|
 | `providers.json` | provider list, active id, **plaintext API keys** | `/key`, `/use`, `/model`, `/local` |
-| `mcp.json` | MCP server names and URLs | `/mcp add`, `/mcp remove` |
+| `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
@@ -154,7 +174,8 @@ status bar · `settings.rs`, `theme.rs` appearance · `bridge.rs` IPC.
 
 | Where | What | Run |
 |---|---|---|
-| `src-tauri/src/lib.rs` `mod tests` | OSC scanner (split marks, ANSI stripping), provider registry and redaction, config round-trip and corruption, request/response shaping, agent reply parsing, danger gate, slash parsing | `cd src-tauri && cargo test` |
+| `src-tauri/src/lib.rs` `mod tests` | OSC scanner (split marks, ANSI stripping), provider registry and redaction, config round-trip and corruption, request/response shaping, agent reply parsing, danger gate, slash parsing, MCP prompt rendering, HTTP session reuse and header redaction (scripted local TCP server) | `cd src-tauri && cargo test` |
+| `src-tauri/src/mcp_stdio.rs` `mod tests` | stdio transport against fake servers written in `sh`: happy path, `isError`, exit, timeout + reaping (unix only) | same |
 | `src-tauri/src/engine.rs` `mod tests` | damage diffing, colours, scroll, resize | same |
 | `ui/src/*.rs` | key encoding, selection, vim motions, keymap parsing/matching — pure logic, runs on the host | `cd ui && cargo test` |
 | `evals/` | model-facing behaviour; the keyless checks run in CI | see README → Evaluation |

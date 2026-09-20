@@ -62,6 +62,9 @@ errors are built from `without_url()` plus a truncated body.
 **The lexical check.** `is_dangerous` lowercases the command and looks for any substring in
 `DANGER_PATTERNS`. `nl_to_command` and `agent_loop` attach the result as `danger`; the UI
 turns the bar red and shows `⚠ destructive`. It runs in Rust so the webview cannot skip it.
+`TOOL:` proposals get the same flag from `tool_is_dangerous`: a destructive-sounding tool
+name (`write`, `delete`, `exec`, `run`, `shell`, `kill`, …) or arguments that trip
+`is_dangerous`.
 The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure the shipped list.
 
 ## Limitations
@@ -82,8 +85,21 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
 - **⌘K does not strip embedded newlines.** `strip_fences` trims only the ends, so a two-line
   model reply executes its first line on arrival. The ⌘B rerun button strips `\r`/`\n`; this
   path does not yet.
-- **MCP tool proposals are never marked dangerous.** `agent_loop` hard-codes `"danger": false`
-  for `TOOL:` actions, and server-supplied tool descriptions enter the system prompt verbatim.
+- **The MCP tool check is a name heuristic.** `tool_is_dangerous` substring-matches the tool
+  name, so a destructive tool called `apply` is unflagged and `list_skills` is flagged. Like
+  the shell check it only colours the gate.
+- **MCP servers are an injection surface.** Tool names, descriptions and schemas enter the
+  system prompt; tool results and tool errors enter the transcript. `render_tools` bounds
+  them (one line per tool, capped description, signature, count and total size) and labels
+  the section as data, which limits prompt flooding and forged `TOOL` lines — it does not
+  stop a description or a result from instructing the model.
+- **A stdio MCP server is a program you told Tachyon to run.** `/mcp add <name> -- <command>`
+  executes `<command>` as you, unsandboxed, on every tool listing and call, without a gate —
+  the gate covers tool *calls*, not server start-up. `/mcp list` prints the full command
+  line. Because `run_slash` is IPC, this is reachable from webview script exactly as
+  `pty_write` is (above).
+- **MCP auth headers are plaintext in `mcp.json`** (0600, like API keys). They are kept out of
+  `/mcp list`, IPC and error strings, not off the disk.
 - **Painted text is not sanitised.** `term_write` interprets escape sequences, so model or
   tool text can overwrite what is on screen. It cannot execute; it can mislead the approver.
 - **The proposal is a single-line input.** A long command is not fully visible without scrolling.
