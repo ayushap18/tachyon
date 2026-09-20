@@ -33,8 +33,8 @@ export function stripFences(s) {
 export function oneLine(cmd) {
   return cmd
     .replace(/\\\r?\n/g, " ")
-    .split(/\r?\n/)
-    .map((l) => l.trim())
+    .split(/\r\n|\r|\n/) // a bare CR is an Enter to the pty too
+    .map((l) => l.replace(/\t/g, " ").replace(/\p{Cc}/gu, "").trim())
     .filter(Boolean)
     .join("; ");
 }

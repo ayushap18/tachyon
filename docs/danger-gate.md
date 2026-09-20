@@ -160,10 +160,14 @@ and is stopped only by the token.
   after the claim is won, so the busy path cannot release someone else's claim, and every
   exit including a panic frees ⌘J.
 - *The requester is named.* The proposal carries `external: true` and the bar reads
-  `external agent · run? ⏎ approve · esc deny`.
+  `external agent · run? ⌘⏎ approve · esc deny` (`Ctrl+⏎` off macOS).
 - *A stray keystroke is not a decision.* External proposals are unsolicited: the bar takes
-  focus while you are typing in the shell. An approval arriving within `MIN_REVIEW` (1 s) of
-  the bar appearing is discarded and the proposal is shown again.
+  focus while you are typing in the shell, so the Enter meant for your own command would
+  otherwise approve one you never read. They therefore need a deliberate chord — ⌘⏎ /
+  Ctrl+⏎ — and a bare Enter is swallowed without deciding anything (`enter_approves` in
+  `ui/src/ai_bar.rs`). The built-in agent keeps plain Enter, because its proposals are
+  solicited. As a second layer, an approval arriving within `MIN_REVIEW` (1 s) of the bar
+  appearing is discarded backend-side and the proposal is shown again.
 - *No proposal without a shell.* Until `pty_spawn` has run there is no webview listening, so
   `run_gated` refuses rather than park a proposal nobody can answer.
 - *The token stays put.* Generated from `/dev/urandom`, compared with `ct_eq`, rendered only
@@ -203,8 +207,6 @@ and is stopped only by the token.
    inherited credentials) so approval is not the only control.
 6. Per-tool MCP policy, with destructive-hint annotations shown in the gate.
 7. Strip escape sequences before `term_write`, and delimit tool output in the transcript as data.
-8. For server mode: approve external proposals with a chord that normal typing never
-   produces, instead of Enter plus a time floor; scope tokens per client, with a read-only
-   scope; gate `read_journal` or redact its output; rate-limit proposals after a denial.
+8. For server mode: scope tokens per client, with a read-only scope; gate `read_journal` or redact its output; rate-limit proposals after a denial.
 
 Bypass reports are welcome — see [SECURITY.md](../SECURITY.md).

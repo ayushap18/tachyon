@@ -1075,8 +1075,24 @@ fn strip_fences(s: &str) -> String {
 fn one_line(cmd: &str) -> String {
     cmd.replace("\\\r\n", " ")
         .replace("\\\n", " ")
+        // A BARE carriage return is an Enter to the pty too, but `str::lines` only splits on
+        // \n and \r\n — and an <input> drops the CR from what it displays. So
+        // "echo hi\rrm -rf ~" showed as one harmless command and ran as two.
+        .replace('\r', "\n")
         .lines()
-        .map(str::trim)
+        .map(|l| {
+            // No other control character belongs in a command either: a tab triggers shell
+            // completion, ^C/^D/ESC act on the terminal itself. Tab becomes a space, the
+            // rest are dropped, so what reaches the pty is exactly what was shown.
+            l.chars()
+                .filter_map(|c| match c {
+                    '\t' => Some(' '),
+                    c if c.is_control() => None,
+                    c => Some(c),
+                })
+                .collect::<String>()
+        })
+        .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
@@ -3205,6 +3221,13 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         // a backslash continuation is one command, not two: no `; ` inserted
         assert_eq!(one_line("echo a \\\n  b"), "echo a    b");
         assert_eq!(one_line("a\r\n\r\nb\n"), "a; b");
+        // bare CR: an Enter to the pty that lines() does not split on
+        assert_eq!(one_line("echo hi\rrm -rf ~"), "echo hi; rm -rf ~");
+        assert!(is_dangerous(&one_line("echo hi\rrm -rf ~")));
+        // other control chars never reach the pty: tab -> space, ^C / ESC dropped
+        assert_eq!(one_line("ls\t-la"), "ls -la");
+        assert_eq!(one_line("ls\x03\x1b[2J -la"), "ls[2J -la");
+        assert!(!one_line("a\rb\x04\x1bc\td").chars().any(|c| c.is_control()));
         // the second line is now visible to the danger gate instead of hiding behind line 1
         assert!(is_dangerous(&one_line("ls\nrm -rf /")));
         // and the agent parser applies it too
