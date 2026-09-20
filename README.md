@@ -24,13 +24,13 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
-| macOS · Apple Silicon | `Tachyon_0.2.1_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
-| Debian / Ubuntu · x86_64 | `Tachyon_0.2.1_amd64.deb` | `sudo apt install ./Tachyon_0.2.1_amd64.deb` |
-| Linux · x86_64 | `Tachyon_0.2.1_amd64.AppImage` | Make executable, then launch (below). |
+| macOS · Apple Silicon | `Tachyon_0.2.2_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.2_amd64.deb` | `sudo apt install ./Tachyon_0.2.2_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.2_amd64.AppImage` | Make executable, then launch (below). |
 
 ```sh
-chmod +x Tachyon_0.2.1_amd64.AppImage
-./Tachyon_0.2.1_amd64.AppImage
+chmod +x Tachyon_0.2.2_amd64.AppImage
+./Tachyon_0.2.2_amd64.AppImage
 ```
 
 Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
@@ -38,7 +38,7 @@ through apt; AppImage compatibility still depends on the host distribution. If A
 reports a FUSE error, try:
 
 ```sh
-./Tachyon_0.2.1_amd64.AppImage --appimage-extract-and-run
+./Tachyon_0.2.2_amd64.AppImage --appimage-extract-and-run
 ```
 
 Builds are **unsigned**. If macOS blocks first launch, use **System Settings → Privacy &
@@ -48,7 +48,7 @@ Security → Open Anyway**. Download `SHA256SUMS` alongside your installer to ve
 # Linux: verifies the downloaded installers; skips those you did not download.
 sha256sum --ignore-missing -c SHA256SUMS
 # macOS: compare the printed digest with the corresponding SHA256SUMS entry.
-shasum -a 256 Tachyon_0.2.1_aarch64.dmg
+shasum -a 256 Tachyon_0.2.2_aarch64.dmg
 ```
 
 ### First launch
@@ -58,8 +58,8 @@ shasum -a 256 Tachyon_0.2.1_aarch64.dmg
 3. Configure a provider with `/key <id> <apikey>`, or use `/local` to discover a local model.
 4. Ask for a command, review the proposed text, then choose whether to run it.
 
-**v0.2.1** improves trackpad scrolling, reduces repaint traffic, fixes deep scrollback,
-and repairs Linux packaging. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**v0.2.2** fixes output hidden behind the status bar and stray pixels after text redraws,
+building on the scrolling and Linux packaging fixes in v0.2.1. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ### Keyboard
 
@@ -377,7 +377,19 @@ npm run eval:agent:selftest         # agent-loop eval against a scripted mock mo
 npm run test:release                # rejects missing/empty/duplicate installers
 ```
 
-All keyless; CI runs exactly these on macOS and Ubuntu.
+All keyless; CI runs these on macOS and Ubuntu.
+
+Canvas rendering can also be checked against the compiled WASM in Chrome:
+
+```sh
+sh ui/build-web.sh --release
+# Point to an existing Playwright package, or install Playwright locally first.
+PLAYWRIGHT_PATH=/path/to/node_modules/playwright npm run test:browser
+```
+
+This checks status-bar clearance, resizing, pixel-clean glyph erasure and scrolling
+at normal, fractional and Retina display scales. Set `PLAYWRIGHT_CHANNEL=chromium`
+if you use Playwright's bundled browser instead of an installed Chrome.
 
 ## Docs
 

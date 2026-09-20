@@ -10,6 +10,8 @@
   --muted: #7b849c;
   --ok: #9ece6a;
   --err: #f7768e;
+  --status-bar-height: 26px;
+  --terminal-inset: 8px;
 }
 
 html,
@@ -30,20 +32,19 @@ body {
 canvas#term {
   display: block;
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
+  top: var(--terminal-inset);
+  left: var(--terminal-inset);
+  width: calc(100vw - 2 * var(--terminal-inset));
+  height: max(1px, calc(100vh - var(--status-bar-height) - 2 * var(--terminal-inset)));
   z-index: 0;
 }
 
-/* AI command / agent bar — docked above the status bar (fixed so the canvas
-   terminal keeps sizing to the full window; layout integration is deferred). */
+/* AI command / agent bar — docked above the status bar. */
 #ai-bar {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 26px;
+  bottom: var(--status-bar-height);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -110,7 +111,7 @@ canvas#term {
   left: 0;
   right: 0;
   bottom: 0;
-  height: 26px;
+  height: var(--status-bar-height);
   padding: 0 12px;
   display: flex;
   align-items: center;
@@ -497,7 +498,7 @@ canvas#term {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 26px;
+  bottom: var(--status-bar-height);
   box-sizing: border-box;
   padding: 6px 12px;
   font: 12px Menlo, monospace;
@@ -516,7 +517,11 @@ canvas#term {
    as a DOM layer over the canvas (below the ai/status bars at z-index 8). */
 #vim-overlay {
   position: fixed;
-  inset: 0;
+  top: var(--terminal-inset);
+  left: var(--terminal-inset);
+  right: var(--terminal-inset);
+  bottom: calc(var(--status-bar-height) + var(--terminal-inset));
+  overflow: hidden;
   pointer-events: none;
   z-index: 7;
 }

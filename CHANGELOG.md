@@ -4,6 +4,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.2 — 2026-09-20
+
+### Fixed
+- Size the terminal to its visible canvas, with padding and room for the status bar,
+  so prompts and the final output row are never hidden underneath the status bar.
+- Repaint damaged rows with backgrounds before text, and clip glyphs to their row.
+  This removes stale italic/combining-character pixels and preserves wide glyphs
+  when their adjacent spacer cell changes.
+- Snap canvas edges to device pixels for clean redraws at fractional display scales.
+- Keep Vim highlights aligned with the padded terminal and handle the first resize
+  observation so late-loading styles cannot leave the PTY at the wrong size.
+- Apply an ad-hoc macOS bundle signature during packaging, avoiding the incomplete
+  linker signature that required local repair. Builds remain unnotarized.
+
+### Added
+- Browser rendering regressions against the compiled WASM at 1x, 1.25x, 1.5x and 2x:
+  viewport sizing, resize, pixel-clean erasure, wide glyphs and scroll backpressure.
+
 ## 0.2.1 — 2026-09-20
 
 ### Fixed

@@ -1,7 +1,7 @@
 {
   "name": "tachyon",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
@@ -12,7 +12,8 @@
     "eval:gate": "node evals/gate.mjs",
     "eval:agent": "node evals/agent.mjs",
     "eval:agent:selftest": "node evals/agent.mjs --mock --selftest",
-    "test:release": "node --test scripts/release.test.mjs"
+    "test:release": "node --test scripts/release.test.mjs",
+    "test:browser": "node scripts/terminal-browser.mjs"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.112.1",

@@ -185,83 +185,100 @@ impl Term {
         }
     }
 
-    /// Cell rect snapped to integer CSS px so a cell's right/bottom edge equals the
-    /// next cell's left/top edge exactly (no anti-aliasing seam). Returns (x, y, w, h).
+    /// Snap shared cell edges to physical pixels, including fractional display scales.
     fn cell_px(&self, col: u16, line: u16) -> (f64, f64, f64, f64) {
-        let x0 = (col as f64 * self.cell_w).round();
-        let x1 = ((col + 1) as f64 * self.cell_w).round();
-        let y0 = (line as f64 * self.cell_h).round();
-        let y1 = ((line + 1) as f64 * self.cell_h).round();
+        let snap = |v: f64| (v * self.dpr).round() / self.dpr;
+        let x0 = snap(col as f64 * self.cell_w);
+        let x1 = snap((col + 1) as f64 * self.cell_w);
+        let y0 = snap(line as f64 * self.cell_h);
+        let y1 = snap((line + 1) as f64 * self.cell_h);
         (x0, y0, x1 - x0, y1 - y0)
     }
 
-    /// Size the canvas to the window, paint it the theme bg, and return the grid
-    /// (cols, rows) that fit. The <1-cell right/bottom remainder stays theme bg.
+    /// Size the grid to the actual canvas box. CSS reserves space for the status
+    /// bar and padding; using window.innerHeight would hide the last shell rows.
     fn fit(&mut self) -> (u16, u16) {
-        // Re-read DPR each fit so moving to a different-density display stays crisp.
-        self.dpr = win().device_pixel_ratio();
-        let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-        let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
-        // Backing store only — the CSS (100vw/100vh, position:fixed) owns the *display* size, so
-        // the canvas always fills the viewport (incl. fullscreen). Setting an inline px width/height
-        // here would override that CSS and pin the canvas to a stale size (the fullscreen bug).
+        self.dpr = win().device_pixel_ratio().max(1.0);
+        let rect = self.canvas.get_bounding_client_rect();
+        let (w, h) = (rect.width().max(1.0), rect.height().max(1.0));
         self.canvas.set_width((w * self.dpr).round() as u32);
         self.canvas.set_height((h * self.dpr).round() as u32);
-        // canvas resize resets the transform; re-apply DPR scaling + baseline.
         let _ = self.ctx.scale(self.dpr, self.dpr);
         self.ctx.set_text_baseline("top");
-        self.ctx.set_fill_style_str(&css(doc_bg()));
-        self.ctx.fill_rect(0.0, 0.0, w, h);
+        self.clear();
         let cols = (w / self.cell_w).floor().max(1.0) as u16;
         let rows = (h / self.cell_h).floor().max(1.0) as u16;
         (cols, rows)
     }
 
-    /// Reallocate the buffer for a fresh full frame. The canvas element size is
-    /// owned by `fit`; here we just repaint the whole window-sized canvas to theme
-    /// bg so a shrunk grid leaves no stale cells and the margin stays bg.
+    fn clear(&self) {
+        self.ctx.set_fill_style_str(&css(doc_bg()));
+        self.ctx.fill_rect(
+            0.0, 0.0,
+            self.canvas.width() as f64 / self.dpr,
+            self.canvas.height() as f64 / self.dpr,
+        );
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
         self.buf = vec![blank_cell(); cols as usize * rows as usize];
-        let w = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-        let h = win().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
-        self.ctx.set_fill_style_str(&css(doc_bg()));
-        self.ctx.fill_rect(0.0, 0.0, w, h);
+        self.clear();
     }
 
-    fn draw_cell(&self, line: u16, col: u16, cell: &Cell) {
-        let (x, y, w, h) = self.cell_px(col, line);
-        let (fg, bg) = if cell.inverse {
-            (cell.bg, cell.fg)
-        } else {
-            (cell.fg, cell.bg)
-        };
-        self.ctx.set_fill_style_str(&css(bg));
-        self.ctx.fill_rect(x, y, w, h);
-        if cell.ch != " " && !cell.ch.is_empty() {
-            let font = format!(
-                "{}{}{}px {}",
-                if cell.italic { "italic " } else { "" },
-                if cell.bold { "bold " } else { "" },
-                self.font_px,
-                self.font_family,
-            );
-            self.ctx.set_font(&font);
-            self.ctx.set_fill_style_str(&css(fg));
-            let _ = self.ctx.fill_text(&cell.ch, x, y);
+    /// Repaint a damaged row in two passes: all backgrounds, then all glyphs.
+    /// A glyph can overhang its own cell (italic, bold, combining or wide text).
+    /// Clearing only changed cells leaves those pixels behind; drawing the next
+    /// cell's background after a wide glyph also erases half of that glyph.
+    fn draw_row(&self, line: u16) {
+        if line >= self.rows || self.cols == 0 {
+            return;
         }
-        if cell.underline {
-            self.ctx.set_fill_style_str(&css(fg));
-            self.ctx.fill_rect(x, y + h - 1.0, w, 1.0);
-        }
-    }
+        let (_, y, _, h) = self.cell_px(0, line);
+        let (last_x, _, last_w, _) = self.cell_px(self.cols - 1, line);
+        self.ctx.save();
+        self.ctx.begin_path();
+        self.ctx.rect(0.0, y, last_x + last_w, h);
+        self.ctx.clip();
 
-    fn repaint(&self, line: u16, col: u16) {
-        if let Some(i) = self.idx(line, col) {
-            let cell = self.buf[i].clone();
-            self.draw_cell(line, col, &cell);
+        // Adjacent equal backgrounds are one fill, so an ordinary row is cheap.
+        let start = line as usize * self.cols as usize;
+        let row = &self.buf[start..start + self.cols as usize];
+        let background = |c: &Cell| if c.inverse { c.fg } else { c.bg };
+        let mut col = 0usize;
+        while col < row.len() {
+            let bg = background(&row[col]);
+            let mut end = col + 1;
+            while end < row.len() && background(&row[end]) == bg {
+                end += 1;
+            }
+            let (x, _, _, _) = self.cell_px(col as u16, line);
+            let (ex, _, ew, _) = self.cell_px((end - 1) as u16, line);
+            self.ctx.set_fill_style_str(&css(bg));
+            self.ctx.fill_rect(x, y, ex + ew - x, h);
+            col = end;
         }
+        for (col, cell) in row.iter().enumerate() {
+            let (x, _, w, _) = self.cell_px(col as u16, line);
+            let fg = if cell.inverse { cell.bg } else { cell.fg };
+            if cell.ch != " " && !cell.ch.is_empty() {
+                let font = format!(
+                    "{}{}{}px {}",
+                    if cell.italic { "italic " } else { "" },
+                    if cell.bold { "bold " } else { "" },
+                    self.font_px, self.font_family,
+                );
+                self.ctx.set_font(&font);
+                self.ctx.set_fill_style_str(&css(fg));
+                let _ = self.ctx.fill_text(&cell.ch, x, y);
+            }
+            if cell.underline {
+                self.ctx.set_fill_style_str(&css(fg));
+                self.ctx.fill_rect(x, y + h - 1.0, w, 1.0);
+            }
+        }
+        self.ctx.restore();
     }
 
     fn draw_cursor(&self) {
@@ -273,6 +290,10 @@ impl Term {
             return;
         }
         let (x, y, w, h) = self.cell_px(col, line);
+        self.ctx.save();
+        self.ctx.begin_path();
+        self.ctx.rect(x, y, w, h);
+        self.ctx.clip();
         self.ctx.set_fill_style_str(&css(CURSOR_COLOR));
         self.ctx.fill_rect(x, y, w, h);
         if let Some(i) = self.idx(line, col) {
@@ -284,6 +305,7 @@ impl Term {
                 let _ = self.ctx.fill_text(&cell.ch, x, y);
             }
         }
+        self.ctx.restore();
     }
 
     /// Pixel (canvas-relative CSS px) -> (row, col), clamped to the grid.
@@ -330,43 +352,40 @@ impl Term {
 
     /// Full repaint of the visible buffer, then selection overlay, then cursor.
     fn redraw(&self) {
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                if let Some(i) = self.idx(r, c) {
-                    let cell = self.buf[i].clone();
-                    self.draw_cell(r, c, &cell);
-                }
-            }
+        self.clear();
+        for row in 0..self.rows {
+            self.draw_row(row);
         }
         self.overlay_selection();
         self.draw_cursor();
     }
 
     fn apply(&mut self, d: GridDamage) {
-        // Erase the entire selection before incremental damage. Then erase the
-        // old cursor as usual, including when the new view hides it.
-        if self.sel.take().is_some() {
-            self.redraw();
-        }
-        // Dimension change => this is a full frame (mount / resize repaint).
-        if d.cols != self.cols || d.rows != self.rows || self.buf.is_empty() {
+        let clear_selection = self.sel.take().is_some();
+        let resized = d.cols != self.cols || d.rows != self.rows || self.buf.is_empty();
+        if resized {
             self.resize(d.cols, d.rows);
-        } else {
-            // erase the previous cursor by repainting its underlying cell.
-            self.repaint(self.cursor.line, self.cursor.col);
         }
-        for cell in &d.cells {
+        let mut dirty = vec![resized || clear_selection; self.rows as usize];
+        if self.cursor.visible {
+            if let Some(row) = dirty.get_mut(self.cursor.line as usize) {
+                *row = true;
+            }
+        }
+        for cell in d.cells {
             if let Some(i) = self.idx(cell.line, cell.col) {
-                self.buf[i] = cell.clone();
-                self.draw_cell(cell.line, cell.col, cell);
+                dirty[cell.line as usize] = true;
+                self.buf[i] = cell;
+            }
+        }
+        for (row, changed) in dirty.into_iter().enumerate() {
+            if changed {
+                self.draw_row(row as u16);
             }
         }
         self.cursor = d.cursor;
         APP_CURSOR.with(|a| a.set(d.application_cursor));
         self.draw_cursor();
-        // A selection's (row,col) coords are screen-relative and become meaningless once new
-        // content is painted (or the view scrolls), so drop it rather than highlight stale cells.
-        self.sel = None;
         self.publish();
     }
 
@@ -381,8 +400,7 @@ impl Term {
     }
 
     /// Publish a read-only snapshot of the visible grid for the vim module.
-    /// ponytail: visible viewport only — the native side owns scrollback and
-    /// there's no scroll command, so vim navigates the painted rows.
+    /// Vim navigation follows the currently painted viewport.
     fn publish(&self) {
         let mut lines = Vec::with_capacity(self.rows as usize);
         for r in 0..self.rows {
@@ -851,21 +869,14 @@ fn setup(mut keys_loaded: Signal<bool>) {
         cb.forget();
     }
 
-    // --- resize: a ResizeObserver on <html> refits the canvas and resizes the PTY.
+    // --- resize: a ResizeObserver refits the canvas and resizes the PTY.
     // More reliable than the window "resize" event across the macOS fullscreen settle. ---
     {
         let term = term.clone();
-        // ResizeObserver fires once automatically on observe(); setup() already did the initial
-        // fit(), so skip that first callback to avoid a redundant wipe-repaint flicker at launch.
-        let first = std::rc::Rc::new(std::cell::Cell::new(true));
-        // Observe the canvas itself — it's position:fixed 100vw/100vh, so its box tracks the
-        // viewport and the observer fires reliably on fullscreen / window resize. (Observing
-        // <html> failed: its layout followed the canvas, so it didn't change on fullscreen.)
+        // Observe the CSS canvas box, including the first notification: styles can
+        // finish loading after setup, changing the available terminal area.
         let canvas_obs = term.borrow().canvas.clone();
         let cb = Closure::wrap(Box::new(move |_: js_sys::Array, _: web_sys::ResizeObserver| {
-            if first.replace(false) {
-                return;
-            }
             refit(&term);
         })
             as Box<dyn FnMut(js_sys::Array, web_sys::ResizeObserver)>);
