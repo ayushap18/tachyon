@@ -21,6 +21,18 @@ Only `v0.1.3` exists as a git tag, and no commit is labelled 0.1.2.
   JSON artifacts, `--baseline` comparison, and a `--min-acc` floor.
 - `docs/danger-gate.md` (safety design and limitations), `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, issue and PR templates, this changelog.
+- MCP client: local **stdio** servers (`/mcp add <name> -- <cmd>`) alongside remote HTTP,
+  tool input schemas rendered into the system prompt as signatures, `isError` results reported
+  as errors, HTTP session reuse, and optional per-server auth `headers` whose values are never
+  printed or sent to the webview.
+- MCP **server** mode (`/mcp serve on|off|status`): external agents can drive this terminal
+  through the same human approval gate. Off by default, 127.0.0.1 only, bearer token stored
+  0600, `Origin`/`Host` checks, and external proposals require ⌘⏎ (`Ctrl+⏎` on Linux).
+- Local and open models: `/local` discovers Ollama, LM Studio, llama.cpp, vLLM and Jan;
+  `/models` lists what a provider actually serves; `/url` and `/remove`; API keys may come
+  from environment variables and are never written to disk.
+- Committed eval baselines (`evals/baseline/`); the README results block is rendered from them
+  and `eval:selftest` fails if the two disagree.
 
 ### Changed
 - Eval prompts and `DANGER_PATTERNS` are extracted from `src-tauri/src/lib.rs` at run time
@@ -46,6 +58,17 @@ Only `v0.1.3` exists as a git tag, and no commit is labelled 0.1.2.
   reported once at startup.
 - Mutex poisoning after a reader-thread panic no longer bricks the app; grid dimensions from
   the webview are clamped.
+- A multi-line model reply reached the PTY with its newlines intact, so ⌘K executed the first
+  line of a "prefill only" command and the agent's single-line approval bar showed line 1 while
+  later lines ran unseen. Replies are folded to one line — including on a bare carriage return,
+  which the approval input hides but the PTY treats as Enter — and control characters are
+  stripped, so what is shown is what runs and what the danger gate sees.
+- ⌘B per-block explain had never worked in the Rust frontend: the argument was sent as
+  `exit_code` where Tauri matches `exitCode`.
+- `cargo test`/`check` failed on a fresh clone and in CI, because Tauri needs the gitignored
+  `ui/dist`; `build.rs` now writes a placeholder.
+- Groq retired `llama-3.3-70b-versatile`, the built-in default, which surfaced only as an
+  opaque 404. The default is now chosen from the committed agent-loop eval.
 - MIT `LICENSE` added; build prerequisites documented.
 
 ## 0.1.5 — 2026-09-20
