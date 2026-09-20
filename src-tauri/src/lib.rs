@@ -1,4 +1,5 @@
 mod engine;
+mod mcp_server;
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -542,8 +543,10 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     Ok(warning)
 }
 
-// The ONLY two callers: the pty_write command (user keystrokes / prefill without newline)
-// and the agent loop's approved==true branch. Nothing else may write to the pty.
+// The ONLY three callers: the pty_write command (user keystrokes / prefill without newline),
+// the agent loop's approved==true branch, and mcp_server::run_gated — an EXTERNAL agent's
+// run_command, which sits behind the same agent_propose / agent_decide(true) keypress and
+// writes the exact string that was shown. Nothing else may write to the pty.
 fn pty_write_internal(state: &PtyState, data: &str) -> Result<(), String> {
     match state.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         Some(w) => w.write_all(data.as_bytes()).map_err(|e| e.to_string()),
@@ -1390,6 +1393,7 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n",
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers and their tools\r\n",
+    "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (you approve each command)\r\n",
     "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n",
     "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n",
 );
@@ -1507,8 +1511,12 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
 // (async): /mcp list does blocking HTTP — must not run on the main thread.
 // Never rejects: errors come back as printable red ANSI text.
 #[tauri::command(async)]
-fn run_slash(input: String) -> String {
-    run_slash_inner(&input).unwrap_or_else(|e| format!("\r\n\x1b[31m[tachyon] {e}\x1b[0m\r\n"))
+fn run_slash(app: AppHandle, input: String) -> String {
+    // `/mcp serve …` starts a listener that needs the AppHandle, which run_slash_inner
+    // (pure, unit-tested) deliberately does not take — so it is peeled off here.
+    mcp_server::slash(&app, &input)
+        .unwrap_or_else(|| run_slash_inner(&input))
+        .unwrap_or_else(|e| format!("\r\n\x1b[31m[tachyon] {e}\x1b[0m\r\n"))
 }
 
 // ---- Agent loop (⌘J) ----
@@ -1574,17 +1582,23 @@ struct AgentState {
 
 use std::sync::atomic::Ordering::SeqCst;
 
+/// Claim the ONE approval slot (and with it the PTY) for a single driver: the built-in agent
+/// or an external agent's run_command (mcp_server.rs). Fails fast rather than queueing, so
+/// a second driver can never overwrite the first one's parked sender. The winner must hold
+/// an `AgentRunGuard`; the loser must not — its Drop would release someone else's claim.
+fn agent_claim(a: &AgentState) -> Result<(), String> {
+    if a.running.swap(true, SeqCst) {
+        return Err("agent already running".into());
+    }
+    a.abort.store(false, SeqCst);
+    // drop any stale sender — a decision from a previous run must never approve this one
+    a.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
+    Ok(())
+}
+
 #[tauri::command]
 fn agent_start(app: AppHandle, task: String) -> Result<(), String> {
-    {
-        let a = app.state::<AgentState>();
-        if a.running.swap(true, SeqCst) {
-            return Err("agent already running".into());
-        }
-        a.abort.store(false, SeqCst);
-        // drop any stale sender — a decision from a previous run must never approve this one
-        a.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
-    }
+    agent_claim(&app.state::<AgentState>())?;
     tauri::async_runtime::spawn(agent_loop(app, task));
     Ok(())
 }
@@ -1824,6 +1838,7 @@ pub fn run() {
             app.manage(PtyState::default());
             app.manage(JournalState::default());
             app.manage(AgentState::default());
+            mcp_server::autostart(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

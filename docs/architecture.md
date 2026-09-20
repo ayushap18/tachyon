@@ -121,6 +121,41 @@ session per call, each POST under `MCP_TIMEOUT`. `parse_rpc_result` accepts JSON
 single-response SSE body. `mcp_list_tools_inner` queries all servers concurrently and returns
 tools plus per-server errors. There is no stdio transport and no server mode.
 
+## Tachyon as an MCP server
+
+`src-tauri/src/mcp_server.rs`. The reverse of the section above: external agents (Claude
+Code, any MCP client) use the live terminal, through the same approval gate as ⌘J. Off by
+default; `/mcp serve on [port] | off | status` is the only switch, and `run_slash` peels it
+off before `run_slash_inner` because starting a listener needs the `AppHandle`. If left on,
+`autostart` brings it back at launch. Threat model: [danger-gate.md](danger-gate.md#threat-model-tachyon-as-an-mcp-server).
+
+```
+client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ thread ─▶ handle_rpc ─▶ Backend
+                                              403 / 401, body never read                              │
+        run_command ─▶ parse_run_args ─▶ run_gated: agent_claim ─▶ agent_propose ─▶ ⏎ ─▶ pty_write_internal ─▶ wait_block
+        read_journal, get_context ─▶ read-only, no approval                       esc ─▶ isError "denied"
+```
+
+- **Transport.** Streamable HTTP with plain JSON responses, no SSE (`GET` is 405), no
+  sessions. `tiny_http` — blocking and thread-based, so it needs no runtime and never touches
+  the Tauri main thread or the PTY reader: one accept thread (`serve`), one short-lived
+  thread per admitted request, because a `run_command` blocks for as long as the human takes.
+- **`handle_rpc`** is pure: `initialize` (echoes a supported `protocolVersion`, else answers
+  with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, unknown
+  tool or bad arguments → `-32602`, a message without an `id` → `None`, which the HTTP layer
+  answers `202` with no body. The terminal sits behind the `Backend` trait — `Live(AppHandle)`
+  in the app, a stub in the tests — the module's one seam.
+- **`run_gated`** is the only road from a client to the PTY. It refuses if no shell is spawned,
+  takes the single approval slot with `agent_claim` (shared with `agent_start`; busy → fails
+  fast, never queues), holds an `AgentRunGuard`, proposes with `"external": true` (the bar
+  reads `external agent · run? …`), and re-shows any approval that arrives inside `MIN_REVIEW`.
+  After the write it waits in `wait_block` — `agent_loop`'s correlation (match on command
+  text, resync on `Lagged`, `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with
+  `agent-done` so the bar closes.
+- **Config** is `mcp-server.json`: `{enabled, port, token}`, default port 47600. The token is
+  32 bytes from `/dev/urandom`, minted on first enable and kept after that. To rotate it:
+  `/mcp serve off`, delete the file, `/mcp serve on`.
+
 ## Config files
 
 `config_dir()` is `$XDG_CONFIG_HOME/tachyon`, else `$HOME/.config/tachyon`, else an error.
@@ -130,6 +165,7 @@ tools plus per-server errors. There is no stdio transport and no server mode.
 | `providers.json` | provider list, active id, **plaintext API keys** | `/key`, `/use`, `/model`, `/local` |
 | `mcp.json` | MCP server names and URLs | `/mcp add`, `/mcp remove` |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
+| `mcp-server.json` | MCP server mode: enabled, port, **plaintext bearer token** | `/mcp serve on`, `/mcp serve off` |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
 is an `Err`, never a reset to defaults — a reset would be persisted over the user's keys by
@@ -156,6 +192,7 @@ status bar · `settings.rs`, `theme.rs` appearance · `bridge.rs` IPC.
 |---|---|---|
 | `src-tauri/src/lib.rs` `mod tests` | OSC scanner (split marks, ANSI stripping), provider registry and redaction, config round-trip and corruption, request/response shaping, agent reply parsing, danger gate, slash parsing | `cd src-tauri && cargo test` |
 | `src-tauri/src/engine.rs` `mod tests` | damage diffing, colours, scroll, resize | same |
+| `src-tauri/src/mcp_server.rs` `mod tests` | admission (Host, Origin, bearer, constant-time compare), JSON-RPC dispatch, tool input validation, token/config round-trip, `wait_block`, `agent_claim`, and the real HTTP server on an ephemeral port with a stub `Backend` (401, 403, initialize → tools/list → tools/call). `run_gated` itself needs an `AppHandle` and is not covered | same |
 | `ui/src/*.rs` | key encoding, selection, vim motions, keymap parsing/matching — pure logic, runs on the host | `cd ui && cargo test` |
 | `evals/` | model-facing behaviour; the keyless checks run in CI | see README → Evaluation |
 

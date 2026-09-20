@@ -66,7 +66,19 @@ struct AgentPropose {
     text: String,
     #[serde(default)]
     danger: bool,
+    // true when the proposal came in over Tachyon's MCP server, not from the built-in agent
+    #[serde(default)]
+    external: bool,
 }
+
+/// The gate's status line. The approver must be able to tell a command THEY asked the
+/// built-in agent for from one an outside process is asking to run.
+fn gate_status(danger: bool, external: bool) -> String {
+    let who = if external { "external agent · " } else { "" };
+    let warn = if danger { "⚠ destructive · " } else { "" };
+    format!("{who}{warn}run? ⏎ approve · esc deny")
+}
+
 #[derive(Deserialize)]
 struct AgentStatus {
     #[serde(default)]
@@ -122,8 +134,7 @@ pub fn AiBar() -> Element {
                 input.set(p.text);
                 readonly.set(true);
                 danger.set(p.danger);
-                let prefix = if p.danger { "⚠ destructive · " } else { "" };
-                status.set(format!("{prefix}run? ⏎ approve · esc deny"));
+                status.set(gate_status(p.danger, p.external));
                 pending_gate.set(true);
             }
         });
@@ -314,5 +325,18 @@ pub fn AiBar() -> Element {
             }
             span { id: "ai-status", "{status}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gate_status;
+
+    #[test]
+    fn gate_status_names_an_external_requester() {
+        assert_eq!(gate_status(false, false), "run? ⏎ approve · esc deny");
+        assert_eq!(gate_status(true, false), "⚠ destructive · run? ⏎ approve · esc deny");
+        assert_eq!(gate_status(false, true), "external agent · run? ⏎ approve · esc deny");
+        assert!(gate_status(true, true).starts_with("external agent · ⚠ destructive"));
     }
 }

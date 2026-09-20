@@ -24,12 +24,18 @@ approved command goes on to do.
 
 ## What is enforced, and where
 
-**One PTY write in the agent path.** `pty_write_internal` is the only function that writes to
-the shell, and it has two callers: the `pty_write` command (keystrokes, paste, prefill) and
-one line in `agent_loop`. That line is lexically inside the `AgentAction::Run` arm, after
-`if !approved { …; continue; }`. One grep confirms there is no other route from a model reply
-to the PTY. (`pty_spawn` also writes the static shell-integration script straight to the
-writer at startup; it contains no model- or user-controlled data.)
+**One PTY write per agent path.** `pty_write_internal` is the only function that writes to
+the shell, and it has three callers: the `pty_write` command (keystrokes, paste, prefill),
+one line in `agent_loop`, and one line in `mcp_server::run_gated`. The `agent_loop` line is
+lexically inside the `AgentAction::Run` arm, after `if !approved { …; continue; }`. The
+`run_gated` line — an external agent's `run_command`, see
+[below](#threat-model-tachyon-as-an-mcp-server) — is after
+`if !approved || aborted() { return Err(…) }`, and `approved` comes from the same
+`agent_propose`. It was two callers until server mode existed; the third is a second
+*proposer* behind the same gate, not a second route around it. One grep still confirms there
+is no other route from a model reply, or an HTTP request, to the PTY. (`pty_spawn` also writes
+the static shell-integration script straight to the writer at startup; it contains no model-
+or user-controlled data.)
 
 **Approval is a fail-closed oneshot.** `agent_propose` parks a `oneshot::Sender<bool>` in
 `AgentState.decision`, emits `agent-propose`, and returns `rx.await.unwrap_or(false)`. The
@@ -91,6 +97,84 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
   credentials. The 20-second step timeout stops the agent waiting; it does not kill the
   command. Approval fatigue over a 12-step run is a real failure mode.
 
+## Threat model: Tachyon as an MCP server
+
+`/mcp serve on` (off by default) starts an HTTP listener in `src-tauri/src/mcp_server.rs` so
+external agents can use the terminal. It adds a new kind of untrusted input — a network
+request — so it gets its own model. Two adversaries:
+
+1. **A web page in the user's browser.** It can make the browser send requests to
+   `127.0.0.1`, directly or by DNS rebinding.
+2. **A local process running as the user** — a malicious npm postinstall script, a
+   compromised MCP client, or a legitimate client whose model has been prompt-injected.
+
+**What stops the web page** (`admit`, run before the request body is read): the socket is
+bound to the literal `127.0.0.1`; every `Host` header must be `localhost`, `127.0.0.1` or
+`[::1]` with an optional port, matched exactly, so a rebound `evil.com:47600` is a 403; any
+`Origin` header must be a local one, so a cross-origin `fetch` is a 403 (`null` included);
+and no `Access-Control-*` header is ever sent, so the preflight that an `Authorization`
+header forces fails in the browser. Under all of that the page still needs the bearer token,
+which it has no way to read. A page served from `http://localhost:*` passes the Origin check
+and is stopped only by the token.
+
+**What the local process can and cannot do.** The token lives in `mcp-server.json`, mode
+0600. Any process running as the user can read that file — so treat the token as keeping out
+*other users and the browser*, not the user's own processes. A process that holds it can:
+
+- call `read_journal` and `get_context` with **no approval**: the last 50 commands, up to
+  4000 characters of each one's output, the cwd and git state. If you `cat .env` with the
+  server on, a token holder can read it. This is the feature's largest unguarded surface.
+- **propose** commands. It cannot run them. `run_command` reaches the PTY only through
+  `run_gated` → `agent_propose` → a human Enter; there is no allowlist, no trusted-client
+  mode, no auto-approve, and no timeout that approves. A process running as you could
+  already run commands as you — what it gains here is the chance to do so with your
+  approval, in your live shell, which matters for a sandboxed or remote-driven client.
+
+**What is enforced, and where** (all in `mcp_server.rs` unless noted):
+
+- *Shown is run.* `parse_run_args` folds the command with `one_line`, then **refuses** any
+  remaining control character or bidi override. `one_line` folds `\n` but not a bare `\r`,
+  which an `<input>` strips from display while a PTY treats it as Enter — `echo hi\rrm -rf ~`
+  would show one command and run two. The validated string is the one proposed and the one
+  written; `is_dangerous` runs on it. Commands over 4096 characters are refused.
+- *One driver at a time.* `agent_claim` (`lib.rs`) is the single way to take
+  `AgentState.running`, used by `agent_start` and `run_gated` alike. While the built-in agent
+  runs or another `run_command` is pending, a new one fails immediately with `isError` — it
+  never queues and never overwrites the parked sender. `AgentRunGuard` is constructed only
+  after the claim is won, so the busy path cannot release someone else's claim, and every
+  exit including a panic frees ⌘J.
+- *The requester is named.* The proposal carries `external: true` and the bar reads
+  `external agent · run? ⏎ approve · esc deny`.
+- *A stray keystroke is not a decision.* External proposals are unsolicited: the bar takes
+  focus while you are typing in the shell. An approval arriving within `MIN_REVIEW` (1 s) of
+  the bar appearing is discarded and the proposal is shown again.
+- *No proposal without a shell.* Until `pty_spawn` has run there is no webview listening, so
+  `run_gated` refuses rather than park a proposal nobody can answer.
+- *The token stays put.* Generated from `/dev/urandom`, compared with `ct_eq`, rendered only
+  by `render_status` for `/mcp serve status` — through `term_write`, so it reaches the display
+  engine and never the PTY, the journal or a model transcript. `ServeConfig` has no `Debug`
+  impl. Nothing in the module logs, and no response or error echoes request headers.
+
+**Limitations specific to server mode:**
+
+- **It is still human-in-the-loop, not a sandbox.** Everything under [Limitations](#limitations)
+  applies to external proposals unchanged: the lexical check warns and does not block, a
+  long command scrolls out of a single-line input, and an approved command runs as you.
+- **Approval fatigue is worse here.** The built-in agent stops after 12 steps; an external
+  client can propose for ever, and each denial is answered instantly. `MIN_REVIEW` defeats an
+  Enter already in flight, not a person typing blind for longer than a second.
+- **A pending proposal outlives its client.** If the client times out or disconnects, the
+  proposal stays in the bar until you decide. Approve it and the command runs with nobody
+  reading the result.
+- **The 20-second wait does not kill the command.** `run_command` then returns
+  `Exit code: unknown`, releases the slot, and the next approved command is written into
+  whatever is still running in the foreground.
+- **Plain HTTP on loopback.** A process that can sniff `lo0` sees the token; one that can do
+  that can usually read the file anyway.
+- **`run_gated` has no automated test.** It needs an `AppHandle`. Its parts are tested
+  (`agent_claim`, `parse_run_args`, `wait_block`, `admit`, the HTTP server against a stub);
+  the ordering of claim → propose → write is verified the way `agent_loop`'s is, by reading it.
+
 ## What would make it stronger
 
 1. Lex the command (flags, pipelines, `$(…)`) and classify by effect instead of substring.
@@ -103,5 +187,8 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
    inherited credentials) so approval is not the only control.
 6. Per-tool MCP policy, with destructive-hint annotations shown in the gate.
 7. Strip escape sequences before `term_write`, and delimit tool output in the transcript as data.
+8. For server mode: approve external proposals with a chord that normal typing never
+   produces, instead of Enter plus a time floor; scope tokens per client, with a read-only
+   scope; gate `read_journal` or redact its output; rate-limit proposals after a denial.
 
 Bypass reports are welcome — see [SECURITY.md](../SECURITY.md).
