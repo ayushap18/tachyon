@@ -342,8 +342,14 @@ pub fn VimSearch() -> Element {
                 return;
             }
             // Other app chords (on macOS: every ⌘-chord) pass through to the app/terminal
-            // shortcut handlers.
-            if action.is_some() || (crate::keymap::is_mac() && ev.meta_key()) {
+            // shortcut handlers. An open overlay (⌘K bar, palette, …) owns the keyboard too:
+            // NORMAL/VISUAL below stop_immediate_propagation() every non-chord key, which would
+            // otherwise eat the approval gate's Enter/Escape and the suggestion list's arrows
+            // before #ai-input ever sees them (app.rs:262-264 leaves vim out of that stand-down).
+            if action.is_some()
+                || (crate::keymap::is_mac() && ev.meta_key())
+                || !matches!(*state.overlay.read(), crate::app::Overlay::None)
+            {
                 return;
             }
             // Search box (`/`) owns Enter/Escape; other keys type into it but must

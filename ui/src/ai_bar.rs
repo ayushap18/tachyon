@@ -4,7 +4,7 @@
 //!
 //! SECURITY: this component owns the agent approval gate — the trust boundary.
 //! A proposal (`agent-propose`) resolves ONLY via an explicit Enter (approve) /
-//! Esc (deny) keypress on #ai-input, invoking `agent_decide`. The global keydown
+//! Esc (deny) keypress on #ai-input, invoking the decide command. The global keydown
 //! handler deliberately never closes AiBar/Agent on Esc. Handled keys call
 //! stop_propagation so the terminal's document keydown listener can't also encode
 //! them to the PTY (an approval Enter must NOT double as a shell carriage return).
@@ -17,6 +17,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
 use crate::bridge::{invoke, listen, term_write, NoArgs, WriteArgs};
+use crate::complete::{accept_text, list_key, list_open, slash_rows, tab_prefix, ListOp};
 
 // ---- invoke arg shapes ----
 #[derive(Serialize)]
@@ -95,6 +96,13 @@ fn enter_approves(external: bool, meta: bool, ctrl: bool) -> bool {
     !external || meta || ctrl
 }
 
+/// Does an agent own the bar (and the pty)? Every async continuation re-checks this after
+/// EACH await, not just the first: a proposal or a ⌘J start can land during any IPC round
+/// trip, and from then on only the gate branch and agent-done may touch input/status/danger.
+fn agent_owns_bar(pending_gate: bool, agent_running: bool) -> bool {
+    pending_gate || agent_running
+}
+
 #[derive(Deserialize)]
 struct AgentStatus {
     #[serde(default)]
@@ -114,14 +122,14 @@ fn reset_and_close(
     mut input: Signal<String>,
     mut status: Signal<String>,
     mut danger: Signal<bool>,
-    mut readonly: Signal<bool>,
+    mut sel: Signal<Option<usize>>,
     mut pending_gate: Signal<bool>,
     mut agent_running: Signal<bool>,
 ) {
     input.set(String::new());
     status.set(String::new());
     danger.set(false);
-    readonly.set(false);
+    sel.set(None);
     pending_gate.set(false);
     agent_running.set(false);
     state.close();
@@ -133,7 +141,11 @@ pub fn AiBar() -> Element {
     let mut input = use_signal(String::new);
     let mut status = use_signal(String::new);
     let mut danger = use_signal(|| false);
-    let mut readonly = use_signal(|| false);
+    // highlighted suggestion row. None by default and on every edit, so Enter keeps its
+    // submit meaning unless the user deliberately arrowed/tabbed onto a row.
+    let mut sel = use_signal(|| None::<usize>);
+    // the input's editability is derived from pending_gate || agent_running at render —
+    // never a separate signal, so no code path can leave an armed gate editable.
     let mut pending_gate = use_signal(|| false);
     let mut gate_external = use_signal(|| false);
     // agent_running is shared state (⌘J abort reads it) — this module owns writes.
@@ -149,7 +161,6 @@ pub fn AiBar() -> Element {
                     state.overlay.clone().set(Overlay::Agent);
                 }
                 input.set(p.text);
-                readonly.set(true);
                 danger.set(p.danger);
                 status.set(gate_status(p.danger, p.external, crate::keymap::is_mac()));
                 gate_external.set(p.external);
@@ -178,7 +189,7 @@ pub fn AiBar() -> Element {
         });
         // agent-done: finish → clear running flag, close the bar.
         listen("agent-done", move |_| {
-            reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
+            reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
         });
     });
 
@@ -191,13 +202,18 @@ pub fn AiBar() -> Element {
                 if !*pending_gate.peek() && !*agent_running.peek() {
                     input.set(String::new());
                     danger.set(false);
-                    readonly.set(false);
                     let mut status = status;
                     spawn_local(async move {
                         // provider_active now fails loudly on a corrupt providers.json
                         // rather than silently handing back defaults — show that here,
                         // since this bar is where the user looks for provider state.
-                        match invoke("provider_active", NoArgs {}).await {
+                        let r = invoke("provider_active", NoArgs {}).await;
+                        // a proposal or run may have taken the bar during the round trip —
+                        // its status line must not be overwritten
+                        if agent_owns_bar(*pending_gate.peek(), *agent_running.peek()) {
+                            return;
+                        }
+                        match r {
                             Ok(v) => {
                                 if let Ok(p) = serde_wasm_bindgen::from_value::<Provider>(v) {
                                     let suffix = if p.has_key || p.kind != "anthropic" {
@@ -214,10 +230,16 @@ pub fn AiBar() -> Element {
                 }
             }
             _ => {
-                input.set(String::new());
-                status.set(String::new());
-                danger.set(false);
-                readonly.set(false);
+                // ⌘K/⌘P/⌘,/⌘B during a gate or run only HIDES the bar — the proposal
+                // text and gate status must survive so reopening shows what Enter approves.
+                if !*pending_gate.peek() && !*agent_running.peek() {
+                    input.set(String::new());
+                    status.set(String::new());
+                    danger.set(false);
+                }
+                // a highlight never survives a hide, gate or not — nothing is at stake in
+                // dropping it, and a stale one would steal the next session's Enter
+                sel.set(None);
             }
         }
     });
@@ -227,6 +249,12 @@ pub fn AiBar() -> Element {
         return rsx! {};
     }
     let agent = overlay == Overlay::Agent;
+    // plain values, not guards: a read()/peek() guard alive across a .set panics, and the
+    // key branch below writes input/sel
+    let rows = slash_rows(&input.read());
+    let open = list_open(*pending_gate.read(), *agent_running.read(), rows.len());
+    let sel_eff = (*sel.read()).filter(|i| *i < rows.len());
+    let rows_for_key = rows.clone();
     let class = match (agent, *danger.read()) {
         (true, true) => "agent danger",
         (true, false) => "agent",
@@ -240,16 +268,28 @@ pub fn AiBar() -> Element {
             input {
                 id: "ai-input",
                 value: "{input}",
-                readonly: readonly(),
+                readonly: *pending_gate.read() || *agent_running.read(),
                 placeholder: if agent { "Describe a task…" } else { "Describe a command…" },
                 onmounted: move |e| {
                     spawn(async move {
                         let _ = e.set_focus(true).await;
                     });
                 },
-                oninput: move |e| input.set(e.value()),
+                oninput: move |e| {
+                    input.set(e.value());
+                    sel.set(None);
+                },
                 onkeydown: move |e| {
                     let key = e.key().to_string();
+                    // Tab must never move focus off #ai-input: it is the only element that
+                    // resolves a gate, and a focus-less gate cannot be denied.
+                    if key == "Tab" {
+                        e.prevent_default();
+                    }
+                    // IME commit / held key: not a deliberate decision — decide nothing.
+                    if e.is_composing() || e.is_auto_repeating() {
+                        return;
+                    }
                     // ---- approval gate: the ONLY place a proposal resolves ----
                     if *pending_gate.read() {
                         let mods = e.modifiers();
@@ -287,11 +327,47 @@ pub fn AiBar() -> Element {
                         }
                         return;
                     }
+                    // ---- suggestion list: lexically after both returns above AND
+                    // list_open is false under a gate/run — belt and braces. Accept and
+                    // Prefix write the input signal only: never the pty, never a submit.
+                    if open {
+                        let cur = input.peek().clone();
+                        match list_key(&key, sel_eff, rows_for_key.len()) {
+                            ListOp::Sel(s) => {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                sel.set(s);
+                                return;
+                            }
+                            ListOp::Accept(i) => {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                if let Some(a) = accept_text(rows_for_key[i].0, &cur) {
+                                    input.set(a);
+                                }
+                                sel.set(None);
+                                return;
+                            }
+                            ListOp::Prefix => {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                match tab_prefix(&rows_for_key, &cur) {
+                                    Some(p) => {
+                                        input.set(p);
+                                        sel.set(None);
+                                    }
+                                    None => sel.set(Some(0)),
+                                }
+                                return;
+                            }
+                            ListOp::Pass => {}
+                        }
+                    }
                     // ---- idle: Esc closes, Enter submits ----
                     if key == "Escape" {
                         e.prevent_default();
                         e.stop_propagation();
-                        reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
+                        reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
                     } else if key == "Enter" {
                         e.prevent_default();
                         e.stop_propagation();
@@ -308,17 +384,19 @@ pub fn AiBar() -> Element {
                                     }
                                 }
                             });
-                            reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
+                            reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
                         } else if agent {
                             if !v.is_empty() && !*agent_running.read() {
                                 agent_running.set(true);
-                                readonly.set(true);
                                 status.set("starting…".to_string());
                                 spawn_local(async move {
                                     if let Err(err) = invoke("agent_start", TaskArgs { task: v }).await {
+                                        // an external proposal may have armed the gate meanwhile
+                                        if *pending_gate.peek() {
+                                            return;
+                                        }
                                         status.set(err_str(err));
                                         agent_running.set(false);
-                                        readonly.set(false);
                                     }
                                 });
                             }
@@ -326,16 +404,27 @@ pub fn AiBar() -> Element {
                             status.set("thinking…".to_string());
                             danger.set(false);
                             spawn_local(async move {
-                                match invoke("nl_to_command", RequestArgs { request: v }).await {
+                                let r = invoke("nl_to_command", RequestArgs { request: v }).await;
+                                // a gate or run that began during the round trip owns the bar
+                                // and the pty: no prefill, no status overwrite, and above all
+                                // no reset_and_close (which would clear agent_running).
+                                if agent_owns_bar(*pending_gate.peek(), *agent_running.peek()) {
+                                    return;
+                                }
+                                match r {
                                     Ok(val) => {
                                         if let Ok(nl) = serde_wasm_bindgen::from_value::<NlResult>(val) {
                                             // no trailing newline — never auto-execute.
                                             let _ = invoke("pty_write", WriteArgs { data: nl.command }).await;
+                                            // the prefill is a second round trip; same rule again
+                                            if agent_owns_bar(*pending_gate.peek(), *agent_running.peek()) {
+                                                return;
+                                            }
                                             if nl.danger {
                                                 danger.set(true);
                                                 status.set("⚠ destructive — review carefully".to_string());
                                             } else {
-                                                reset_and_close(state, input, status, danger, readonly, pending_gate, agent_running);
+                                                reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
                                             }
                                         }
                                     }
@@ -346,6 +435,17 @@ pub fn AiBar() -> Element {
                     }
                 },
             }
+            // keyboard only: no onclick, so the sole way onto a row is an arrow/Tab press
+            if open {
+                ul { id: "ai-list",
+                    for (i, (form, detail)) in rows.into_iter().enumerate() {
+                        li { key: "{form}", class: if Some(i) == sel_eff { "sel" } else { "" },
+                            span { class: "label", "{form}" }
+                            span { class: "hint", "{detail}" }
+                        }
+                    }
+                }
+            }
             span { id: "ai-status", "{status}" }
         }
     }
@@ -353,7 +453,15 @@ pub fn AiBar() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{enter_approves, gate_status};
+    use super::{agent_owns_bar, enter_approves, gate_status};
+
+    #[test]
+    fn a_continuation_stands_down_under_a_gate_or_run() {
+        assert!(!agent_owns_bar(false, false));
+        assert!(agent_owns_bar(true, false)); // armed gate
+        assert!(agent_owns_bar(false, true)); // ⌘J started, no proposal yet
+        assert!(agent_owns_bar(true, true));
+    }
 
     #[test]
     fn gate_status_names_an_external_requester() {

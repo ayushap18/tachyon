@@ -236,8 +236,14 @@ pub fn Palette() -> Element {
         entries.into_iter().filter(|(label, _, _)| fuzzy(label, &q)).collect()
     };
 
-    // clamp selection into range
+    // Clamp the selection into range AND write it back. `shown` shrinks whenever the query
+    // filters or the journal ring drops rows; a display-only clamp leaves the stale larger
+    // index in the signal, so a later append (local-runtime discovery lands async) would
+    // un-clamp it and jump the highlight to a row the user never selected.
     let sel_val = (*sel.read()).min(shown.len().saturating_sub(1));
+    if *sel.peek() != sel_val {
+        sel.set(sel_val);
+    }
 
     let shown_for_key = shown.clone();
     rsx! {

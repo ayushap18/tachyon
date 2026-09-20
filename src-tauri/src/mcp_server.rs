@@ -187,7 +187,7 @@ fn parse_run_args(args: &Value) -> Result<String, String> {
     // a model's reply (a model cannot be refused), but an external client that sends a bare
     // CR, a tab or an escape sequence is refused outright rather than quietly cleaned up.
     // Line breaks (\n, \r\n) are legitimate — they are folded and shown, like the agent's.
-    if raw.replace("\r\n", "\n").chars().any(|c| c.is_control() && c != '\n') {
+    if raw.replace("\r\n", "\n").chars().any(|c| (c.is_control() && c != '\n') || crate::is_invisible(c)) {
         return Err("run_command: `command` contains control or bidi-override characters".into());
     }
     let cmd = one_line(raw);
@@ -197,7 +197,9 @@ fn parse_run_args(args: &Value) -> Result<String, String> {
     if cmd.chars().count() > MAX_COMMAND_CHARS {
         return Err(format!("run_command: `command` is longer than {MAX_COMMAND_CHARS} characters"));
     }
-    if cmd.chars().any(|c| c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')) {
+    // Unreachable while one_line drops both classes — kept so a change there cannot open the
+    // external path silently.
+    if cmd.chars().any(|c| c.is_control() || crate::is_invisible(c)) {
         return Err("run_command: `command` contains control or bidi-override characters".into());
     }
     Ok(cmd)
@@ -776,6 +778,8 @@ mod tests {
         assert!(parse_run_args(&json!({ "command": "ls\t" })).is_err()); // even at the edge: refused, not trimmed
         assert_eq!(parse_run_args(&json!({ "command": "echo a\r\necho b" })).unwrap(), "echo a; echo b"); // CRLF is a line break
         assert!(parse_run_args(&json!({ "command": "ls \u{202e}~ fr- mr" })).is_err());
+        // zero-width is as invisible as a bidi override, and hides inside a danger pattern
+        assert!(parse_run_args(&json!({ "command": "r\u{200B}m -rf ~" })).is_err());
         assert!(parse_run_args(&json!({ "command": "x".repeat(MAX_COMMAND_CHARS + 1) })).is_err());
         assert!(parse_run_args(&json!({ "command": "x".repeat(MAX_COMMAND_CHARS) })).is_ok());
 

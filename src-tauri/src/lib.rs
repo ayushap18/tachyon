@@ -371,7 +371,15 @@ impl OscScanner {
             idx = p + len;
             pos = idx;
             match mark {
-                b'A' | b'B' => self.pre_cmd.clear(),
+                // A new prompt means any line still pending belongs to the command that just
+                // ended, never to the next one. Without this a line typed at an unechoed
+                // prompt (sudo/ssh password) survives to label the next block — and any
+                // accept-line that isn't a literal CR (^O, ^X^E, an ESC-prefixed paste)
+                // sends no typed line of its own to overwrite it.
+                b'A' | b'B' => {
+                    self.pre_cmd.clear();
+                    self.pending_typed = None;
+                }
                 b'C' => {
                     // prefer what the user actually typed (clean); fall back to scraping
                     // the echo (agent-injected commands and history recalls have no typed line)
@@ -1076,6 +1084,13 @@ fn strip_fences(s: &str) -> String {
 // bar is a single-line input, so the user would approve line 1 while lines 2+ ran unseen.
 // Fold to one line: a trailing-backslash continuation becomes a space, a real line break
 // becomes `; ` (same sequencing, now visible and covered by the danger check).
+// Cf, not Cc: `char::is_control` is category Cc only, so a bidi override can reorder what the
+// approver reads while the bytes written to the pty stay unchanged, and a zero-width char can
+// sit inside a DANGER_PATTERNS substring to defeat `is_dangerous`.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
 fn one_line(cmd: &str) -> String {
     cmd.replace("\\\r\n", " ")
         .replace("\\\n", " ")
@@ -1091,7 +1106,7 @@ fn one_line(cmd: &str) -> String {
             l.chars()
                 .filter_map(|c| match c {
                     '\t' => Some(' '),
-                    c if c.is_control() => None,
+                    c if c.is_control() || is_invisible(c) => None,
                     c => Some(c),
                 })
                 .collect::<String>()
@@ -1314,9 +1329,12 @@ fn parse_tools(result: &serde_json::Value) -> Vec<McpTool> {
         .and_then(|t| t.as_array())
         .map(|arr| {
             arr.iter()
+                // Folded at ingest, the one choke point every consumer shares: `/mcp list`
+                // interpolates these into an ANSI string that `term_write` feeds to the vt100
+                // engine, so a remote server's `\x1b[2J` would repaint the grid.
                 .map(|t| McpTool {
-                    name: t.get("name").and_then(|v| v.as_str()).unwrap_or_default().into(),
-                    description: t.get("description").and_then(|v| v.as_str()).unwrap_or_default().into(),
+                    name: one_line(t.get("name").and_then(|v| v.as_str()).unwrap_or_default()),
+                    description: one_line(t.get("description").and_then(|v| v.as_str()).unwrap_or_default()),
                     input_schema: match t.get("inputSchema") {
                         Some(s) if !s.is_null() => s.clone(),
                         _ => serde_json::json!({}),
@@ -2190,12 +2208,14 @@ The arguments are one JSON object with the keys from the tool's signature below;
                     Ok(out) => {
                         let _ = app.emit(
                             "agent-output",
-                            serde_json::json!({ "step": step, "text": format!("tool {server}.{tool} → {}", truncate_chars(&out, 500)) }),
+                            // the transcript copy below keeps the raw text for the model; this
+                            // one is painted by term_write, which interprets escapes
+                            serde_json::json!({ "step": step, "text": format!("tool {server}.{tool} → {}", one_line(&truncate_chars(&out, 500))) }),
                         );
                         transcript.push_str(&format!("\nTool: {server}.{tool}\nResult:\n{}\n", truncate_chars(&out, 2000)));
                     }
                     Err(e) => {
-                        let _ = app.emit("agent-output", serde_json::json!({ "step": step, "text": format!("tool error: {e}") }));
+                        let _ = app.emit("agent-output", serde_json::json!({ "step": step, "text": format!("tool error: {}", one_line(&e)) }));
                         transcript.push_str(&format!("\nTool error: {}\n", truncate_chars(&e, 2000)));
                     }
                 }
@@ -2587,6 +2607,18 @@ mod tests {
         assert_eq!(tools[0].input_schema, serde_json::json!({"type":"object"}));
         assert_eq!(tools[1].description, "");
         assert_eq!(tools[1].input_schema, serde_json::json!({}));
+    }
+
+    // `/mcp list` paints these through term_write, which feeds the vt100 engine: a remote
+    // server must not be able to clear the grid or forge a prompt.
+    #[test]
+    fn parse_tools_strips_control_chars() {
+        let result = serde_json::json!({"tools":[
+            {"name":"read\u{1b}[2Jfile","description":"\u{1b}[H\u{1b}[36mfake\r\n$ "}
+        ]});
+        let tools = parse_tools(&result);
+        assert_eq!(tools[0].name, "read[2Jfile");
+        assert!(!tools[0].description.contains(['\u{1b}', '\r', '\n']));
     }
 
     fn tool(name: &str, description: &str, input_schema: serde_json::Value) -> McpServerTool {
@@ -3047,13 +3079,23 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
     #[test]
     fn osc_typed_label_beats_echo_scrape_and_is_consumed_once() {
         let mut sc = OscScanner::default();
+        // the prompt mark is on the wire before the user can type into that prompt (every
+        // integration emits A from precmd), so set_typed always lands between A and C
+        sc.feed(b"\x1b]133;A\x07p % ");
         sc.set_typed("ls -la".into());
-        let b1 = sc.feed(b"\x1b]133;A\x07p % garbled echo\x1b]133;C\x07f\x1b]133;D;0\x07");
+        let b1 = sc.feed(b"garbled echo\x1b]133;C\x07f\x1b]133;D;0\x07");
         assert_eq!(b1[0].command, "ls -la");
-        // no typed line for the next command → echo scrape
+        // a line typed at the last command's unechoed prompt (a sudo password) must not
+        // label the next block: the A mark discards it, so this is an echo scrape
+        sc.set_typed("hunter2".into());
         let b2 = sc.feed(b"\x1b]133;A\x07p % cat foo\x1b]133;C\x07x\x1b]133;D;1\x07");
         assert_eq!(b2[0].command, "cat foo");
         assert_eq!(b2[0].exit_code, 1);
+        // a line typed AFTER the prompt mark is still adopted — that is the whole point
+        sc.feed(b"\x1b]133;A\x07p % \x1b]133;B\x07");
+        sc.set_typed("ls".into());
+        let b3 = sc.feed(b"ls\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(b3[0].command, "ls");
     }
 
     // Captured from bash 3.2 on a pty with BASH_INTEGRATION loaded: clear, handshake, `true`,
@@ -3091,10 +3133,9 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
     #[test]
     fn osc_fish_stream() {
         let mut sc = OscScanner::default();
+        sc.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07"); // prompt first, then the user types
         sc.set_typed("false".into());
-        let b = sc.feed(
-            b"\x1b]133;D;0\x07\x1b]133;A\x07dev@box ~/src> \x1b[38;2;0;95;215mfalse\x1b[m\r\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07",
-        );
+        let b = sc.feed(b"dev@box ~/src> \x1b[38;2;0;95;215mfalse\x1b[m\r\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07");
         assert_eq!(b.len(), 1);
         assert_eq!((b[0].command.as_str(), b[0].exit_code, b[0].output.as_str()), ("false", 1, ""));
 
@@ -3232,6 +3273,12 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert_eq!(one_line("ls\t-la"), "ls -la");
         assert_eq!(one_line("ls\x03\x1b[2J -la"), "ls[2J -la");
         assert!(!one_line("a\rb\x04\x1bc\td").chars().any(|c| c.is_control()));
+        // Cf too: a bidi override reorders what the approver reads, a zero-width char hides
+        // inside a danger pattern
+        assert_eq!(one_line("echo a\u{202E}b"), "echo ab");
+        assert_eq!(one_line("r\u{200B}m -rf /"), "rm -rf /");
+        assert!(is_dangerous(&one_line("r\u{200B}m -rf /")));
+        assert_eq!(one_line("\u{FEFF}ls"), "ls");
         // the second line is now visible to the danger gate instead of hiding behind line 1
         assert!(is_dangerous(&one_line("ls\nrm -rf /")));
         // and the agent parser applies it too

@@ -105,6 +105,50 @@ canvas#term {
   color: var(--err);
 }
 
+/* ⌘K suggestion list — grows upward out of #ai-bar. #ai-bar is position: fixed,
+   so it is the containing block; bottom: 100% keeps the list strictly above the
+   bar, so it can never cover the approval prompt or the readonly input. */
+#ai-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  max-height: 40vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px 12px;
+  list-style: none;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font: 12px Menlo, monospace;
+}
+
+#ai-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#ai-list li .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ai-list li .hint {
+  color: var(--muted);
+  flex: none;
+}
+
+/* no :hover rule — the list is keyboard-only, a hover highlight would lie */
+#ai-list li.sel {
+  background: var(--surface-alt);
+}
+
 /* Status bar — fixed at the bottom edge. */
 #status-bar {
   position: fixed;
