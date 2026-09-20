@@ -62,10 +62,20 @@ fn clamp_dim(v: u16) -> u16 {
     v.clamp(1, 1000)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn parse_lsof_cwd(output: &str) -> Option<String> {
     output.lines().find(|l| l.starts_with('n')).map(|l| l[1..].to_string())
 }
 
+// Linux: procfs has the answer as a symlink — no subprocess, nothing to time out. (lsof is
+// not installed by default on most distros, and a failed probe silently drops cwd/git from
+// the status bar and from the Context: block of every prompt.)
+#[cfg(target_os = "linux")]
+fn cwd_of_pid(pid: u32) -> Option<String> {
+    Some(std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn cwd_of_pid(pid: u32) -> Option<String> {
     let mut cmd = std::process::Command::new("lsof");
     cmd.args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]);
@@ -93,24 +103,92 @@ fn git_info(cwd: &str) -> (Option<String>, u32) {
     (branch, dirty)
 }
 
-// OSC 133 shell integration: zsh hooks marking prompt/exec boundaries.
-// \e / \a are text escapes interpreted by zsh's `print -n`, not raw bytes.
-// precmd emits D;<prev exit> + A (prompt start); preexec emits C (output start).
-// add-zsh-hook is idempotent, so re-injection would be harmless; the trailing
-// `clear` erases the echoed injection line so the user sees a clean prompt.
-fn shell_integration_script() -> String {
-    concat!(
-        "_tachyon_precmd(){ print -n \"\\e]133;D;$?\\a\\e]133;A\\a\"; }; ",
-        "_tachyon_preexec(){ print -n \"\\e]133;C\\a\"; }; ",
-        "autoload -Uz add-zsh-hook && add-zsh-hook precmd _tachyon_precmd && add-zsh-hook preexec _tachyon_preexec; clear\n"
-    )
-    .into()
+// $SHELL is what the pty runs; unset (a bare launcher environment) falls back per OS.
+fn shell_path() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from(if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/bash" }))
+}
+
+fn shell_name(shell: &str) -> &str {
+    std::path::Path::new(shell).file_name().and_then(|n| n.to_str()).unwrap_or(shell)
+}
+
+// fills the {env} placeholder in AI_SYSTEM / AI_AGENT, e.g. "bash on Linux"
+fn with_env(prompt: &str) -> String {
+    let os = if cfg!(target_os = "macos") { "macOS" } else { "Linux" };
+    prompt.replace("{env}", &format!("{} on {os}", shell_name(&shell_path())))
+}
+
+// OSC 133 shell integration: per-shell hooks marking prompt/exec boundaries —
+// D;<prev exit> + A before each prompt, C right before a command's output. The script is
+// typed into the fresh pty, so each one is a single line (no PS2 continuation prompts),
+// ends in `clear` to erase its own echo, and stays under 1024 bytes: it can arrive before
+// the shell leaves canonical mode, and macOS truncates a canonical input line at MAX_CANON.
+// The bash/fish lines start with a space to stay out of history (fish always, bash under
+// the common HISTCONTROL=ignorespace/ignoreboth).
+//
+// zsh: \e / \a are text escapes interpreted by `print -n`, not raw bytes. add-zsh-hook is
+// idempotent, so re-injection would be harmless.
+const ZSH_INTEGRATION: &str = concat!(
+    "_tachyon_precmd(){ print -n \"\\e]133;D;$?\\a\\e]133;A\\a\"; }; ",
+    "_tachyon_preexec(){ print -n \"\\e]133;C\\a\"; }; ",
+    "autoload -Uz add-zsh-hook && add-zsh-hook precmd _tachyon_precmd && add-zsh-hook preexec _tachyon_preexec; clear\n"
+);
+
+// bash (3.2+, what macOS ships) has no preexec, so C comes from a DEBUG trap. That trap
+// fires before EVERY simple command — each pipeline stage, and PROMPT_COMMAND itself — so it
+// is armed only by the last statement of the LAST PROMPT_COMMAND entry (under functrace /
+// extdebug it also fires inside functions) and disarms on first fire; firing for
+// _tachyon_d means Enter on an empty line, which disarms without a C. COMP_LINE /
+// READLINE_LINE are set only while completion / `bind -x` widgets (fzf's ctrl-r) run.
+// The trap always returns 0 — under `shopt -s extdebug` a non-zero return SKIPS the
+// command — and every expansion has a :- default so `set -u` shells stay quiet.
+// _tachyon_d runs first to see the command's $? and returns it, so an existing
+// PROMPT_COMMAND (kept, scalar or array) still sees it too. With bash-preexec loaded
+// (atuin, ble.sh) we register with it instead: replacing its DEBUG trap would break it.
+// PS1 gets a B mark re-appended every prompt (themes rebuild PS1) so the echo-scrape label
+// starts after the prompt — bash prompts end in "$ " with no space before the sigil, which
+// strip_prompt_sigil does not recognise.
+// ponytail: a line that is only a ( subshell ) fires no DEBUG trap without `set -T`, so it
+// gets no block; bash-preexec's subshell tracking is the upgrade path.
+const BASH_INTEGRATION: &str = concat!(
+    r#" _tachyon_d(){ local e=$?; printf '\033]133;D;%s\007\033]133;A\007' $e; return $e; }; "#,
+    r#"_tachyon_c(){ printf '\033]133;C\007'; }; _tachyon_b='\[\033]133;B\007\]'; "#,
+    r#"_tachyon_arm(){ PS1=${PS1%"$_tachyon_b"}$_tachyon_b; _tachyon_armed=1; }; "#,
+    r#"if [ -n "${bash_preexec_imported:-${__bp_imported:-}}" ]; then "#,
+    r#"precmd_functions+=(_tachyon_d _tachyon_arm); preexec_functions+=(_tachyon_c); else "#,
+    r#"_tachyon_dbg(){ [ -n "${_tachyon_armed:-}" ] && [ -z "${COMP_LINE:-}" ] && [ -z "${READLINE_LINE+x}" ] || return 0; "#,
+    r#"_tachyon_armed=; [ "$BASH_COMMAND" = _tachyon_d ] || _tachyon_c; }; "#,
+    r#"_tachyon_pc=$(IFS=$'\n'; printf %s "${PROMPT_COMMAND[*]:-}"); unset PROMPT_COMMAND; "#,
+    r#"PROMPT_COMMAND=$'_tachyon_d\n'$_tachyon_pc$'\n_tachyon_arm'; trap _tachyon_dbg DEBUG; fi; clear"#,
+    "\n"
+);
+
+// fish: plain event handlers; $status inside fish_postexec is the command's. fish 4 also
+// emits its own marks — its A/C carry parameters, which parse_osc_mark rejects, and its
+// duplicate D lands when nothing is capturing, so the two coexist.
+const FISH_INTEGRATION: &str = concat!(
+    r#" function _tachyon_a --on-event fish_prompt; printf '\e]133;A\a'; end; "#,
+    r#"function _tachyon_c --on-event fish_preexec; printf '\e]133;C\a'; end; "#,
+    r#"function _tachyon_d --on-event fish_postexec; printf '\e]133;D;%s\a' $status; end; clear"#,
+    "\n"
+);
+
+fn shell_integration_script(shell: &str) -> Option<&'static str> {
+    match shell_name(shell) {
+        "zsh" => Some(ZSH_INTEGRATION),
+        "bash" => Some(BASH_INTEGRATION),
+        "fish" => Some(FISH_INTEGRATION),
+        _ => None,
+    }
 }
 
 // ---- OSC 133 journal ----
 // The pty reader thread scans the RAW bytes (an ADDITIONAL consumer alongside the
 // grid engine, which is fed the same immutable slice) for the OSC 133
-// marks the injected zsh hooks emit: A (prompt start), C (output start), D;<code>
+// marks the injected shell hooks emit: A (prompt start), C (output start), D;<code>
 // (command end). Finalized blocks live in a ring of 50 and are pushed to the webview
 // via "journal-block" events.
 
@@ -397,7 +475,7 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let shell = shell_path();
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     if let Ok(home) = std::env::var("HOME") {
@@ -412,14 +490,17 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Re
     // to explain, and every agent step waits out its full timeout. That used to happen
     // silently; hand the reason back so the frontend can say so once.
     let mut warning = None;
-    if shell.ends_with("zsh") {
-        if let Err(e) = writer.write_all(shell_integration_script().as_bytes()) {
-            warning = Some(format!("shell integration failed to load ({e}) — no command journal"));
+    match shell_integration_script(&shell) {
+        Some(script) => {
+            if let Err(e) = writer.write_all(script.as_bytes()) {
+                warning = Some(format!("shell integration failed to load ({e}) — no command journal"));
+            }
         }
-    } else {
-        warning = Some(format!(
-            "shell integration is zsh-only; {shell} gets no command journal (⌘B/⌘E disabled)"
-        ));
+        None => {
+            warning = Some(format!(
+                "shell integration supports zsh, bash and fish; {shell} gets no command journal (⌘B/⌘E disabled)"
+            ));
+        }
     }
     *state.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
     *state.shell_pid.lock().unwrap_or_else(|e| e.into_inner()) = child.process_id();
@@ -637,9 +718,9 @@ impl ProviderState {
         ProviderState {
             active: "claude".into(),
             providers: vec![
-                builtin("claude", "anthropic", "", "claude-opus-4-8"),
+                builtin("claude", "anthropic", "", "claude-opus-5"),
                 builtin("openai", "openai", "https://api.openai.com/v1", "gpt-4o"),
-                builtin("groq", "openai", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+                builtin("groq", "openai", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
                 builtin("gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
                 builtin("kimi", "openai", "https://api.moonshot.ai/v1", "moonshot-v1-8k"),
                 builtin("deepseek", "openai", "https://api.deepseek.com", "deepseek-chat"),
@@ -814,10 +895,13 @@ fn provider_add_local(id: String, base_url: String, model: String, key: String) 
 // ---- AI completion ----
 // Request/response shaping lives in pure helpers so they unit-test without a network.
 
+// max_tokens is 4096, not the 1024 the OpenAI body uses: claude-opus-5 thinks by default and
+// thinking tokens count against the cap, so 1024 could be spent before the answer starts.
+// No thinking/effort/temperature params — the model is user-set and older ones reject them.
 fn build_anthropic_body(model: &str, system: &str, user: &str) -> serde_json::Value {
     serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "system": system,
         "messages": [{"role": "user", "content": user}]
     })
@@ -922,7 +1006,7 @@ async fn ai_complete(system: String, user: String) -> Result<String, String> {
 // Prompt assembly, fence stripping, and the danger check live here — the webview
 // only sends the raw request and renders the result.
 
-const AI_SYSTEM: &str = "You translate natural-language requests into a single shell command for zsh on macOS. \
+const AI_SYSTEM: &str = "You translate natural-language requests into a single shell command for {env}. \
 Output ONLY the command — no markdown fences, no explanation, no commentary.";
 const AI_EXPLAIN: &str = "You are a terminal assistant. Given recent terminal output, explain the most recent error \
 or failure in 1-3 short sentences and suggest a fix. If there is no error, say so briefly. \
@@ -936,6 +1020,21 @@ fn strip_fences(s: &str) -> String {
         s = rest.trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim_start();
     }
     s.trim_end_matches("```").trim().to_string()
+}
+
+// A model reply can span lines. Written to the pty, every embedded newline is an Enter:
+// ⌘K would EXECUTE line 1 of a "prefill only" command, and in agent mode the approval
+// bar is a single-line input, so the user would approve line 1 while lines 2+ ran unseen.
+// Fold to one line: a trailing-backslash continuation becomes a space, a real line break
+// becomes `; ` (same sequencing, now visible and covered by the danger check).
+fn one_line(cmd: &str) -> String {
+    cmd.replace("\\\r\n", " ")
+        .replace("\\\n", " ")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // last `max` chars (not bytes — slicing bytes could split a codepoint and panic)
@@ -987,7 +1086,7 @@ async fn nl_to_command(
     let pid = *pty.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
     let jctx = journal_context(&journal.blocks.lock().unwrap_or_else(|e| e.into_inner()));
     let user = format!("{request}\n\nContext:\n{}\n{jctx}", shell_context_line(pid));
-    let command = strip_fences(&ai_call(AI_SYSTEM, &user).await?);
+    let command = one_line(&strip_fences(&ai_call(&with_env(AI_SYSTEM), &user).await?));
     if command.is_empty() {
         return Err("no command returned".into());
     }
@@ -1417,7 +1516,7 @@ fn run_slash(input: String) -> String {
 // the approval gate. INVARIANT: no command or tool ever runs without an explicit
 // agent_decide(true), which TS invokes only from a literal Enter keypress.
 
-const AI_AGENT: &str = "You drive a macOS zsh terminal to accomplish the user's task step by step. \
+const AI_AGENT: &str = "You drive a terminal running {env} to accomplish the user's task step by step. \
 Respond with EXACTLY ONE line: either 'RUN: <single shell command>' to execute a command, \
 or 'DONE: <one-sentence summary>' when the task is complete or cannot proceed. \
 No markdown, no prose, no multiple commands, no explanation. \
@@ -1457,7 +1556,7 @@ fn parse_agent_reply(reply: &str) -> AgentAction {
             args,
         };
     }
-    let cmd = strip_fences(strip_prefix_ci(reply, "RUN:").unwrap_or(reply));
+    let cmd = one_line(&strip_fences(strip_prefix_ci(reply, "RUN:").unwrap_or(reply)));
     if cmd.is_empty() {
         AgentAction::Done("no command returned".into())
     } else {
@@ -1562,11 +1661,12 @@ async fn agent_loop(app: AppHandle, task: String) {
     for e in &tool_errs {
         let _ = app.emit("agent-output", serde_json::json!({ "step": 0, "text": format!("mcp {e}") }));
     }
+    let agent = with_env(AI_AGENT);
     let system = if tools.is_empty() {
-        AI_AGENT.to_string()
+        agent
     } else {
         format!(
-            "{AI_AGENT} You may also call a tool: respond with EXACTLY 'TOOL: <server>.<name> {{json arguments}}' (one line).\nTOOLS:\n{}",
+            "{agent} You may also call a tool: respond with EXACTLY 'TOOL: <server>.<name> {{json arguments}}' (one line).\nTOOLS:\n{}",
             tools.iter().map(|t| format!("TOOL {}.{} — {}", t.server, t.name, t.description)).collect::<Vec<_>>().join("\n")
         )
     };
@@ -1705,6 +1805,17 @@ async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String>
     Ok(ShellContext { cwd, branch, dirty, shell_pid: pid })
 }
 
+// User key rebinds: action id → chord ("ctrl+shift+k"). The frontend owns both vocabularies,
+// so nothing is validated here. Missing file = no overrides; corrupt = Err like every config.
+fn load_keybindings(path: &std::path::Path) -> Result<std::collections::HashMap<String, String>, String> {
+    Ok(read_config(path)?.unwrap_or_default())
+}
+
+#[tauri::command]
+fn keybindings() -> Result<std::collections::HashMap<String, String>, String> {
+    load_keybindings(&config_dir()?.join("keybindings.json"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1747,7 +1858,8 @@ pub fn run() {
             mcp_servers,
             mcp_list_tools,
             mcp_call,
-            run_slash
+            run_slash,
+            keybindings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1757,24 +1869,33 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    // captured from real `lsof -a -p <pid> -d cwd -Fn` on this machine
-    const LSOF_SAMPLE: &str = "p86425\nfcwd\nn/Users/ayush18/tachyon\n";
+    // shape of real `lsof -a -p <pid> -d cwd -Fn` output
+    #[cfg(not(target_os = "linux"))]
+    const LSOF_SAMPLE: &str = "p86425\nfcwd\nn/Users/dev/tachyon\n";
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn parse_lsof_cwd_sample() {
-        assert_eq!(parse_lsof_cwd(LSOF_SAMPLE), Some("/Users/ayush18/tachyon".into()));
+        assert_eq!(parse_lsof_cwd(LSOF_SAMPLE), Some("/Users/dev/tachyon".into()));
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn parse_lsof_cwd_garbage() {
         assert_eq!(parse_lsof_cwd("total garbage\nxyz 123"), None);
         assert_eq!(parse_lsof_cwd(""), None);
     }
 
+    // the live probe on whichever OS runs the suite: lsof on macOS, /proc on Linux
     #[test]
     fn cwd_of_self_matches_current_dir() {
-        let cwd = cwd_of_pid(std::process::id()).expect("lsof gave no cwd");
+        let cwd = cwd_of_pid(std::process::id()).expect("cwd probe gave nothing");
         assert_eq!(std::path::PathBuf::from(cwd), std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn cwd_of_dead_pid_is_none() {
+        assert_eq!(cwd_of_pid(u32::MAX), None); // above any pid_max: no such process
     }
 
     #[test]
@@ -1793,7 +1914,7 @@ mod tests {
 
     #[test]
     fn shell_integration_script_shape() {
-        let s = shell_integration_script();
+        let zsh = shell_integration_script("/bin/zsh").unwrap();
         for needle in [
             "add-zsh-hook precmd",
             "add-zsh-hook preexec",
@@ -1802,9 +1923,64 @@ mod tests {
             "\\e]133;A\\a",
             "\\e]133;C\\a",
         ] {
-            assert!(s.contains(needle), "missing {needle}");
+            assert!(zsh.contains(needle), "zsh: missing {needle}");
         }
-        assert!(s.ends_with('\n'));
+
+        let bash = shell_integration_script("/usr/local/bin/bash").unwrap();
+        for needle in [
+            "local e=$?",                          // exit captured before anything can clobber it
+            "'\\033]133;D;%s\\007\\033]133;A\\007'", // octal: bash 3.2's printf has no \e
+            "'\\033]133;C\\007'",
+            "\\[\\033]133;B\\007\\]",              // \[ \] keep readline's width math right
+            "trap _tachyon_dbg DEBUG",
+            "${PROMPT_COMMAND[*]:-}",              // existing PROMPT_COMMAND preserved
+            "$'\\n_tachyon_arm'",                  // armed LAST, so the trap skips PROMPT_COMMAND
+            "\"$BASH_COMMAND\" = _tachyon_d",      // empty Enter must not open a block
+            "preexec_functions+=(_tachyon_c)",     // bash-preexec cooperation
+        ] {
+            assert!(bash.contains(needle), "bash: missing {needle}");
+        }
+
+        let fish = shell_integration_script("/opt/homebrew/bin/fish").unwrap();
+        for needle in [
+            "--on-event fish_prompt; printf '\\e]133;A\\a'",
+            "--on-event fish_preexec; printf '\\e]133;C\\a'",
+            "--on-event fish_postexec; printf '\\e]133;D;%s\\a' $status",
+        ] {
+            assert!(fish.contains(needle), "fish: missing {needle}");
+        }
+
+        for s in [zsh, bash, fish] {
+            // typed into a live shell: exactly one line, self-erasing, within macOS MAX_CANON
+            assert!(s.ends_with("; clear\n"));
+            assert_eq!(s.matches('\n').count(), 1);
+            assert!(s.len() < 1024, "{} bytes", s.len());
+        }
+        for s in [bash, fish] {
+            assert!(s.starts_with(' '), "leading space keeps it out of history");
+        }
+    }
+
+    #[test]
+    fn shell_integration_unsupported_shells() {
+        for sh in ["/bin/sh", "/usr/bin/nu", "/bin/dash", ""] {
+            assert!(shell_integration_script(sh).is_none(), "{sh}");
+        }
+        assert_eq!(shell_name("/usr/bin/fish"), "fish");
+        assert_eq!(shell_name("zsh"), "zsh");
+    }
+
+    // The evals harness parses these consts out of this file and substitutes {env} itself.
+    #[test]
+    fn prompts_carry_env_placeholder() {
+        let os = if cfg!(target_os = "macos") { "macOS" } else { "Linux" };
+        for p in [AI_SYSTEM, AI_AGENT] {
+            assert_eq!(p.matches("{env}").count(), 1);
+            let filled = with_env(p);
+            assert!(!filled.contains("{env}"));
+            assert!(filled.contains(&format!("{} on {os}", shell_name(&shell_path()))), "{filled}");
+        }
+        assert!(!AI_EXPLAIN.contains("{env}"));
     }
 
     #[test]
@@ -1820,6 +1996,7 @@ mod tests {
             "shutdown -h now",
             "sudo reboot",
             "chmod -R 777 /",
+            "cat /dev/zero > /dev/sda",
         ] {
             assert!(is_dangerous(cmd), "{cmd}");
         }
@@ -1892,6 +2069,28 @@ mod tests {
         assert!(read_config::<ProviderState>(&path).is_err());
         // and the bytes are still there to recover by hand
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn keybindings_missing_corrupt_valid() {
+        let dir = std::env::temp_dir().join(format!("tachyon-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keybindings.json");
+
+        assert!(load_keybindings(&path).unwrap().is_empty()); // missing = no overrides
+
+        std::fs::write(&path, r#"{"palette.open":"ctrl+shift+k","agent.start":"not a chord"}"#).unwrap();
+        let map = load_keybindings(&path).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["palette.open"], "ctrl+shift+k");
+        assert_eq!(map["agent.start"], "not a chord"); // passed through unvalidated
+
+        for corrupt in ["{not json", r#"["a","b"]"#, r#"{"palette.open":1}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(load_keybindings(&path).is_err(), "{corrupt}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1989,7 +2188,7 @@ mod tests {
         assert_eq!(
             build_anthropic_body("m", "sys", "hi"),
             serde_json::json!({
-                "model": "m", "max_tokens": 1024, "system": "sys",
+                "model": "m", "max_tokens": 4096, "system": "sys",
                 "messages": [{"role": "user", "content": "hi"}]
             })
         );
@@ -2010,6 +2209,16 @@ mod tests {
     fn parse_anthropic_ok_and_skips_non_text() {
         let body = r#"{"content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"hello"}]}"#;
         assert_eq!(parse_anthropic_response(body).unwrap(), "hello");
+    }
+
+    // claude-opus-5 thinks by default; with display omitted the block arrives first, empty
+    #[test]
+    fn parse_anthropic_thinking_block_before_text() {
+        let body = r#"{"content":[{"type":"thinking","thinking":"","signature":"EuYBCkQ"},{"type":"text","text":"ls -la"}],"stop_reason":"end_turn"}"#;
+        assert_eq!(parse_anthropic_response(body).unwrap(), "ls -la");
+        // budget spent entirely on thinking: an error, never the thinking text as a command
+        let truncated = r#"{"content":[{"type":"thinking","thinking":"rm -rf /","signature":"x"}],"stop_reason":"max_tokens"}"#;
+        assert!(parse_anthropic_response(truncated).is_err());
     }
 
     #[test]
@@ -2141,6 +2350,107 @@ mod tests {
         assert_eq!(b2[0].exit_code, 1);
     }
 
+    // Captured from bash 3.2 on a pty with BASH_INTEGRATION loaded: clear, handshake, `true`,
+    // Enter on an empty line, a pipeline, a failing command, a missing one. The prompt has no
+    // space before its "$" — only the B mark keeps it out of the scraped label.
+    #[test]
+    fn osc_bash_stream() {
+        let p = "\x1b]133;A\x07dev@box:~/src$ \x1b]133;B\x07";
+        let stream = [
+            "\x1b[3J\x1b[H\x1b[2J\x1b]133;D;0\x07",
+            p, "true\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+            p, "\r\n\x1b]133;D;0\x07", // empty Enter: D with no C
+            p, "\x1b[?2004l\rprintf 'a\\n' | cat\r\n\x1b]133;C\x07a\r\n\x1b]133;D;0\x07",
+            p, "false\r\n\x1b]133;C\x07\x1b]133;D;1\x07",
+            p, "nosuch\r\n\x1b]133;C\x07bash: nosuch: command not found\r\n\x1b]133;D;127\x07",
+            p,
+        ]
+        .concat();
+        let blocks = OscScanner::default().feed(stream.as_bytes());
+        let got: Vec<_> = blocks.iter().map(|b| (b.command.as_str(), b.exit_code, b.output.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("true", 0, ""),
+                ("printf 'a\\n' | cat", 0, "a"),
+                ("false", 1, ""),
+                ("nosuch", 127, "bash: nosuch: command not found"),
+            ]
+        );
+    }
+
+    // fish with FISH_INTEGRATION. The second round is fish 4, which also emits its own marks:
+    // parameterised A/C (not ours — must be ignored, not restart the capture and eat the
+    // typed label) and a duplicate D (must not produce a second block).
+    #[test]
+    fn osc_fish_stream() {
+        let mut sc = OscScanner::default();
+        sc.set_typed("false".into());
+        let b = sc.feed(
+            b"\x1b]133;D;0\x07\x1b]133;A\x07dev@box ~/src> \x1b[38;2;0;95;215mfalse\x1b[m\r\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07",
+        );
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].command.as_str(), b[0].exit_code, b[0].output.as_str()), ("false", 1, ""));
+
+        sc.set_typed("echo hi".into());
+        let b = sc.feed(
+            b"\x1b]133;A;special_key=1\x07dev@box ~/src> echo hi\r\n\x1b]133;C\x07\x1b]133;C;cmdline_url=echo%20hi\x07hi\r\n\x1b]133;D;0\x07\x1b]133;D;0\x07\x1b]133;A\x07",
+        );
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].command.as_str(), b[0].exit_code, b[0].output.as_str()), ("echo hi", 0, "hi"));
+    }
+
+    // End to end: real bash (3.2 on macOS, 5.x on Linux CI) on a real pty, the real script,
+    // the real scanner. --norc/--noprofile and a fixed PS1 keep it hermetic; the watchdog
+    // turns a wedged shell into a failed assert instead of a hung suite.
+    #[test]
+    fn bash_integration_end_to_end() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 200, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        cmd.args(["--norc", "--noprofile", "-i"]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("PS1", "dev@box:~$ ");
+        cmd.env("PROMPT_COMMAND", "_user_pc=kept$?"); // must survive, and still see $?
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave); // or the master never sees EOF
+        let mut killer = child.clone_killer();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let _ = killer.kill();
+        });
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        writer.write_all(BASH_INTEGRATION.as_bytes()).unwrap();
+
+        let (mut sc, mut blocks, mut raw, mut sent) = (OscScanner::default(), Vec::new(), Vec::new(), false);
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = reader.read(&mut buf) {
+            blocks.extend(sc.feed(&buf[..n]));
+            raw.extend_from_slice(&buf[..n]);
+            // first B = hooks live and readline is reading; now type the session
+            if !sent && raw.windows(6).any(|w| w == b"133;B\x07") {
+                sent = true;
+                writer.write_all(b"true\n\nfalse | true\nfalse\necho $_user_pc | cat\nnosuch_tachyon_cmd\nexit\n").unwrap();
+            }
+        }
+        let _ = child.wait();
+
+        let got: Vec<_> = blocks.iter().map(|b| (b.command.as_str(), b.exit_code)).collect();
+        assert_eq!(
+            got,
+            [("true", 0), ("false | true", 0), ("false", 1), ("echo $_user_pc | cat", 0), ("nosuch_tachyon_cmd", 127)],
+            "raw: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert_eq!(blocks[3].output, "kept1"); // the user's PROMPT_COMMAND ran and saw `false`'s status
+        assert!(blocks[4].output.contains("not found"), "{}", blocks[4].output);
+    }
+
     #[test]
     fn osc_first_d_is_handshake_only() {
         let mut sc = OscScanner::default();
@@ -2201,6 +2511,22 @@ mod tests {
     }
 
     // ---- ⌘K / ⌘E helpers ----
+
+    #[test]
+    fn one_line_never_leaves_a_newline() {
+        assert_eq!(one_line("ls -la"), "ls -la");
+        assert_eq!(one_line("cd /tmp\nrm -rf x"), "cd /tmp; rm -rf x");
+        // a backslash continuation is one command, not two: no `; ` inserted
+        assert_eq!(one_line("echo a \\\n  b"), "echo a    b");
+        assert_eq!(one_line("a\r\n\r\nb\n"), "a; b");
+        // the second line is now visible to the danger gate instead of hiding behind line 1
+        assert!(is_dangerous(&one_line("ls\nrm -rf /")));
+        // and the agent parser applies it too
+        assert_eq!(parse_agent_reply("RUN: ls\nrm -rf ~"), AgentAction::Run("ls; rm -rf ~".into()));
+        for s in ["x\ny", "x\r\ny", "x \\\ny"] {
+            assert!(!one_line(s).contains(['\n', '\r']));
+        }
+    }
 
     #[test]
     fn strip_fences_variants() {
