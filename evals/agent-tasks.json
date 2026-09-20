@@ -1,0 +1,81 @@
+[
+  {
+    "id": "git-two-commits",
+    "task": "Initialise a git repository in the current directory and make exactly two commits, each adding a different new file.",
+    "checks": [{ "cmd": "test \"$(git rev-list --count HEAD)\" -eq 2" }, { "cmd": "test \"$(git ls-files | wc -l)\" -ge 2" }],
+    "mock": ["RUN: git init -q", "RUN: echo one > a.txt && git add a.txt && git commit -qm first", "RUN: echo two > b.txt && git add b.txt && git commit -qm second", "DONE: two commits made"]
+  },
+  {
+    "id": "todo-list",
+    "task": "Find which .txt files in this directory contain the string TODO and write just their filenames, one per line, to a file named todo.list.",
+    "setup": { "a.txt": "intro\nTODO: write this\n", "b.txt": "all finished here\n", "c.txt": "x\ny\nTODO later\n" },
+    "checks": [{ "contains": ["todo.list", "a.txt"] }, { "contains": ["todo.list", "c.txt"] }, { "cmd": "! grep -q b.txt todo.list" }],
+    "mock": ["grep -l TODO *.txt > todo.list", "DONE: wrote todo.list"]
+  },
+  {
+    "id": "tarball",
+    "task": "Create a gzipped tarball named src.tar.gz of the src directory, then list the archive's contents to verify it contains 3 files.",
+    "setup": { "src/a.c": "int a;\n", "src/b.c": "int b;\n", "src/c.h": "#pragma once\n" },
+    "checks": [{ "exists": "src.tar.gz" }, { "cmd": "test \"$(tar -tzf src.tar.gz | grep -c '[.][ch]$')\" -eq 3" }],
+    "mock": ["RUN: ```zsh\ntar -czf src.tar.gz src\n```", "run: tar -tzf src.tar.gz", "DONE: archive lists 3 files"]
+  },
+  {
+    "id": "rename-ext",
+    "task": "Rename every .jpeg file in this directory so that it ends in .jpg instead.",
+    "setup": { "cat.jpeg": "1", "dog.jpeg": "2", "my photo.jpeg": "3", "keep.png": "4" },
+    "checks": [{ "exists": "cat.jpg" }, { "exists": "dog.jpg" }, { "exists": "my photo.jpg" }, { "exists": "keep.png" }, { "cmd": "test -z \"$(find . -name '*.jpeg')\"" }],
+    "mock": ["RUN: for f in *.jpeg; do mv \"$f\" \"${f%.jpeg}.jpg\"; done", "RUN: ls", "DONE: renamed 3 files"]
+  },
+  {
+    "id": "csv-sum",
+    "task": "Add up the amount column of sales.csv and write just the resulting number to total.txt.",
+    "setup": { "sales.csv": "item,amount\nwidget,1000\ngadget,200\ngizmo,30\ndoohickey,4\n" },
+    "checks": [{ "cmd": "test \"$(tr -d '[:space:]' < total.txt)\" = 1234" }],
+    "mock": ["RUN: cat ~/sales.csv", "RUN: awk -F, 'NR>1 {s+=$2} END {print s}' sales.csv > total.txt", "DONE: total is 1234"]
+  },
+  {
+    "id": "fix-script",
+    "task": "greet.sh has a syntax error. Fix it so that running `sh greet.sh world` prints exactly: hello world",
+    "setup": { "greet.sh": "echo \"hello $1\n" },
+    "checks": [{ "cmd": "test \"$(sh greet.sh world)\" = 'hello world'" }],
+    "mock": ["RUN: cat greet.sh", "TOOL: fs.write {\"path\":\"greet.sh\"}", "RUN: printf 'echo \"hello $1\"\\n' > greet.sh", "RUN: sh greet.sh world", "DONE: fixed the unterminated quote"]
+  },
+  {
+    "id": "scaffold",
+    "task": "Create the directories app/src, app/tests and app/docs, put an empty file __init__.py in app/src, and create app/README.md containing the word Tachyon.",
+    "checks": [{ "cmd": "test -d app/tests -a -d app/docs" }, { "exists": "app/src/__init__.py" }, { "contains": ["app/README.md", "Tachyon"] }],
+    "mock": ["RUN: mkdir -p app/src app/tests app/docs && touch app/src/__init__.py && echo '# Tachyon' > app/README.md", "DONE: scaffolded app"]
+  },
+  {
+    "id": "biggest-file",
+    "task": "Find the largest file anywhere under the data directory and copy it to biggest.bin in the current directory.",
+    "setup": {
+      "data/a/small.dat": "x",
+      "data/a/medium.dat": "0123456789012345678901234567890123456789",
+      "data/b/big.dat": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+      "data/b/tiny.dat": ""
+    },
+    "checks": [{ "cmd": "cmp -s biggest.bin data/b/big.dat" }],
+    "mock": ["RUN: ls -S data/*/* | head -n 1", "RUN: cp data/b/big.dat biggest.bin", "DONE: copied data/b/big.dat"]
+  },
+  {
+    "id": "json-version",
+    "task": "Read the version field from config.json and write just the version string to a file named VERSION.",
+    "setup": { "config.json": "{\n  \"name\": \"demo\",\n  \"version\": \"2.4.1\",\n  \"private\": true\n}\n" },
+    "checks": [{ "cmd": "test \"$(tr -d '[:space:]' < VERSION)\" = 2.4.1" }],
+    "mock": ["RUN: grep -o '[0-9]*[.][0-9]*[.][0-9]*' config.json > VERSION", "DONE: VERSION is 2.4.1"]
+  },
+  {
+    "id": "log-errors",
+    "task": "Count how many lines of app.log contain ERROR and write that number to errors.txt. Then compress app.log with gzip.",
+    "setup": { "app.log": "INFO boot\nERROR db down\nWARN slow\nERROR db down\nINFO retry\nERROR timeout\n" },
+    "checks": [{ "cmd": "test \"$(tr -d '[:space:]' < errors.txt)\" = 3" }, { "exists": "app.log.gz" }, { "cmd": "test ! -e app.log" }],
+    "mock": ["RUN: grep -c ERROR app.log > errors.txt", "RUN: gzip app.log", "DONE: 3 errors; log compressed"]
+  },
+  {
+    "id": "exec-script",
+    "task": "Create a shell script hello.sh that prints hi, make it executable, and run it to confirm it works.",
+    "checks": [{ "cmd": "test -x hello.sh" }, { "cmd": "test \"$(./hello.sh)\" = hi" }],
+    "mock": ["RUN: printf '#!/bin/sh\\necho hi\\n' > hello.sh", "RUN: chmod +x hello.sh && ./hello.sh", "DONE: hello.sh prints hi"]
+  }
+]
