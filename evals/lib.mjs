@@ -6,7 +6,7 @@
 // are used only in the Authorization header / SDK constructor.
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -76,15 +76,19 @@ export function loadProviders(keylessHint) {
   );
   const only = argValue("--provider");
   if (only) bench = bench.filter((p) => p.id === only);
-  // --model: benchmark a provider against a model other than the one the app is
-  // configured with (copied, so the config object is untouched). One provider
-  // only — a model id means nothing across providers.
-  const model = argValue("--model");
-  if (model && !only) {
-    console.error("--model needs --provider");
+  // --model / --models a,b,c: benchmark a provider against models other than the
+  // one the app is configured with — one bench entry per model, run in order
+  // (copied, so the config object is untouched). One provider only — a model id
+  // means nothing across providers.
+  const models = (argValue("--models") ?? argValue("--model"))
+    ?.split(",")
+    .map((m) => m.trim())
+    .filter(Boolean);
+  if (models && !only) {
+    console.error("--model / --models need --provider");
     process.exit(1);
   }
-  if (model) bench = bench.map((p) => ({ ...p, model }));
+  if (models) bench = bench.flatMap((p) => models.map((model) => ({ ...p, model })));
 
   if (bench.length === 0) {
     console.error(
@@ -212,7 +216,13 @@ export async function pool(items, worker, size = Number(argValue("--concurrency"
 
 // Approximate $/1M tokens [input, output], keyed by MODEL id (a provider can be
 // pointed at any model) — a snapshot; prices drift. Unknown models cost "—".
+// The three Groq entries are the "PRICE PER 1M TOKENS" column of the Production
+// Models table at https://console.groq.com/docs/models, read 2026-09-20
+// (groq.com/pricing renders client-side and serves no table to a plain fetch).
 const PRICES = {
+  "openai/gpt-oss-120b": [0.15, 0.6],
+  "openai/gpt-oss-20b": [0.075, 0.3],
+  "qwen/qwen3.8-27b": [0.8, 4],
   "claude-opus-5": [5, 25],
   "claude-opus-4-8": [5, 25],
   "claude-sonnet-5": [2, 10],
@@ -241,12 +251,24 @@ export function failIfAllErrored(id, errors, total) {
   return true;
 }
 
-// evals/results/<ISO-timestamp>-<name>.json (gitignored; copy one into
-// evals/baseline/ to commit it). ":" → "-" keeps the name portable.
-export function writeArtifact(name, data) {
+// One provider can appear once per model, so the model is part of every label
+// and file name: groq + openai/gpt-oss-120b → groq-openai-gpt-oss-120b.
+export const artifactName = (id, model) => `${id}-${model}`.replace(/[^a-z0-9.]+/gi, "-");
+
+// evals/results/<ISO-timestamp>-<name>.json (gitignored). `promote` also copies
+// it to evals/baseline/<name>.json — the committed artifacts the README block is
+// rendered from (report.mjs). ":" → "-" keeps the name portable. A `data.at`
+// survives, so a --rescore keeps the date the model was actually called.
+// → the artifact as written
+export function writeArtifact(name, { at = new Date().toISOString(), ...data }, promote = false) {
   mkdirSync(DIR + "results", { recursive: true });
-  const at = new Date().toISOString();
   const file = `${DIR}results/${at.replace(/:/g, "-")}-${name}.json`;
-  writeFileSync(file, JSON.stringify({ at, ...data }, null, 2) + "\n");
+  const artifact = { at, ...data };
+  writeFileSync(file, JSON.stringify(artifact, null, 2) + "\n");
   console.error(`wrote ${path.relative(process.cwd(), file)}`);
+  if (promote) {
+    copyFileSync(file, `${DIR}baseline/${name}.json`);
+    console.error(`promoted to evals/baseline/${name}.json`);
+  }
+  return artifact;
 }

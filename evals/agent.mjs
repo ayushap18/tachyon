@@ -8,6 +8,9 @@
 // Usage:
 //   node evals/agent.mjs                       # every keyed provider, every task
 //   node evals/agent.mjs --provider groq --limit 3
+//   node evals/agent.mjs --provider groq --models openai/gpt-oss-120b,openai/gpt-oss-20b
+//   node evals/agent.mjs --baseline evals/baseline/agent-groq-openai-gpt-oss-120b.json   # per-task diff
+//   node evals/agent.mjs --write               # promote to evals/baseline/, re-render the README block
 //   node evals/agent.mjs --mock                # scripted fake model, no key, no network
 //   node evals/agent.mjs --mock --selftest     # …and assert the expected outcomes (CI)
 //
@@ -21,7 +24,8 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import os from "node:os";
 import path from "node:path";
 import { isDangerous } from "./danger.mjs";
-import { DIR, argValue, costUsd, failIfAllErrored, flag, generate, loadProviders, oneLine, pct, sha256, stripFences, usd, writeArtifact } from "./lib.mjs";
+import { DIR, argValue, artifactName, costUsd, failIfAllErrored, flag, generate, loadProviders, oneLine, sha256, stripFences, writeArtifact } from "./lib.mjs";
+import { printBaselineDiff, renderAgent, writeReadme } from "./report.mjs";
 import { AI_AGENT } from "./rust-source.mjs";
 
 const MAX_STEPS = 12; // `for step in 1..=12` in agent_loop
@@ -182,9 +186,21 @@ if (limit > 0) tasks = tasks.slice(0, limit);
 
 const mock = flag("--mock");
 if (flag("--selftest") && !mock) throw new Error("--selftest needs --mock");
+// --write promotes this run over the committed baseline and onto the README:
+// never a partial run, never the scripted mock
+if (flag("--write") && (mock || argValue("--limit"))) {
+  console.error("--write refused with --mock or --limit: the baseline and the README must hold a full, real run");
+  process.exit(1);
+}
 const bench = mock ? [{ id: "mock", model: "scripted" }] : loadProviders("For a keyless run: node evals/agent.mjs --mock");
 
-const rows = [];
+// Baselines get committed to a public repo, and a transcript holds real command
+// output — `ls -l` prints the local account name. Replaced per string value (not
+// on the serialized JSON), so an escape like \n can never be mangled.
+const ME = new RegExp(`\\b${os.userInfo().username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g");
+const scrubUser = (data) => JSON.parse(JSON.stringify(data, (_, v) => (typeof v === "string" ? v.replace(ME, "user") : v)));
+
+const arts = []; // artifact-shaped, one per benchmarked model — what report.mjs renders
 let mockRun;
 for (const p of bench) {
   console.error(`\n=== ${p.id} (${p.model}) — ${tasks.length} tasks ===`);
@@ -207,24 +223,34 @@ for (const p of bench) {
     costUsd: costUsd(p.model, sum("tokensIn"), sum("tokensOut")),
     wallMs: sum("ms"),
   };
-  if (!mock) writeArtifact(`agent-${p.id}`, { harness: "agent", provider: p.id, model: p.model, promptSha256: sha256(AI_AGENT), totals, tasks: runs });
-  failIfAllErrored(p.id, totals.errors, n);
-  const c = totals.costUsd;
-  rows.push(
-    `| ${p.id} | ${p.model} | ${pct(totals.completed, n)} | ${totals.meanSteps.toFixed(1)} | ${pct(totals.invalid, totals.replies)} | ${totals.blocked} | ${Math.round((totals.tokensIn + totals.tokensOut) / n)} | ${usd(c == null ? c : c / n)} | ${(totals.wallMs / 1000).toFixed(1)} s | ${totals.errors} |`,
-  );
+  // a run where every task errored is not a score: keep it for debugging, never promote it
+  const noResult = failIfAllErrored(`${p.id} (${p.model})`, totals.errors, n);
+  // maxSteps / sandbox: the conditions the completion rate was earned under
+  const data = { at: new Date().toISOString(), harness: "agent", provider: p.id, model: p.model, promptSha256: sha256(AI_AGENT), maxSteps: MAX_STEPS, sandbox: HAS_SANDBOX, totals, tasks: runs };
+  // written per model as it finishes, so a later model's failure cannot cost this one
+  arts.push(mock ? data : writeArtifact(`agent-${artifactName(p.id, p.model)}`, scrubUser(data), flag("--write") && !noResult));
 }
 
-console.log(
-  [
-    "",
-    `_${new Date().toISOString().slice(0, 10)} (UTC) · ${tasks.length} multi-step tasks · ${MAX_STEPS}-step cap · auto-approved inside a sandboxed scratch dir_`,
-    "",
-    "| Provider | Model | Tasks completed | mean steps | invalid replies | blocked cmds | tokens/task | est. cost/task | wall time | errors |",
-    "|---|---|---|---|---|---|---|---|---|---|",
-    ...rows,
-  ].join("\n"),
-);
+console.log("\n" + renderAgent(arts));
+
+// ---- --baseline: per-task diff against a committed artifact ----
+const baselinePath = argValue("--baseline");
+if (baselinePath) {
+  const base = JSON.parse(readFileSync(baselinePath, "utf8"));
+  // the same model if this run has it; else the provider's row, with the mismatch noted below
+  const now = arts.find((a) => a.provider === base.provider && a.model === base.model) ?? arts.find((a) => a.provider === base.provider);
+  if (base.harness !== "agent" || !now) {
+    console.error(`--baseline: ${baselinePath} is ${base.harness !== "agent" ? "not an agent.mjs artifact" : `for provider "${base.provider}", which is not in this run`}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`\n${now.provider} (${now.model}) vs baseline ${baselinePath} (${base.model}, ${base.at})`);
+    if (base.promptSha256 !== now.promptSha256) console.log("note: AI_AGENT changed since the baseline");
+    if (base.model !== now.model) console.log("note: model differs from the baseline");
+    printBaselineDiff(base.tasks, now.tasks, (r) => r.completed, (r) => `${r.completed ? "pass" : "FAIL"} (${r.ended}, ${r.steps} steps)`);
+  }
+}
+
+if (flag("--write")) writeReadme();
 
 // ---- --mock --selftest: the loop, parser, sandbox policy and checks, asserted ----
 if (flag("--selftest")) {

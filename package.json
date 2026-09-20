@@ -6,8 +6,9 @@
   "scripts": {
     "tauri": "tauri",
     "eval": "node evals/run.mjs",
-    "eval:selftest": "node evals/run.mjs --safety-local",
+    "eval:selftest": "node evals/run.mjs --safety-local && node evals/report.mjs --check",
     "eval:write": "node evals/run.mjs --write",
+    "eval:readme": "node evals/report.mjs",
     "eval:gate": "node evals/gate.mjs",
     "eval:agent": "node evals/agent.mjs",
     "eval:agent:selftest": "node evals/agent.mjs --mock --selftest"
