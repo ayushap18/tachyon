@@ -14,6 +14,7 @@
 //!     that approves;
 //!   * the token is printed by `/mcp serve status` and nowhere else: no error, response or
 //!     event carries it, and nothing here logs.
+//!
 //! See docs/danger-gate.md → "Threat model: Tachyon as an MCP server".
 
 use super::*;
@@ -957,5 +958,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let gone = ureq::post(&url).timeout(std::time::Duration::from_secs(2)).set("Authorization", &auth).send_string(&ping.to_string());
         assert!(matches!(gone, Err(ureq::Error::Transport(_))));
+    }
+
+    /// `get_context` is the unapproved read surface, so the threat model is only worth
+    /// reading if its field list is exhaustive. `Live::get_context` serialises a whole
+    /// `ShellContext` and adds `shell`, so a field added to that struct silently widens
+    /// what a token holder can read — this fails until the doc names it.
+    #[test]
+    fn get_context_tool_fields_are_documented() {
+        let mut v = serde_json::to_value(ShellContext::default()).unwrap();
+        v["shell"] = "zsh".into();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["branch", "cwd", "dirty", "shell", "shell_pid"]);
+
+        let doc = include_str!("../../docs/danger-gate.md");
+        let at = doc.find("with **no approval**").expect("the unapproved-reads bullet is gone");
+        let bullet = &doc[at..][..doc[at..].find("\n\n").unwrap()];
+        for k in keys {
+            assert!(bullet.contains(k), "danger-gate.md does not name {k}");
+        }
     }
 }

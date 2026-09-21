@@ -183,7 +183,7 @@ pub(crate) fn render_discovery(found: &[LocalRuntime]) -> String {
         let names: Vec<&str> = LOCAL_RUNTIMES.iter().map(|(id, _)| *id).collect();
         return format!(
             "\r\n\x1b[36m[tachyon] no local runtime answered\x1b[0m \x1b[90m(probed {})\x1b[0m\r\n\
-             \x1b[90mstart one, or add any endpoint: /local <id> <base_url> <model> [key]\x1b[0m\r\n",
+             \x1b[90mstart one, or add any endpoint: /local <id> <url> <model> [key]\x1b[0m\r\n",
             names.join(" ")
         );
     }
@@ -202,7 +202,7 @@ pub(crate) fn render_discovery(found: &[LocalRuntime]) -> String {
 
 /// `/local <id> [model]`: probe that one runtime and pick the model to register.
 pub(crate) fn resolve_runtime(probes: &[(&str, &str)], id: &str, model: Option<&str>) -> Result<(String, String), String> {
-    let probe = probes.iter().find(|(pid, _)| *pid == id).ok_or("usage: /local <id> <base_url> <model> [key]")?;
+    let probe = probes.iter().find(|(pid, _)| *pid == id).ok_or("usage: /local <id> <url> <model> [key]")?;
     let rt = discover(&[*probe])
         .pop()
         .ok_or_else(|| format!("{id} is not answering at {} \u{2014} is it running?", probe.1))?;
@@ -350,10 +350,10 @@ mod tests {
         let login = std::collections::BTreeMap::from([("E3_PROBE_API_KEY".to_string(), "k_from_login".to_string())]);
         let env = |name: &str| env_or_login(name, &login);
         let saved = provider("e3-probe", "openai", "", "m", "k_saved");
-        assert_eq!(resolve_key(&saved, &env), ("k_saved".to_string(), "saved"));
+        assert_eq!(resolve_key(&saved, env), ("k_saved".to_string(), "saved"));
         // and with nothing saved the login shell is what rescues the Dock launch
         let bare = provider("e3-probe", "openai", "", "m", "");
-        assert_eq!(resolve_key(&bare, &env), ("k_from_login".to_string(), "env"));
+        assert_eq!(resolve_key(&bare, env), ("k_from_login".to_string(), "env"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! AI command bar + agent gate (⌘K command / ⌘J agent). Ported from
-//! src/main.ts lines 179-385. One panel, two modes, keyed off Overlay::AiBar
-//! (command) vs Overlay::Agent, plus the agent approval gate.
+//! AI command bar + agent gate (⌘K command / ⌘J agent). One panel, two modes,
+//! keyed off Overlay::AiBar (command) vs Overlay::Agent, plus the agent approval
+//! gate.
 //!
 //! SECURITY: this component owns the agent approval gate — the trust boundary.
 //! A proposal (`agent-propose`) resolves ONLY via an explicit Enter (approve) /
@@ -16,7 +16,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::{AppState, Overlay};
-use crate::bridge::{invoke, listen, term_write, NoArgs, WriteArgs};
+use crate::bridge::{invoke, listen, term_write, IdArgs, NoArgs, WriteArgs};
 use crate::complete::{accept_text, list_key, list_open, rows, tab_prefix, wants_models, Ctx, ListOp};
 
 // ---- invoke arg shapes ----
@@ -35,11 +35,6 @@ struct DecideArgs {
 #[derive(Serialize)]
 struct SlashArgs {
     input: String,
-}
-/// one word, so serde's camelCase mapping is a no-op
-#[derive(Serialize)]
-struct IdArgs {
-    id: String,
 }
 
 // ---- response / event shapes ----
@@ -131,7 +126,7 @@ fn err_str(e: JsValue) -> String {
     e.as_string().unwrap_or_else(|| "error".to_string())
 }
 
-/// Mirror of closeAiBar() (main.ts 234-248): clear the bar and drop the overlay.
+/// Clear the bar and drop the overlay.
 fn reset_and_close(
     state: AppState,
     mut input: Signal<String>,

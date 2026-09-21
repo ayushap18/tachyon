@@ -11,7 +11,7 @@ use web_sys::KeyboardEvent;
 
 use crate::ai_bar::AiBar;
 use crate::blocks::BlocksPanel;
-use crate::bridge::{invoke, listen};
+use crate::bridge::{fire, invoke, listen, NoArgs};
 use crate::keymap::{self, Action};
 use crate::palette::Palette;
 use crate::settings::SettingsPanel;
@@ -20,12 +20,10 @@ use crate::terminal::Terminal;
 use crate::theme;
 use crate::vim::VimSearch;
 
-const MAIN_CSS: Asset = asset!("/assets/main.css");
-
 // ---- shared data types ----
 
 /// User settings; seeded from localStorage "tachyon-settings" (partial JSON is
-/// fine — each field defaults, mirroring main.ts's spread over defaults).
+/// fine — each field defaults).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_theme")]
@@ -34,15 +32,25 @@ pub struct Settings {
     pub font: String,
     #[serde(default = "default_size")]
     pub size: u32,
+    /// Window transparency, 40-100. Absent in settings saved before 0.2.9, so the default
+    /// keeps existing users fully opaque.
+    #[serde(default = "default_opacity")]
+    pub opacity: u8,
 }
 
 fn default_theme() -> String { "Tokyo Night".into() }
 fn default_font() -> String { theme::default_font().into() }
 fn default_size() -> u32 { 14 }
+fn default_opacity() -> u8 { 100 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { theme: default_theme(), font: default_font(), size: default_size() }
+        Settings {
+            theme: default_theme(),
+            font: default_font(),
+            size: default_size(),
+            opacity: default_opacity(),
+        }
     }
 }
 
@@ -117,7 +125,7 @@ impl AppState {
     }
 
     /// The ai bar is one panel with two modes. ⌘K/⌘J: if the bar is showing (either
-    /// mode) close it, else open it in the requested mode. Mirrors main.ts K/J.
+    /// mode) close it, else open it in the requested mode.
     pub fn toggle_bar(self, mode: Overlay) {
         let mut ov = self.overlay;
         if matches!(*ov.read(), Overlay::AiBar | Overlay::Agent) {
@@ -140,7 +148,10 @@ impl AppState {
 // ---- invoke arg shape ----
 
 #[derive(Serialize)]
-struct NoArgs {}
+struct ThemeArgs {
+    name: String,
+    opacity: u8,
+}
 
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
@@ -166,23 +177,17 @@ fn load_settings() -> Settings {
         .unwrap_or_default();
     // A font saved on another platform (Menlo on Linux) isn't in this platform's list.
     s.font = theme::resolve_font(&s.font).into();
+    s.opacity = s.opacity.clamp(40, 100);
     s
 }
 
-/// Fire a no-arg native command, ignoring the result. Used for ⌘J abort and ⌘E explain.
-fn fire(cmd: &'static str) {
-    spawn_local(async move {
-        let _ = invoke(cmd, NoArgs {}).await;
-    });
-}
-
-/// Global document keydown → overlay routing (main.ts lines 144-177).
+/// Global document keydown → overlay routing.
 /// Keymap chords route to overlay state; bare Esc closes plain overlays. The ai bar
 /// (command/agent) owns its own Esc — the agent approval gate is the trust
 /// boundary, so this handler never closes AiBar/Agent on Esc.
 /// ⌘E / palette "Explain last error": run the autopsy, then paint the result cyan on the
-/// canvas (mirrors main.ts printing the explanation cyan). Errors are painted too so
-/// nothing is silently dropped. Display-only — never written to the pty.
+/// canvas. Errors are painted too so nothing is silently dropped. Display-only —
+/// never written to the pty.
 pub fn explain_and_paint() {
     spawn_local(async move {
         let text = match invoke("explain_last_error", NoArgs {}).await {
@@ -204,7 +209,7 @@ fn handle_global_key(state: AppState, ev: KeyboardEvent) {
             Action::AiBar => state.toggle_bar(Overlay::AiBar),
             Action::Agent => {
                 if *state.agent_running.read() {
-                    fire("agent_abort"); // agent chord while running = dedicated abort
+                    fire("agent_abort", NoArgs {}); // agent chord while running = dedicated abort
                 } else {
                     state.toggle_bar(Overlay::Agent);
                 }
@@ -248,9 +253,14 @@ pub fn App() -> Element {
                 let _ = ls.set_item("tachyon-settings", &json);
             }
         }
+        // Sole call site: it repaints the engine in the new palette, recolours the native
+        // window backing, and mirrors both to settings.json for the next launch's first frame.
+        let args = ThemeArgs { name: s.theme.clone(), opacity: s.opacity };
+        spawn_local(async move {
+            let _ = invoke("term_set_theme", args).await;
+        });
         // Notify the canvas terminal to re-read font/size from the just-persisted settings.
-        // Fired post-persist so terminal.rs sees current values (mirrors main.ts applySettings
-        // driving term.options.fontFamily/fontSize).
+        // Fired post-persist so terminal.rs sees current values.
         if let Some(win) = web_sys::window() {
             if let Ok(ev) = web_sys::Event::new("tachyon-font") {
                 let _ = win.dispatch_event(&ev);
@@ -268,7 +278,7 @@ pub fn App() -> Element {
 
     // Journal mirror + provider seed + global keybindings — once on mount.
     use_effect(move || {
-        // listener BEFORE seed so no block slips between (main.ts line 652).
+        // listener BEFORE seed so no block slips between.
         let journal = state.journal;
         listen("journal-block", move |payload| {
             if let Ok(mut b) = serde_wasm_bindgen::from_value::<JournalBlock>(payload) {
@@ -317,7 +327,9 @@ pub fn App() -> Element {
     });
 
     rsx! {
-        document::Link { rel: "stylesheet", href: MAIN_CSS }
+        // Inlined, not linked: a stylesheet still in flight when the Terminal mounts lets
+        // fit() measure an unstyled canvas, and the PTY is then born at the wrong size.
+        style { {include_str!("../assets/main.css")} }
         Terminal {}
         StatusBar {}
         VimSearch {}
@@ -325,5 +337,20 @@ pub fn App() -> Element {
         AiBar {}
         BlocksPanel {}
         Palette {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    /// Settings saved before 0.2.9 have no `opacity`. Any default but 100 would make every
+    /// existing user's window see-through the first time they launch the new build.
+    #[test]
+    fn stored_settings_without_opacity_load_opaque() {
+        let old = r#"{"theme":"Nord","font":"Menlo","size":14}"#;
+        assert_eq!(serde_json::from_str::<Settings>(old).unwrap().opacity, 100);
+        let saved = r#"{"theme":"Nord","font":"Menlo","size":14,"opacity":40}"#;
+        assert_eq!(serde_json::from_str::<Settings>(saved).unwrap().opacity, 40);
     }
 }

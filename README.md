@@ -24,13 +24,13 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
-| macOS · Apple Silicon | `Tachyon_0.2.8_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
-| Debian / Ubuntu · x86_64 | `Tachyon_0.2.8_amd64.deb` | `sudo apt install ./Tachyon_0.2.8_amd64.deb` |
-| Linux · x86_64 | `Tachyon_0.2.8_amd64.AppImage` | Make executable, then launch (below). |
+| macOS · Apple Silicon | `Tachyon_0.2.9_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.9_amd64.deb` | `sudo apt install ./Tachyon_0.2.9_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.9_amd64.AppImage` | Make executable, then launch (below). |
 
 ```sh
-chmod +x Tachyon_0.2.8_amd64.AppImage
-./Tachyon_0.2.8_amd64.AppImage
+chmod +x Tachyon_0.2.9_amd64.AppImage
+./Tachyon_0.2.9_amd64.AppImage
 ```
 
 Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
@@ -38,7 +38,7 @@ through apt; AppImage compatibility still depends on the host distribution. If A
 reports a FUSE error, try:
 
 ```sh
-./Tachyon_0.2.8_amd64.AppImage --appimage-extract-and-run
+./Tachyon_0.2.9_amd64.AppImage --appimage-extract-and-run
 ```
 
 Builds are **not signed by Apple**. If macOS blocks the first launch, use **System Settings →
@@ -49,7 +49,7 @@ an update does not ask again. Download `SHA256SUMS` alongside your installer to 
 # Linux: verifies the downloaded installers; skips those you did not download.
 sha256sum --ignore-missing -c SHA256SUMS
 # macOS: compare the printed digest with the corresponding SHA256SUMS entry.
-shasum -a 256 Tachyon_0.2.8_aarch64.dmg
+shasum -a 256 Tachyon_0.2.9_aarch64.dmg
 ```
 
 ### Updating
@@ -270,6 +270,7 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 
 ```
 /keys                              providers, active one, and where each key comes from
+/providers                         same table as /keys
 /key <id> <apikey>                 set a provider's API key
 /use <id> [model]                  switch active provider (+ optional model)
 /model <model>                     set the active provider's model
@@ -281,7 +282,13 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /remove <id>                       remove a provider (/use <id> restores a built-in)
 /route                             which provider+model each task uses (command explain agent)
 /route <task> <id> [model]         route one task; /route <task> off resets it
+/mcp add <name> <url>              add a remote MCP server (see MCP, below)
+/mcp add <name> -- <cmd> [args]    add a local stdio MCP server — Tachyon runs <cmd>
+/mcp remove <name>                 remove an MCP server
+/mcp list                          servers, transport, full command line, and their tools
+/mcp serve on|off|status           let external agents use this terminal (on <port> to pick one)
 /update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
+/help                              this list
 ```
 
 Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Everything non-Anthropic is called
@@ -347,7 +354,7 @@ command, and a call whose name or arguments look destructive is flagged like `rm
 **As a server** — let Claude Code or any other MCP client use this terminal:
 
 ```
-/mcp serve on        # binds 127.0.0.1 only, mints a bearer token
+/mcp serve on        # binds 127.0.0.1 only, mints a bearer token (on <port> to choose)
 /mcp serve status    # prints the URL and a ready-to-paste client config
 /mcp serve off
 ```

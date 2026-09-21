@@ -7,14 +7,15 @@
 //! @tauri-apps/cli 2.11.5): its signatures stop at `timestamp:…\tfile:…`. So 0.2.6 shipped
 //! able to verify a field nothing could produce, and rejected its first real update.
 //! This tool produces it, with the same key, in the same format.
-// ponytail: delete this tool and its workflow step once the Tauri CLI records the version
-// itself — scripts/release.mjs asserts the field either way, so the swap cannot go unnoticed.
 //!
 //! usage: sign-updater <artifact> <version> <pubkey-b64>
 //!   key and password come from TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD,
 //!   the same two secrets the Tauri bundler reads. Writes <artifact>.sig, then verifies it
 //!   against <pubkey-b64> exactly as the updater will, so a wrong key fails HERE, at release
 //!   time, not on a user's machine.
+
+// ponytail: delete this tool and its workflow step once the Tauri CLI records the version
+// itself — scripts/release.mjs asserts the field either way, so the swap cannot go unnoticed.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::io::Cursor;
