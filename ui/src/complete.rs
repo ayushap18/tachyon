@@ -10,11 +10,11 @@
 //! Matching is prefix-only, never subsequence: `/mo` must not offer `/mcp remove`, and a
 //! subsequence match would also shrink Tab's common prefix to uselessness.
 
-/// KEEP IN SYNC BY HAND with SLASH_HELP, src-tauri/src/lib.rs:1879-1901 — separate
-/// crates (ui is deliberately outside the src-tauri workspace), so no test can compare
-/// them. Drift shows up as a row missing from the list, never as a wrong command.
-pub const SLASH_ROWS: [(&str, &str); 19] = [
+/// The form column must match SLASH_HELP in src-tauri/src/lib.rs; the test
+/// `surfaces_agree_with_the_backend` parses that file and fails if they drift.
+pub const SLASH_ROWS: [(&str, &str); 20] = [
     ("/keys", "list providers, active, key source"),
+    ("/providers", "same table as /keys"),
     ("/key <id> <apikey>", "set a provider's API key"),
     ("/use <id> [model]", "switch active provider (+ optional model)"),
     ("/model <model>", "set the active provider's model"),
@@ -30,7 +30,7 @@ pub const SLASH_ROWS: [(&str, &str); 19] = [
     ("/mcp add <name> -- <cmd> [args]", "add a local MCP server (Tachyon will run <cmd>)"),
     ("/mcp remove <name>", "remove an MCP server"),
     ("/mcp list", "list MCP servers and their tools"),
-    ("/mcp serve on|off|status", "let external agents use this terminal"),
+    ("/mcp serve on|off|status", "let external agents use this terminal (on <port> to pick one)"),
     ("/update", "check for a newer Tachyon"),
     ("/help", "this list"),
 ];
@@ -134,18 +134,14 @@ pub fn list_key(key: &str, sel: Option<usize>, n: usize) -> ListOp {
 
 // ---- argument-aware completion ----
 
-/// KEEP IN SYNC BY HAND with LOCAL_RUNTIMES, src-tauri/src/local_models.rs:13-19 — same
-/// rule as SLASH_ROWS: drift costs a missing row, never a wrong command.
+/// Mirrors LOCAL_RUNTIMES in src-tauri/src/local_models.rs — `surfaces_agree_with_the_backend`.
 pub const LOCAL_IDS: [&str; 5] = ["ollama", "lmstudio", "llamacpp", "vllm", "jan"];
 
-/// KEEP IN SYNC BY HAND with Task::ALL, src-tauri/src/lib.rs — same rule as SLASH_ROWS:
-/// drift costs a missing row, never a wrong command.
-// ponytail: a third hand-synced table. The crates are deliberately in separate
-// workspaces, so no test can compare them.
+/// Mirrors Task::name in src-tauri/src/lib.rs — `surfaces_agree_with_the_backend`.
 pub const TASK_IDS: [&str; 3] = ["command", "explain", "agent"];
 
 /// SLASH_ROWS advertises on|off|status; parse_serve also takes `on <port>`, and a port is
-/// never suggestible (mcp_server.rs:500-517).
+/// never suggestible (`parse_serve` in mcp_server.rs).
 const SERVE_WORDS: [&str; 3] = ["on", "off", "status"];
 
 /// What may be suggested for the token under the cursor.
@@ -208,11 +204,11 @@ pub fn spot(input: &str) -> Spot {
         ("url", 0) => at(Slot::Provider { revivable: false }, " <base_url>"),
         ("remove", 0) => at(Slot::Provider { revivable: false }, ""),
         ("local", 0) => at(Slot::Runtime, " [model]"),
-        // THE hazard: run_slash_inner matches [id, url, model, key @ ..] BEFORE [id, model @ ..]
-        // (lib.rs:1727-1747), so position 1 is a model ONLY if this id resolves at its
-        // HARDCODED LOCAL_RUNTIMES port (local_models.rs:196-208). A name in LOCAL_IDS does
-        // not prove that: `/local lmstudio http://localhost:1235/v1 m` registers the name at
-        // a different endpoint, and provider_models then reads THAT base_url — two endpoints
+        // THE hazard: run_slash_inner's local arm matches [id, url, model, key @ ..] BEFORE
+        // [id, model @ ..], so position 1 is a model ONLY if this id resolves at its
+        // HARDCODED LOCAL_RUNTIMES port (`resolve_runtime` in local_models.rs). A name in
+        // LOCAL_IDS does not prove that: `/local lmstudio http://localhost:1235/v1 m` registers
+        // the name at a different endpoint, and provider_models reads THAT base_url — two endpoints
         // we cannot compare, because Ctx must never carry a base_url (non-negotiable).
         // Unprovable here => never offered. The model argument is optional anyway
         // (resolve_runtime picks the first model when it is None), so this costs nothing.
@@ -236,13 +232,16 @@ pub fn spot(input: &str) -> Spot {
 /// of is_invisible, src-tauri/src/lib.rs — ui is outside that workspace; two ids that render
 /// identically but differ by an invisible codepoint means the user accepts the row they can
 /// see and Enter sends the other one), whitespace (run_slash_inner splits on it, so it could
-/// never round-trip) and anything over 64 chars. DROP, never strip: a mangled id is a wrong id.
+/// never round-trip), `<[|` (fixed_prefix reads them as the placeholder token, so the row
+/// they build is one accept_text can only answer None for — an inert row the user presses
+/// Enter on twice) and anything over 64 chars. DROP, never strip: a mangled id is a wrong id.
 pub fn safe_row(s: &str) -> bool {
     !s.is_empty()
         && s.chars().count() <= 64
         && !s.chars().any(|c| {
             c.is_control()
                 || c.is_whitespace()
+                || matches!(c, '<' | '[' | '|')
                 || matches!(
                     c,
                     '\u{00AD}'
@@ -277,7 +276,7 @@ pub fn arg_rows(input: &str, cx: &Ctx) -> Vec<(String, &'static str)> {
         Slot::Provider { revivable } => {
             let mut v = cx.providers.clone();
             // every mutator but use_provider routes through find_mut and errors on a hidden
-            // id (lib.rs:785-802), so offering one there would teach a guaranteed error
+            // id (`find_mut` in lib.rs), so offering one there would teach a guaranteed error
             if revivable {
                 v.extend(cx.hidden.iter().cloned());
             }
@@ -379,14 +378,14 @@ mod tests {
             SLASH_ROWS.iter().map(|(f, _)| f.split(' ').next().unwrap()).collect();
         verbs.sort_unstable();
         verbs.dedup();
-        // the arms of run_slash_inner, lib.rs:1938-2083, plus `/update` which run_slash
-        // peels off first; the `providers` alias is deliberately absent (one row per
-        // thing, /keys already shows it)
+        // the arms of run_slash_inner in lib.rs, plus `/update` which run_slash peels off
+        // first. `/providers` is an alias the parser accepts, so it is listed like any other
+        // verb — an accepted command the completer denies is worse than a duplicate row.
         assert_eq!(
             verbs,
             [
-                "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models", "/remove",
-                "/route", "/update", "/url", "/use"
+                "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models", "/providers",
+                "/remove", "/route", "/update", "/url", "/use"
             ]
         );
     }
@@ -664,11 +663,96 @@ mod tests {
             // the Cf blocks a hand-written four-range list kept missing: two ids that paint
             // identically must not both be offerable
             "a\u{061C}b", "a\u{00AD}b", "a\u{2060}b", "a\u{E0041}b", "\u{FFF9}a\u{FFFB}",
+            // fixed_prefix's placeholder markers: a candidate carrying one builds an
+            // unacceptable row (every_listed_row_is_acceptable)
+            "gpt|4", "a<b>", "my[srv]",
         ] {
             assert!(!safe_row(bad), "{bad:?}");
         }
         assert!(safe_row("groq"));
         assert!(safe_row("llama3.2:8b"));
+        assert!(safe_row("qwen/qwen3.8-27b"));
+    }
+
+    /// A row the list offers and Enter cannot accept is worse than no row: the bar clears
+    /// the selection, the next Enter submits the half-typed text, and `/model gp` writes
+    /// `gp` as the active provider's model. Nothing listed may answer None.
+    #[test]
+    fn every_listed_row_is_acceptable() {
+        let cx = Ctx {
+            active: "groq".into(),
+            providers: vec!["groq".into(), "gemini".into(), "gpt|4".into()],
+            hidden: vec!["a<b>".into()],
+            mcp: vec!["fs".into(), "my[srv]".into()],
+            models: Some(("groq".into(), vec!["gpt|4".into(), "ok-model".into(), "ok-2".into()])),
+        };
+        let mut checked = 0;
+        for input in ["/model ", "/model g", "/use ", "/key ", "/mcp remove ", "/route command "] {
+            for (row, _) in arg_rows(input, &cx) {
+                assert!(accept_text(&row, input).is_some(), "{input} -> {row} cannot be accepted");
+                checked += 1;
+            }
+        }
+        assert!(checked > 5, "the loop went vacuous: only {checked} rows");
+    }
+
+    /// The three tables above mirror declarations in the other crate. ui is deliberately
+    /// outside the src-tauri workspace so nothing links them — but the source is on disk and
+    /// all three are `const`s, so a drift is a text comparison away. Three releases of
+    /// hand-syncing produced four stale line numbers; this is what replaced the prose.
+    #[test]
+    fn surfaces_agree_with_the_backend() {
+        const LIB: &str = include_str!("../../src-tauri/src/lib.rs");
+        const LOCAL: &str = include_str!("../../src-tauri/src/local_models.rs");
+
+        fn between<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+            let rest = src.split_once(open).unwrap_or_else(|| panic!("`{open}` is gone")).1;
+            rest.split_once(close).unwrap().0
+        }
+
+        // each help line is `\x1b[36m<form>\x1b[0m<description>`, written as escapes in the source
+        let help = between(LIB, "const SLASH_HELP: &str = concat!(", "\n);");
+        let mut forms: Vec<&str> =
+            help.split("\\x1b[36m").skip(1).map(|s| s.split("\\x1b[0m").next().unwrap()).collect();
+        let mut rows: Vec<&str> = SLASH_ROWS.iter().map(|(f, _)| *f).collect();
+        forms.sort_unstable();
+        rows.sort_unstable();
+        assert_eq!(forms, rows, "SLASH_HELP and SLASH_ROWS have drifted");
+
+        // The README is the fourth surface and was the only one nothing read. Its block is a
+        // fenced form/description table, two-or-more spaces between the columns.
+        const RM: &str = include_str!("../../README.md");
+        let mut readme: Vec<&str> = between(RM, "```\n/keys", "```")
+            .lines()
+            .filter(|l| l.starts_with('/'))
+            .map(|l| l.split("  ").next().unwrap().trim())
+            .collect();
+        readme.push("/keys"); // consumed by the opening delimiter
+        readme.sort_unstable();
+        assert_eq!(readme, rows, "README.md and SLASH_ROWS have drifted");
+
+        let runtimes = between(LOCAL, "LOCAL_RUNTIMES: &[(&str, &str)] = &[", "];");
+        let ids: Vec<&str> = runtimes
+            .lines()
+            .filter_map(|l| l.split_once("(\""))
+            .map(|(_, id)| id.split('"').next().unwrap())
+            .collect();
+        assert_eq!(ids, LOCAL_IDS, "LOCAL_RUNTIMES and LOCAL_IDS have drifted");
+
+        let arms = between(LIB, "fn name(self) -> &'static str {", "}");
+        let names: Vec<&str> =
+            arms.split("=> \"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+        assert_eq!(names, TASK_IDS, "Task::name and TASK_IDS have drifted");
+    }
+
+    /// The port lives in the description column. In the form column `on [port]` would move
+    /// fixed_prefix's cut to `/mcp serve on`, so accepting the row would pick `on` for the user.
+    #[test]
+    fn serve_port_is_described_not_in_the_form() {
+        let (form, desc) = SLASH_ROWS.iter().find(|(f, _)| f.starts_with("/mcp serve")).unwrap();
+        assert!(desc.contains("<port>"), "{desc}");
+        assert!(!form.contains("port"), "{form}");
+        assert_eq!(accept_text(form, "/mcp s").as_deref(), Some("/mcp serve "));
     }
 
     #[test]

@@ -1,19 +1,14 @@
-/* Theme tokens — defaults (Tokyo Night); overridden per-theme at runtime by
-   theme::apply_theme (mirrors main.ts applySettings). */
+/* The colour tokens (--bg, --fg, --accent, --surface, --surface-alt, --border, --muted,
+   --ok, --err) are set on :root by theme::apply_theme. They are deliberately NOT defaulted
+   here: a copy of one theme's palette in this file is a second source of truth, and it is
+   what painted the first frame in a theme the user had not chosen. */
 :root {
-  --bg: #16161e;
-  --fg: #c0caf5;
-  --accent: #7aa2f7;
-  --surface: #1a1b26;
-  --surface-alt: #24283b;
-  --border: #2a2e42;
-  --muted: #7b849c;
-  --ok: #9ece6a;
-  --err: #f7768e;
   --status-bar-height: 26px;
   --terminal-inset: 8px;
 }
 
+/* Transparent, not var(--bg): the native window carries the theme colour (and the
+   user's opacity), so the page must not composite a second layer over it. */
 html,
 body {
   margin: 0;
@@ -21,7 +16,7 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: var(--bg);
+  background: transparent;
 }
 
 #main {
@@ -228,6 +223,10 @@ canvas#term {
 
 #settings input {
   width: 52px;
+}
+
+#settings input[type="range"] {
+  width: 110px;
 }
 
 /* Command palette (⌘P) */
@@ -535,6 +534,17 @@ canvas#term {
 }
 #status-vim.visual {
   color: var(--ok);
+}
+
+/* Update pill — a background check found a newer release. Quiet on purpose: no animation,
+   no colour that competes with the vim indicator. */
+#status-update {
+  color: var(--accent);
+  cursor: pointer;
+}
+#status-update .note,
+#status-update .skip {
+  color: var(--muted);
 }
 
 /* Vim search input (/) — docked above the status bar */

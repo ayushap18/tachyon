@@ -39,22 +39,32 @@ struct ClipArgs {
     text: String,
 }
 
+/// `{ id }` — a provider id. One word, so serde's camelCase mapping is a no-op.
+#[derive(Serialize)]
+pub struct IdArgs {
+    pub id: String,
+}
+
+/// Invoke a native command and drop its result. For the calls where a failure has
+/// nothing to report and nothing to retry; anything that inspects the result calls
+/// `invoke` directly.
+pub fn fire<T: Serialize + 'static>(cmd: &'static str, args: T) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = invoke(cmd, args).await;
+    });
+}
+
 /// Copy `text` to the system clipboard via the native `clipboard_set` command
 /// (reliable inside the webview, unlike navigator.clipboard). Fire-and-forget.
 pub fn clipboard_write(text: &str) {
-    let text = text.to_string();
-    wasm_bindgen_futures::spawn_local(async move {
-        let _ = invoke("clipboard_set", ClipArgs { text }).await;
-    });
+    fire("clipboard_set", ClipArgs { text: text.to_string() });
 }
 
 /// Paint `text` onto the canvas via the native display-only `term_write`
 /// (⌘E explanation, agent narrative, slash results). NEVER touches the pty —
 /// nothing painted this way is sent to the shell. Fire-and-forget.
 pub fn term_write(text: String) {
-    wasm_bindgen_futures::spawn_local(async move {
-        let _ = invoke("term_write", TextArgs { text }).await;
-    });
+    fire("term_write", TextArgs { text });
 }
 
 /// Invoke a Tauri command. `args` is serialized to a JS object (its fields

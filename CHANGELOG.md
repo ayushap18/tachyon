@@ -4,6 +4,69 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.9 — 2026-09-22
+
+### Performance
+- **Scrolling while a command runs no longer drags.** Two causes, both measured on a 200x50
+  grid with 4000 lines of history before anything was changed:
+  - A full frame cost 127 bytes and one heap allocation per cell as JSON objects. Cells now
+    travel as tuples with packed colours: **1,270,609 → 310,795 bytes per full frame (31 B per
+    cell)**, and an unchanged damage scan went from **10,000 allocations to zero** and from
+    247 µs to 111 µs. Both are enforced by tests.
+  - The PTY reader held the engine lock while serialising and emitting each frame, so a scroll
+    queued behind a command's output. Frames are now emitted outside that lock by one painter
+    thread that coalesces to at most one repaint per 8 ms; an ordering lock keeps frames in
+    diff order, and the reader never waits on a frame being serialised.
+- Snapping back to the bottom on a keypress sent the whole grid (480 of 480 cells in the test
+  leg); it now sends the diff (14).
+- The painter sets the canvas font and colour once per run of same-styled cells, not once per
+  glyph, and the vim grid view is built on demand instead of on every frame.
+- The status bar's `lsof`/`git` probes ran on the async runtime: four concurrent calls against a
+  wedged `git` took 8.5 s, fully serial. They now run on the blocking pool.
+- Grid size is clamped by area, not just per dimension: a hostile 1000x1000 request was a
+  123 MB frame, and is now capped at 60,000 cells.
+
+### Fixed
+- **Startup showed the wrong colours, and the shell started at the wrong size.**
+  - The window had no native background and the stylesheet was injected only after the 1.1 MB
+    wasm compiled, so launch was a blank page. The native window is now painted in your saved
+    theme before the webview exists, and the CSS is inline.
+  - Because the stylesheet had not loaded when the canvas was measured, the shell was spawned
+    at the browser-default 300x150 canvas — about 35x8 — and reflowed a moment later. It is now
+    measured at its real size first.
+  - The cursor was a hardcoded Tokyo Night grey in every theme: the engine computed a per-theme
+    cursor colour and never sent it. It is sent now, and a test forbids hardcoded theme colours
+    outside the two theme tables.
+  - The first launch after upgrading may still flash dark once; the saved-theme file it reads
+    is written the first time 0.2.9 applies your theme.
+- `/update` said "latest version" when the check had in fact **failed**. It now says it could
+  not reach the update server and links the download page.
+- Two quick ⌘U presses could race the bundle swap; the install is single-flight.
+- Slash-command surfaces disagreed in eight places (usage strings, `/mcp serve on [port]`,
+  `<url>` vs `<base_url>`, a catch-all error that omitted `serve`). A test in each crate now
+  parses the other crate's source, so the parsers, `/help`, the completer and the README cannot
+  drift apart silently.
+
+### Added
+- **Window transparency.** An Opacity slider in Settings (40–100%, default 100%, live preview).
+  Default-background cells become see-through; coloured backgrounds, selections and all text
+  stay opaque. **The approval bar and all chrome stay fully opaque at every setting** — a
+  security control must never be hard to read — and a test enforces it. A transparent terminal
+  shows what is behind it in screen shares.
+- Updater: a background check that never downloads or installs anything, a quiet status-bar
+  indicator when an update exists, a real download percentage, failure messages that say what
+  to do, and skip-this-version. Release notes come from an unsigned manifest, so they are
+  sanitised and capped before display. The update check no longer exists on the IPC surface at
+  all; the backend emits an event instead.
+
+### Security
+- Found by the adversarial pass on this release's own performance work: once frames were
+  emitted outside the engine lock, nothing ordered them, so a resize racing a coalesced frame
+  could deliver frames out of diff order — including the frame that paints an approval
+  proposal. Fixed with the ordering lock above before release.
+- The update manifest's `version` string reached the status bar unsanitised while its `notes`
+  were capped; both now go through the same sanitiser.
+
 ## 0.2.8 — 2026-09-21
 
 ### Fixed

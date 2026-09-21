@@ -106,6 +106,15 @@ test('a signature that does not record the release version blocks publication', 
   result = run(true);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /does not record version:0\.2\.1/);
+  // minisign does not cover the untrusted comment, so a version: field there proves nothing
+  // and must not satisfy the check — the plugin reads the trusted line only.
+  const untrusted = Buffer.from(
+    'untrusted comment: x\tversion:0.2.1\nRUTest\ntrusted comment: timestamp:1\tfile:Tachyon.app.tar.gz\nsig\n',
+  ).toString('base64');
+  fs.writeFileSync(path.join(source, 'Tachyon.app.tar.gz.sig'), untrusted);
+  result = run(true);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not record version:0\.2\.1/);
 });
 
 test('README installer names carry the shipped version', () => {

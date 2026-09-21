@@ -13,9 +13,6 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, KeyboardEvent};
 use crate::bridge::{invoke, listen, NoArgs, WriteArgs};
 
 const FONT_PX: f64 = 14.0;
-const DEFAULT_FG: [u8; 3] = [0xc0, 0xc6, 0xc6];
-const DEFAULT_BG: [u8; 3] = [0x16, 0x16, 0x1e];
-const CURSOR_COLOR: [u8; 3] = [0xc0, 0xc6, 0xc6];
 
 // ---- grid-damage contract (mirrors src-tauri/src/engine.rs) ----
 
@@ -23,12 +20,35 @@ const CURSOR_COLOR: [u8; 3] = [0xc0, 0xc6, 0xc6];
 struct Cursor {
     line: u16,
     col: u16,
-    #[allow(dead_code)]
-    shape: String,
+    color: [u8; 3],
     visible: bool,
 }
 
+/// The wire shape of a cell: [line, col, ch, fg, bg, flags], with the colours packed into a
+/// u32 and bold/italic/inverse/underline into one bitfield. See the `Serialize` impl in
+/// src-tauri/src/engine.rs — the two must change together.
+#[derive(Deserialize)]
+struct WireCell(u16, u16, String, u32, u32, u8);
+
+impl From<WireCell> for Cell {
+    fn from(w: WireCell) -> Self {
+        let unpack = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        Cell {
+            line: w.0,
+            col: w.1,
+            ch: w.2,
+            fg: unpack(w.3),
+            bg: unpack(w.4),
+            bold: w.5 & 1 != 0,
+            italic: w.5 & 2 != 0,
+            inverse: w.5 & 4 != 0,
+            underline: w.5 & 8 != 0,
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
+#[serde(from = "WireCell")]
 struct Cell {
     line: u16,
     col: u16,
@@ -51,13 +71,13 @@ struct GridDamage {
     cells: Vec<Cell>,
 }
 
-fn blank_cell() -> Cell {
+fn blank_cell(bg: [u8; 3], fg: [u8; 3]) -> Cell {
     Cell {
         line: 0,
         col: 0,
         ch: " ".into(),
-        fg: DEFAULT_FG,
-        bg: DEFAULT_BG,
+        fg,
+        bg,
         bold: false,
         italic: false,
         inverse: false,
@@ -75,6 +95,17 @@ struct Term {
     cell_h: f64,
     cols: u16,
     rows: u16,
+    /// The geometry `fit` last measured, which is what the native side was asked for.
+    /// `cols`/`rows` above are what came back, and the native area clamp may have cut them —
+    /// comparing a fresh fit against those would make every resize event look like a change
+    /// and re-send pty_resize 60x a second for the whole drag.
+    asked: (u16, u16),
+    /// The active theme's terminal background and foreground. `bg` is the colour the
+    /// native window is painted, so cells carrying it are cleared rather than filled.
+    bg: [u8; 3],
+    fg: [u8; 3],
+    /// Selection tint, drawn translucent over the cells it covers.
+    accent: [u8; 3],
     buf: Vec<Cell>,
     cursor: Cursor,
     /// Mouse text selection as (anchor, focus) cells, each (row, col). None = no selection.
@@ -134,18 +165,52 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
     ])
 }
 
-/// The active theme's terminal background, read from the `--bg` CSS variable that
-/// theme::apply_theme sets on :root. Used to fill the full canvas so the sub-cell
-/// margin (and any resize flash) matches the theme instead of a hardcoded color.
-fn doc_bg() -> [u8; 3] {
-    web_sys::window()
-        .and_then(|w| {
-            let el = w.document()?.document_element()?;
-            w.get_computed_style(&el).ok().flatten()
+/// The saved theme's terminal (background, foreground) as canvas bytes. Read from the
+/// theme table rather than the computed `--bg`, which is unset until app.rs's first effect.
+fn theme_rgb() -> ([u8; 3], [u8; 3], [u8; 3]) {
+    let t = crate::theme::tokens(&settings_theme());
+    let rgb = |h| parse_hex(h).unwrap_or_default();
+    (rgb(t.bg), rgb(t.fg), rgb(t.accent))
+}
+
+/// Maximal spans of adjacent cells sharing a font and a fill colour, as half-open
+/// `(start, end)` column ranges.
+fn style_runs(row: &[Cell]) -> Vec<(usize, usize)> {
+    let key = |c: &Cell| (c.italic, c.bold, if c.inverse { c.bg } else { c.fg });
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < row.len() {
+        let k = key(&row[start]);
+        let mut end = start + 1;
+        while end < row.len() && key(&row[end]) == k {
+            end += 1;
+        }
+        runs.push((start, end));
+        start = end;
+    }
+    runs
+}
+
+/// Trailing-trimmed row strings of a visible buffer (mirrors xterm translateToString(true)).
+fn rows_text(buf: &[Cell], rows: u16, cols: u16) -> Vec<String> {
+    let cols = cols as usize;
+    (0..rows as usize)
+        .map(|r| {
+            let mut s = String::with_capacity(cols);
+            for c in 0..cols {
+                if let Some(cell) = buf.get(r * cols + c) {
+                    s.push_str(&cell.ch);
+                }
+            }
+            s.trim_end().to_string()
         })
-        .and_then(|s| s.get_property_value("--bg").ok())
-        .and_then(|v| parse_hex(&v))
-        .unwrap_or(DEFAULT_BG)
+        .collect()
+}
+
+/// Grid size for a canvas box: whole cells only, and never zero (a PTY rejects a 0 dimension).
+fn grid_dims(w: f64, h: f64, cell_w: f64, cell_h: f64) -> (u16, u16) {
+    let n = |px: f64, cell: f64| (px / cell).floor().max(1.0) as u16;
+    (n(w, cell_w), n(h, cell_h))
 }
 
 /// Row-major linear selection text over trailing-trimmed row strings, between
@@ -206,14 +271,12 @@ impl Term {
         let _ = self.ctx.scale(self.dpr, self.dpr);
         self.ctx.set_text_baseline("top");
         self.clear();
-        let cols = (w / self.cell_w).floor().max(1.0) as u16;
-        let rows = (h / self.cell_h).floor().max(1.0) as u16;
-        (cols, rows)
+        self.asked = grid_dims(w, h, self.cell_w, self.cell_h);
+        self.asked
     }
 
     fn clear(&self) {
-        self.ctx.set_fill_style_str(&css(doc_bg()));
-        self.ctx.fill_rect(
+        self.ctx.clear_rect(
             0.0, 0.0,
             self.canvas.width() as f64 / self.dpr,
             self.canvas.height() as f64 / self.dpr,
@@ -223,7 +286,7 @@ impl Term {
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        self.buf = vec![blank_cell(); cols as usize * rows as usize];
+        self.buf = vec![blank_cell(self.bg, self.fg); cols as usize * rows as usize];
         self.clear();
     }
 
@@ -242,7 +305,12 @@ impl Term {
         self.ctx.rect(0.0, y, last_x + last_w, h);
         self.ctx.clip();
 
-        // Adjacent equal backgrounds are one fill, so an ordinary row is cheap.
+        // Adjacent equal backgrounds are one fill, so an ordinary row is cheap. A run in the
+        // theme background is cleared instead: the native window already carries that colour,
+        // at the user's opacity, and filling it would composite a second opaque layer.
+        // ponytail: this keys on the colour, so an explicit background that happens to equal
+        // the theme's (ANSI black under Matrix) also goes see-through. Upgrade path is an
+        // is_default flag on the wire cell.
         let start = line as usize * self.cols as usize;
         let row = &self.buf[start..start + self.cols as usize];
         let background = |c: &Cell| if c.inverse { c.fg } else { c.bg };
@@ -255,27 +323,45 @@ impl Term {
             }
             let (x, _, _, _) = self.cell_px(col as u16, line);
             let (ex, _, ew, _) = self.cell_px((end - 1) as u16, line);
-            self.ctx.set_fill_style_str(&css(bg));
-            self.ctx.fill_rect(x, y, ex + ew - x, h);
+            if bg == self.bg {
+                self.ctx.clear_rect(x, y, ex + ew - x, h);
+            } else {
+                self.ctx.set_fill_style_str(&css(bg));
+                self.ctx.fill_rect(x, y, ex + ew - x, h);
+            }
             col = end;
         }
-        for (col, cell) in row.iter().enumerate() {
-            let (x, _, w, _) = self.cell_px(col as u16, line);
-            let fg = if cell.inverse { cell.bg } else { cell.fg };
-            if cell.ch != " " && !cell.ch.is_empty() {
-                let font = format!(
-                    "{}{}{}px {}",
-                    if cell.italic { "italic " } else { "" },
-                    if cell.bold { "bold " } else { "" },
-                    self.font_px, self.font_family,
-                );
-                self.ctx.set_font(&font);
-                self.ctx.set_fill_style_str(&css(fg));
-                let _ = self.ctx.fill_text(&cell.ch, x, y);
+        // set_font reparses a CSS font string, so the four variants are built once per row
+        // and the canvas state is set per run of same-styled cells, not per glyph.
+        let fonts: [String; 4] = std::array::from_fn(|i| {
+            format!(
+                "{}{}{}px {}",
+                if i & 2 != 0 { "italic " } else { "" },
+                if i & 1 != 0 { "bold " } else { "" },
+                self.font_px, self.font_family,
+            )
+        });
+        let (mut last_font, mut last_fg) = (usize::MAX, None);
+        for (start, end) in style_runs(row) {
+            let head = &row[start];
+            let f = (usize::from(head.italic) << 1) | usize::from(head.bold);
+            let fg = if head.inverse { head.bg } else { head.fg };
+            if f != last_font {
+                self.ctx.set_font(&fonts[f]);
+                last_font = f;
             }
-            if cell.underline {
+            if last_fg != Some(fg) {
                 self.ctx.set_fill_style_str(&css(fg));
-                self.ctx.fill_rect(x, y + h - 1.0, w, 1.0);
+                last_fg = Some(fg);
+            }
+            for (col, cell) in (start..end).zip(&row[start..end]) {
+                let (x, _, w, _) = self.cell_px(col as u16, line);
+                if cell.ch != " " && !cell.ch.is_empty() {
+                    let _ = self.ctx.fill_text(&cell.ch, x, y);
+                }
+                if cell.underline {
+                    self.ctx.fill_rect(x, y + h - 1.0, w, 1.0);
+                }
             }
         }
         self.ctx.restore();
@@ -294,7 +380,7 @@ impl Term {
         self.ctx.begin_path();
         self.ctx.rect(x, y, w, h);
         self.ctx.clip();
-        self.ctx.set_fill_style_str(&css(CURSOR_COLOR));
+        self.ctx.set_fill_style_str(&css(self.cursor.color));
         self.ctx.fill_rect(x, y, w, h);
         if let Some(i) = self.idx(line, col) {
             let cell = &self.buf[i];
@@ -315,32 +401,18 @@ impl Term {
         (row.min(self.rows.saturating_sub(1)), col.min(self.cols.saturating_sub(1)))
     }
 
-    /// Trailing-trimmed row strings of the visible buffer (for selection extraction).
-    fn rows_text(&self) -> Vec<String> {
-        (0..self.rows)
-            .map(|r| {
-                let mut s = String::with_capacity(self.cols as usize);
-                for c in 0..self.cols {
-                    if let Some(i) = self.idx(r, c) {
-                        s.push_str(&self.buf[i].ch);
-                    }
-                }
-                s.trim_end().to_string()
-            })
-            .collect()
-    }
-
     /// Extract the current selection's text (None if nothing selected).
     fn selection_text(&self) -> Option<String> {
         let (a, b) = self.sel?;
-        Some(linear_selection(&self.rows_text(), a, b))
+        Some(linear_selection(&rows_text(&self.buf, self.rows, self.cols), a, b))
     }
 
     /// Overlay a translucent highlight on the cells inside the linear selection.
     fn overlay_selection(&self) {
         let Some((a, b)) = self.sel else { return };
         let (s, e) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { (a, b) } else { (b, a) };
-        self.ctx.set_fill_style_str("rgba(120,150,220,0.35)");
+        let [r, g, b] = self.accent;
+        self.ctx.set_fill_style_str(&format!("rgba({r},{g},{b},0.35)"));
         for r in s.0..=e.0 {
             let sc = if r == s.0 { s.1 } else { 0 };
             let ec = if r == e.0 { e.1 } else { self.cols.saturating_sub(1) };
@@ -386,7 +458,6 @@ impl Term {
         self.cursor = d.cursor;
         APP_CURSOR.with(|a| a.set(d.application_cursor));
         self.draw_cursor();
-        self.publish();
     }
 
     /// Change the font (from a settings update) and re-measure the cell box. The caller
@@ -397,32 +468,6 @@ impl Term {
         self.ctx.set_font(&format!("{}px {}", self.font_px, self.font_family));
         self.cell_w = self.ctx.measure_text("M").map(|m| m.width()).unwrap_or(px * 0.6).max(1.0);
         self.cell_h = (px * 1.2).round();
-    }
-
-    /// Publish a read-only snapshot of the visible grid for the vim module.
-    /// Vim navigation follows the currently painted viewport.
-    fn publish(&self) {
-        let mut lines = Vec::with_capacity(self.rows as usize);
-        for r in 0..self.rows {
-            let mut s = String::with_capacity(self.cols as usize);
-            for c in 0..self.cols {
-                if let Some(i) = self.idx(r, c) {
-                    s.push_str(&self.buf[i].ch);
-                }
-            }
-            lines.push(s.trim_end().to_string());
-        }
-        GRID.with(|g| {
-            *g.borrow_mut() = GridView {
-                cols: self.cols,
-                rows: self.rows,
-                cell_w: self.cell_w,
-                cell_h: self.cell_h,
-                cursor_line: self.cursor.line,
-                cursor_col: self.cursor.col,
-                lines,
-            };
-        });
     }
 }
 
@@ -442,12 +487,28 @@ pub struct GridView {
 }
 
 thread_local! {
-    static GRID: RefCell<GridView> = RefCell::new(GridView::default());
+    // The live terminal, so the vim module can read the painted viewport on demand.
+    static TERM: RefCell<Option<Rc<RefCell<Term>>>> = const { RefCell::new(None) };
 }
 
-/// Snapshot the current visible grid. Cheap enough (a handful of KB) to clone per keypress.
+/// Snapshot the current visible grid. Built on demand — vim navigation follows the
+/// currently painted viewport. Returns the default if the terminal is mid-repaint.
 pub fn grid_view() -> GridView {
-    GRID.with(|g| g.borrow().clone())
+    TERM.with(|slot| {
+        let Ok(slot) = slot.try_borrow() else { return GridView::default() };
+        let Some(term) = slot.as_ref().and_then(|t| t.try_borrow().ok()) else {
+            return GridView::default();
+        };
+        GridView {
+            cols: term.cols,
+            rows: term.rows,
+            cell_w: term.cell_w,
+            cell_h: term.cell_h,
+            cursor_line: term.cursor.line,
+            cursor_col: term.cursor.col,
+            lines: rows_text(&term.buf, term.rows, term.cols),
+        }
+    })
 }
 
 /// Batch wheel events at display cadence, and wait for each native scroll to
@@ -536,7 +597,7 @@ fn encode_key(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Option<Stri
 // ---- invoke argument shapes ----
 
 #[derive(Serialize)]
-struct SpawnArgs {
+struct ResizeArgs {
     rows: u16,
     cols: u16,
 }
@@ -551,10 +612,6 @@ struct SpawnThemeArgs {
 #[derive(Serialize)]
 struct TypedArgs {
     line: String,
-}
-#[derive(Serialize)]
-struct ThemeArgs {
-    name: String,
 }
 #[derive(Serialize)]
 struct ScrollArgs {
@@ -582,8 +639,9 @@ fn win() -> web_sys::Window {
 fn refit(term: &Rc<RefCell<Term>>) {
     let (cols, rows, changed) = {
         let mut t = term.borrow_mut();
+        let prev = t.asked;
         let (cols, rows) = t.fit(); // resizes the backing store, which CLEARS the canvas
-        let changed = cols != t.cols || rows != t.rows;
+        let changed = (cols, rows) != prev;
         t.redraw(); // repaint current content so a no-grid-change resize doesn't blank the screen
         (cols, rows, changed)
     };
@@ -591,7 +649,7 @@ fn refit(term: &Rc<RefCell<Term>>) {
     // full grid-damage it emits then repaints the new dimensions.
     if changed {
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
+            let _ = invoke("pty_resize", ResizeArgs { rows, cols }).await;
         });
     }
 }
@@ -630,6 +688,7 @@ fn setup(mut keys_loaded: Signal<bool>) {
         .unwrap_or(font_px * 0.6)
         .max(1.0);
     let cell_h = (font_px * 1.2).round();
+    let (bg, fg, accent) = theme_rgb();
 
     let term = Rc::new(RefCell::new(Term {
         ctx,
@@ -641,16 +700,21 @@ fn setup(mut keys_loaded: Signal<bool>) {
         cell_h,
         cols: 0,
         rows: 0,
+        asked: (0, 0),
+        bg,
+        fg,
+        accent,
         buf: Vec::new(),
         cursor: Cursor {
             line: 0,
             col: 0,
-            shape: "block".into(),
+            color: fg,
             visible: false,
         },
         sel: None,
         selecting: false,
     }));
+    TERM.with(|slot| *slot.borrow_mut() = Some(term.clone()));
 
     // --- grid-damage listener ---
     {
@@ -670,7 +734,7 @@ fn setup(mut keys_loaded: Signal<bool>) {
             let row = (t.cursor.line + 1).min(t.rows.saturating_sub(1));
             let (x, y, _, _) = t.cell_px(0, row);
             t.ctx.set_font(&format!("{}px {}", t.font_px, t.font_family));
-            t.ctx.set_fill_style_str(&css([0xff, 0x6b, 0x6b]));
+            t.ctx.set_fill_style_str(crate::theme::tokens(&settings_theme()).err);
             let _ = t.ctx.fill_text("[process exited]", x, y);
         });
     }
@@ -686,7 +750,7 @@ fn setup(mut keys_loaded: Signal<bool>) {
         // pty_spawn's Result used to be discarded: a failed shell spawn left a blank canvas
         // with no feedback anywhere. It also returns an optional warning (no shell
         // integration => no command journal), which is otherwise invisible.
-        match invoke("pty_spawn", SpawnThemeArgs { rows, cols, theme: theme.clone() }).await {
+        match invoke("pty_spawn", SpawnThemeArgs { rows, cols, theme }).await {
             Err(e) => {
                 let msg = e.as_string().unwrap_or_else(|| "failed to start the shell".into());
                 crate::bridge::term_write(format!("\r\n\x1b[31m[tachyon] {msg}\x1b[0m\r\n"));
@@ -701,16 +765,9 @@ fn setup(mut keys_loaded: Signal<bool>) {
         if let Some(e) = key_err {
             crate::bridge::term_write(format!("\r\n\x1b[33m[tachyon] keybindings: {e} — using defaults\x1b[0m\r\n"));
         }
-        // One https GET, one line, no download and no install — the install chord is a
-        // native menu item the webview cannot reach. Silent on every failure.
-        if let Ok(v) = invoke("update_check", NoArgs {}).await {
-            if let Some(s) = v.as_string() {
-                crate::bridge::term_write(s);
-            }
-        }
-        // The engine already has this theme (passed to pty_spawn), so this is no longer a
-        // colour correction — it is just the initial full repaint, and it is idempotent.
-        let _ = invoke("term_set_theme", ThemeArgs { name: theme }).await;
+        // The engine already has this theme (passed to pty_spawn), so all this asks for is
+        // the initial full frame; it is idempotent with the shell's first output.
+        let _ = invoke("term_full_repaint", NoArgs {}).await;
     });
 
     // --- keyboard input ---
@@ -864,19 +921,20 @@ fn setup(mut keys_loaded: Signal<bool>) {
         cb.forget();
     }
 
-    // --- live font/size changes from the settings panel (dispatches "tachyon-font") ---
+    // --- live font/size/theme changes from the settings panel (dispatches "tachyon-font") ---
     {
         let term = term.clone();
         let cb = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
             let (px, family) = settings_font();
             let (cols, rows) = {
                 let mut t = term.borrow_mut();
+                (t.bg, t.fg, t.accent) = theme_rgb();
                 t.set_font(px, family);
                 t.fit()
             };
             // resizing the PTY makes the native side emit a full grid-damage repaint.
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = invoke("pty_resize", SpawnArgs { rows, cols }).await;
+                let _ = invoke("pty_resize", ResizeArgs { rows, cols }).await;
             });
         }) as Box<dyn FnMut(web_sys::Event)>);
         let _ = win().add_event_listener_with_callback("tachyon-font", cb.as_ref().unchecked_ref());
@@ -887,8 +945,6 @@ fn setup(mut keys_loaded: Signal<bool>) {
     // More reliable than the window "resize" event across the macOS fullscreen settle. ---
     {
         let term = term.clone();
-        // Observe the CSS canvas box, including the first notification: styles can
-        // finish loading after setup, changing the available terminal area.
         let canvas_obs = term.borrow().canvas.clone();
         let cb = Closure::wrap(Box::new(move |_: js_sys::Array, _: web_sys::ResizeObserver| {
             refit(&term);
@@ -914,8 +970,7 @@ fn setup(mut keys_loaded: Signal<bool>) {
     }
 }
 
-/// Mirror of src/main.ts:673-695 — rebuild the typed command line for the
-/// journal. On a completed line, tell the native side via `set_typed_command`.
+/// Rebuild the typed command line for the journal. On a completed line, tell the native side via `set_typed_command`.
 fn reconstruct_typed_line(typed: &Rc<RefCell<String>>, data: &str) {
     if data.starts_with('\x1b') {
         typed.borrow_mut().clear();
@@ -949,7 +1004,62 @@ pub fn Terminal() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_key, linear_selection};
+    use super::{blank_cell, encode_key, grid_dims, linear_selection, rows_text, style_runs, Cell};
+
+    fn styled(ch: &str, fg: [u8; 3], bold: bool) -> Cell {
+        Cell { ch: ch.into(), fg, bold, ..blank_cell([0; 3], [0; 3]) }
+    }
+
+    // Guards the painter's canvas-state budget: set_font/set_fill_style_str run per run,
+    // so a run that fails to coalesce is a per-glyph font reparse again.
+    #[test]
+    fn style_runs_coalesces_adjacent_identical_styles() {
+        let red = [0xff, 0, 0];
+        let row = [
+            styled("a", red, false),
+            styled("b", red, false),
+            styled("c", red, true),
+            styled("d", [0, 0xff, 0], true),
+        ];
+        assert_eq!(style_runs(&row), [(0, 2), (2, 3), (3, 4)]);
+        assert_eq!(style_runs(&[]), []);
+
+        // inverse swaps fg/bg, so it coalesces with a plain cell of the same painted colour.
+        let mut inv = styled("e", [0, 0, 0], false);
+        inv.bg = red;
+        inv.inverse = true;
+        assert_eq!(style_runs(&[styled("a", red, false), inv]), [(0, 2)]);
+    }
+
+    #[test]
+    fn rows_text_trims_trailing_blanks() {
+        let mut buf = vec![blank_cell([0; 3], [0; 3]); 6];
+        buf[0].ch = "h".into();
+        buf[1].ch = "i".into();
+        buf[3].ch = "y".into();
+        assert_eq!(rows_text(&buf, 2, 3), ["hi", "y"]);
+        // a buffer shorter than rows*cols yields empty rows rather than panicking
+        assert_eq!(rows_text(&[], 2, 3), ["", ""]);
+    }
+
+    #[test]
+    fn grid_dims_floors_and_never_returns_zero() {
+        assert_eq!(grid_dims(801.5, 600.0, 8.0, 17.0), (100, 35));
+        // a canvas smaller than one cell still has to spawn a 1x1 PTY
+        assert_eq!(grid_dims(1.0, 1.0, 8.0, 17.0), (1, 1));
+    }
+
+    // Pins the tuple wire format against src-tauri/src/engine.rs's Serialize impl: the two
+    // sides are hand-written mirrors, and a silent drift would repaint the grid wrong.
+    #[test]
+    fn wire_cell_fixture_round_trips() {
+        let c: Cell = serde_json::from_str(r#"[3,7,"a",12634869,1447454,5]"#).unwrap();
+        assert_eq!((c.line, c.col), (3, 7));
+        assert_eq!(c.ch, "a");
+        assert_eq!(c.fg, [0xc0, 0xca, 0xf5]);
+        assert_eq!(c.bg, [0x16, 0x16, 0x1e]);
+        assert!(c.bold && !c.italic && c.inverse && !c.underline);
+    }
 
     #[test]
     fn selection_extraction() {

@@ -1,4 +1,4 @@
-//! Block navigator (⌘B) + session-health minimap (main.ts 504-643). Cards from
+//! Block navigator (⌘B) + session-health minimap. Cards from
 //! the journal mirror, newest-first; per-block explain/rerun/copy/expand; a
 //! session-summarize header action; and an always-visible minimap rail whose
 //! segments open the panel scrolled to the clicked block.
@@ -53,7 +53,7 @@ fn block_class(code: i32) -> &'static str {
 
 /// Ask the native `explain_output` command and stash the reply at the block with this id.
 /// Keyed by stable block id (not Vec index) so a journal ring-shift during the async call
-/// can't misattribute the reply — main.ts held a direct object reference for the same reason.
+/// can't misattribute the reply — an id survives a ring shift, a Vec index does not.
 fn explain(state: AppState, id: u64) {
     let mut j = state.journal;
     let (cmd, code, out) = {
@@ -198,7 +198,7 @@ pub fn BlocksPanel() -> Element {
             div { id: "minimap", {segs} }
         }
         if is_open {
-            // tabindex keeps Esc off the canvas terminal (main.ts openBlocks focus)
+            // tabindex keeps Esc off the canvas terminal
             div { id: "blocks", tabindex: "0",
                 div { id: "blocks-header",
                     span { id: "blocks-title", "Blocks" }

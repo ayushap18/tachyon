@@ -23,7 +23,7 @@ struct PtyState {
     engine: Mutex<Option<engine::TerminalEngine>>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Default)]
 struct ShellContext {
     cwd: Option<String>,
     branch: Option<String>,
@@ -97,6 +97,51 @@ pub(crate) fn login_env() -> &'static std::collections::BTreeMap<String, String>
 // allocate ~4.3e9 cells. Nothing legitimate is outside this range.
 fn clamp_dim(v: u16) -> u16 {
     v.clamp(1, 1000)
+}
+
+// Per-dimension clamping still allows 1000x1000 = 1,000,000 cells, and a full repaint of that
+// grid is ~123 MiB of JSON that Tauri copies again into a JS source string on the main thread.
+// The ceiling is the frame size, not the cell count: at the tuple wire format's ~30 B/cell this
+// keeps the worst full repaint near 6 MB (grid_area_is_clamped asserts under 16 MB), and it
+// leaves real geometry alone — a 3840x2160 desktop at the smallest settable 9px font wants
+// ~136,000 cells, so a lower cap would silently cut rows off an ordinary 4K display.
+const MAX_CELLS: usize = 200_000;
+
+fn clamp_grid(rows: u16, cols: u16) -> (u16, u16) {
+    let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
+    (rows.min((MAX_CELLS / cols as usize).max(1) as u16), cols)
+}
+
+// `grid-damage` is a diff against one shared snapshot — take_damage never re-sends a cell it
+// has already sent — so two frames that reach the webview out of order leave the older one's
+// content on screen permanently. Until 0.2.8 the engine lock gave that order for free, because
+// the emit happened under it. It must not: emit serialises the frame and then copies it again
+// into a JS source string (~1 ms for a full frame), and the reader thread, every keystroke and
+// every scroll all queue behind that lock. So emitters take EMIT_ORDER first and hold it across
+// the emit, while the reader thread — which only feeds and never emits — takes the engine lock
+// alone, and a `find /` flood still never queues behind a frame.
+static EMIT_ORDER: Mutex<()> = Mutex::new(());
+
+fn paint_with(
+    state: &PtyState,
+    f: impl FnOnce(&mut engine::TerminalEngine) -> Option<engine::GridDamage>,
+    sink: impl FnOnce(engine::GridDamage),
+) {
+    let _order = EMIT_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let damage = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(f);
+    if let Some(d) = damage {
+        sink(d);
+    }
+}
+
+fn paint(
+    app: &AppHandle,
+    state: &PtyState,
+    f: impl FnOnce(&mut engine::TerminalEngine) -> Option<engine::GridDamage>,
+) {
+    paint_with(state, f, |d| {
+        let _ = app.emit("grid-damage", d);
+    });
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -304,7 +349,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 // naive prompt strip (no B mark): drop through the LAST space-delimited sigil,
-// port of the TS regex ^.*\s[%$#>]\s+
+// i.e. ^.*\s[%$#>]\s+
 fn strip_prompt_sigil(line: &str) -> String {
     let b = line.as_bytes();
     let mut start = 0usize;
@@ -510,7 +555,7 @@ fn last_failed_block(journal: State<JournalState>) -> Option<Block> {
 #[tauri::command]
 fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16, theme: String) -> Result<Option<String>, String> {
     // rows/cols arrive raw from the webview and size a rows*cols allocation; clamp them.
-    let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
+    let (rows, cols) = clamp_grid(rows, cols);
     let mut master_slot = state.master.lock().unwrap_or_else(|e| e.into_inner());
     if master_slot.is_some() {
         return Ok(None); // already running (e.g. frontend hot-reload)
@@ -553,6 +598,21 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16, theme
     *master_slot = Some(pair.master);
     *state.engine.lock().unwrap_or_else(|e| e.into_inner()) = Some(engine::TerminalEngine::new(cols, rows, &theme));
 
+    // Repaint is coalesced onto its own thread so a `find /`-class flood costs one frame per
+    // ~8 ms instead of one per PTY read. A full wake channel means a repaint is already pending,
+    // and that repaint takes the damage this feed just produced — so dropping the wake is lossless.
+    let (wake, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let painter_app = app.clone();
+    std::thread::spawn(move || {
+        let pty = painter_app.state::<PtyState>();
+        while wake_rx.recv().is_ok() {
+            // Only repaint at the live bottom: while the user reads history, the grid underneath
+            // is shifting as output streams, and repainting it every chunk is what glitched.
+            paint(&painter_app, &pty, |e| (e.scrollback() == 0).then(|| e.take_damage()));
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+    });
+
     std::thread::spawn(move || {
         let journal = app.state::<JournalState>();
         let pty = app.state::<PtyState>();
@@ -562,16 +622,12 @@ fn pty_spawn(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16, theme
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     // grid engine: same bytes -> screen model -> only changed cells painted.
-                    if let Some(eng) = pty.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        eng.feed(&buf[..n]); // always advance history
-                        // Only repaint when at the live bottom. If the user is scrolled up reading
-                        // history, freeze their view (the grid underneath is shifting as output
-                        // streams — repainting it every chunk is what glitched). They see the new
-                        // output when they scroll/type back to the bottom.
-                        if eng.scrollback() == 0 {
-                            let _ = app.emit("grid-damage", eng.take_damage());
-                        }
+                    // Deliberately not `paint`: this thread emits nothing, so it stays off
+                    // EMIT_ORDER and a flood never waits on a frame being serialised.
+                    if let Some(e) = pty.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        e.feed(&buf[..n]); // always advance history
                     }
+                    let _ = wake.try_send(()); // feed first, then wake
                     let finalized = journal.scanner.lock().unwrap_or_else(|e| e.into_inner()).feed(&buf[..n]);
                     for block in finalized {
                         journal_push(&journal.blocks, &block); // no lock held across emit
@@ -602,25 +658,21 @@ fn pty_write_internal(state: &PtyState, data: &str) -> Result<(), String> {
 fn pty_write(app: AppHandle, state: State<PtyState>, data: String) -> Result<(), String> {
     // Typing snaps the view back to the live bottom so the prompt is always visible. Repaint
     // here (not just on the echo) so it snaps even when the foreground program doesn't echo
-    // (sudo/ssh password prompts). Guarded on scrollback != 0 so normal typing at the bottom
-    // stays an incremental diff, not a full repaint per keystroke.
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        if eng.scrollback() != 0 {
-            eng.scroll_to_bottom();
-            let _ = app.emit("grid-damage", eng.full_repaint());
-        }
-    }
+    // (sudo/ssh password prompts). Guarded on scrollback != 0 so typing at the bottom costs
+    // no frame at all; the snap itself ships only the rows that differ.
+    paint(&app, &state, |e| {
+        (e.scrollback() != 0).then(|| {
+            e.scroll_to_bottom();
+            e.take_damage()
+        })
+    });
     pty_write_internal(&state, &data)
 }
 
 // Scroll the native grid by `delta` rows (delta > 0 = up into history) and repaint.
 #[tauri::command]
 fn term_scroll(app: AppHandle, state: State<PtyState>, delta: i32) {
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        if eng.scroll_by(delta) {
-            let _ = app.emit("grid-damage", eng.take_damage());
-        }
-    }
+    paint(&app, &state, |e| e.scroll_by(delta).then(|| e.take_damage()));
 }
 
 // Write to the system clipboard from Rust: the webview's navigator.clipboard is blocked here.
@@ -633,13 +685,13 @@ fn clipboard_set(text: String) -> Result<(), String> {
 
 #[tauri::command]
 fn pty_resize(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> Result<(), String> {
-    let (rows, cols) = (clamp_dim(rows), clamp_dim(cols));
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        eng.resize(cols, rows);
+    let (rows, cols) = clamp_grid(rows, cols);
+    paint(&app, &state, |e| {
+        e.resize(cols, rows);
         // repaint immediately — the child may not write anything after a resize (a static
         // prompt, a paused pager), and the canvas was just blanked to the new dimensions.
-        let _ = app.emit("grid-damage", eng.full_repaint());
-    }
+        Some(e.full_repaint())
+    });
     match state.master.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         Some(m) => m
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -648,14 +700,12 @@ fn pty_resize(app: AppHandle, state: State<PtyState>, rows: u16, cols: u16) -> R
     }
 }
 
-// Frontend calls this once on mount to paint the initial full grid; the reader thread
+// Frontend calls this once on mount to paint the initial full grid; the painter thread
 // emits incremental "grid-damage" thereafter. Emits rather than only returning, so the
 // same grid-damage listener paints it (the caller need not apply the return value).
 #[tauri::command]
 fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        let _ = app.emit("grid-damage", eng.full_repaint());
-    }
+    paint(&app, &state, |e| Some(e.full_repaint()));
 }
 
 // Frontend text-render path: feed text straight into the DISPLAY engine so it shows on the
@@ -663,18 +713,56 @@ fn term_full_repaint(app: AppHandle, state: State<PtyState>) {
 // this only paints; it must not call pty_write_internal or write to the shell.
 #[tauri::command]
 fn term_write(app: AppHandle, state: State<PtyState>, text: String) {
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        eng.feed(text.as_bytes());
-        let _ = app.emit("grid-damage", eng.take_damage());
-    }
+    paint(&app, &state, |e| {
+        e.feed(text.as_bytes());
+        Some(e.take_damage())
+    });
 }
 
-// Settings panel: switch the terminal color table (chrome CSS is handled frontend-side).
+/// The mirror of the webview's theme/opacity, kept only so `run()` can colour the native
+/// window before the 1.1 MB wasm bundle boots. localStorage stays authoritative; the
+/// frontend rewrites this on every settings change, so drift self-heals at the next launch.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Appearance {
+    theme: String,
+    opacity: u8,
+}
+
+fn appearance_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("settings.json"))
+}
+
+/// Below 40% the glyphs stop being readable against whatever is behind the window.
+const MIN_OPACITY: u8 = 40;
+
+fn window_bg(theme: &str, opacity: u8) -> tauri::window::Color {
+    let [r, g, b] = engine::theme_bg(theme);
+    let a = opacity.clamp(MIN_OPACITY, 100) as u16 * 255 / 100;
+    tauri::window::Color(r, g, b, a as u8)
+}
+
+/// Paint the native window backing. Deliberately the Window and not the WebviewWindow:
+/// the latter colours the webview layer too, and one backing painted twice is how a
+/// translucent window ends up compositing native alpha against page alpha.
+fn set_window_bg(app: &AppHandle, theme: &str, opacity: u8) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    let webview: &tauri::Webview<_> = w.as_ref();
+    let _ = webview.window().set_background_color(Some(window_bg(theme, opacity)));
+}
+
+// Settings panel: switch the terminal color table and the native window backing (the chrome
+// CSS variables are handled frontend-side). No colour crosses IPC — only the theme name.
 #[tauri::command]
-fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String) {
-    if let Some(eng) = state.engine.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        eng.set_theme(&name);
-        let _ = app.emit("grid-damage", eng.full_repaint());
+fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String, opacity: u8) {
+    paint(&app, &state, |e| {
+        e.set_theme(&name);
+        Some(e.full_repaint())
+    });
+    set_window_bg(&app, &name, opacity);
+    let _guard = CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(path) = appearance_path() {
+        let a = Appearance { theme: name, opacity: opacity.clamp(MIN_OPACITY, 100) };
+        let _ = write_config(&path, &a);
     }
 }
 
@@ -1079,8 +1167,8 @@ fn mutate<F: FnOnce(&mut ProviderState) -> Result<(), String>>(f: F) -> Result<P
     Ok(state)
 }
 
-/// Ceiling on the ids provider_models hands the completer. Same order as local_models'
-/// MODELS_SHOWN — a suggestion list nobody scrolls past 200 of.
+/// Ceiling on the ids provider_models hands the completer, which re-renders a row per
+/// candidate on every keystroke. /models keeps the true count.
 const MODELS_SUGGESTED: usize = 200;
 
 #[tauri::command]
@@ -1273,7 +1361,7 @@ or failure in 1-3 short sentences and suggest a fix. If there is no error, say s
 You may instead be given the exact failing command, its exit code, and its output. \
 Plain text only, no markdown.";
 
-// port of the TS: trim, strip a leading ```lang fence, strip a trailing ```
+// trim, strip a leading ```lang fence, strip a trailing ```
 fn strip_fences(s: &str) -> String {
     let mut s = s.trim();
     if let Some(rest) = s.strip_prefix("```") {
@@ -1318,6 +1406,10 @@ fn one_line(cmd: &str) -> String {
         // \n and \r\n — and an <input> drops the CR from what it displays. So
         // "echo hi\rrm -rf ~" showed as one harmless command and ran as two.
         .replace('\r', "\n")
+        // U+2028/U+2029 are Zl/Zp, so neither `is_control` nor `is_invisible` sees them, and
+        // `str::lines` does not split on them — but CSS treats both as a forced break that
+        // `white-space: nowrap` will not collapse, so they break the status bar's single line.
+        .replace(['\u{2028}', '\u{2029}'], "\n")
         .lines()
         .map(|l| {
             // No other control character belongs in a command either: a tab triggers shell
@@ -1358,16 +1450,27 @@ fn journal_context(q: &VecDeque<Block>) -> String {
     out
 }
 
+// The probes spawn `lsof` and up to two `git` children and poll each for up to
+// PROBE_TIMEOUT, so running them inline parks a tokio worker for seconds — and the status
+// bar refires them after every command.
+async fn shell_context(pid: Option<u32>) -> ShellContext {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = pid.and_then(cwd_of_pid);
+        let (branch, dirty) = cwd.as_deref().map(git_info).unwrap_or((None, 0));
+        ShellContext { cwd, branch, dirty, shell_pid: pid }
+    })
+    .await
+    .unwrap_or_default()
+}
+
 // same data as get_context, rendered as prompt lines
-fn shell_context_line(pid: Option<u32>) -> String {
-    let cwd = pid.and_then(cwd_of_pid);
-    let (branch, dirty) = cwd.as_deref().map(git_info).unwrap_or((None, 0));
-    let git = match branch {
-        Some(b) if dirty > 0 => format!("{b} ({dirty} dirty)"),
-        Some(b) => b,
+fn shell_context_line(c: &ShellContext) -> String {
+    let git = match &c.branch {
+        Some(b) if c.dirty > 0 => format!("{b} ({} dirty)", c.dirty),
+        Some(b) => b.clone(),
         None => "none".into(),
     };
-    format!("cwd: {}\ngit: {git}", cwd.as_deref().unwrap_or("unknown"))
+    format!("cwd: {}\ngit: {git}", c.cwd.as_deref().unwrap_or("unknown"))
 }
 
 #[derive(serde::Serialize)]
@@ -1385,7 +1488,7 @@ async fn nl_to_command(
     // extract everything guarded before the first .await — MutexGuard is !Send
     let pid = *pty.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
     let jctx = journal_context(&journal.blocks.lock().unwrap_or_else(|e| e.into_inner()));
-    let user = format!("{request}\n\nContext:\n{}\n{jctx}", shell_context_line(pid));
+    let user = format!("{request}\n\nContext:\n{}\n{jctx}", shell_context_line(&shell_context(pid).await));
     let command = one_line(&strip_fences(&ai_call(Task::Command, &with_env(AI_SYSTEM), &user).await?));
     if command.is_empty() {
         return Err("no command returned".into());
@@ -1872,12 +1975,13 @@ fn mcp_call(server: String, tool: String, args: serde_json::Value) -> Result<Str
 }
 
 // ---- Slash commands (⌘K "/…") ----
-// Parsing + registry mutation live here; TS only prints the returned ANSI string.
+// Parsing + registry mutation live here; the caller only prints the returned ANSI string.
 // Provider display goes through PublicProvider (has_key), so a raw key structurally
 // cannot appear in the output, and /key never echoes its argument.
 
 const SLASH_HELP: &str = concat!(
     "\r\n\x1b[36m/keys\x1b[0m                       list providers, active, key source (saved/env/none)\r\n",
+    "\x1b[36m/providers\x1b[0m                  same table as /keys\r\n",
     "\x1b[36m/key <id> <apikey>\x1b[0m          set a provider's API key\r\n",
     "\x1b[36m/use <id> [model]\x1b[0m           switch active provider (+ optional model)\r\n",
     "\x1b[36m/model <model>\x1b[0m              set the active provider's model\r\n",
@@ -1893,8 +1997,9 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/mcp add <name> -- <cmd> [args]\x1b[0m  add a local MCP server (stdio) \x1b[31m— Tachyon will run <cmd>\x1b[0m\r\n",
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers (transport, full command line) and their tools\r\n",
-    "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (you approve each command)\r\n",
+    "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (on <port> to pick one)\r\n",
     "\x1b[36m/update\x1b[0m                     check for a newer Tachyon (install: \u{2318}U / Ctrl+U)\r\n",
+    "\x1b[36m/help\x1b[0m                       this list\r\n",
     "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n",
     "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n",
     "\x1b[90mno saved key? GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY… (<ID>_API_KEY) is used, never saved.\x1b[0m\r\n",
@@ -2075,7 +2180,9 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                     }
                     Ok(out)
                 }
-                _ => Err("usage: /mcp add|remove|list".into()),
+                // `serve` belongs here even though run_slash peels it off: a bare /mcp and a
+                // typo like `/mcp serv` both land in this arm
+                _ => Err("usage: /mcp add|remove|list|serve".into()),
             }
         }
         other => Err(format!("unknown command: /{other} — try /help")),
@@ -2100,7 +2207,7 @@ async fn run_slash(app: AppHandle, input: String) -> String {
 // ---- Agent loop (⌘J) ----
 // The full orchestration runs here on a background task; the webview only renders
 // the approval gate. INVARIANT: no command or tool ever runs without an explicit
-// agent_decide(true), which TS invokes only from a literal Enter keypress.
+// agent_decide(true), which ai_bar.rs invokes only from a literal Enter keypress.
 
 const AI_AGENT: &str = "You drive a terminal running {env} to accomplish the user's task step by step. \
 Respond with EXACTLY ONE line: either 'RUN: <single shell command>' to execute a command, \
@@ -2222,7 +2329,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.get(..prefix.len()).filter(|p| p.eq_ignore_ascii_case(prefix)).map(|_| &s[prefix.len()..])
 }
 
-// one-line agent reply → action. Port of the TS RUN/DONE/TOOL parsing.
+// one-line agent reply → action: RUN / DONE / TOOL.
 fn parse_agent_reply(reply: &str) -> AgentAction {
     let reply = reply.trim();
     if let Some(rest) = strip_prefix_ci(reply, "DONE:") {
@@ -2371,10 +2478,11 @@ async fn agent_loop(app: AppHandle, task: String) {
     let _reset = AgentRunGuard(app.clone());
     let aborted = |app: &AppHandle| app.state::<AgentState>().abort.load(SeqCst);
 
-    // transcript seed: same shape as the old TS runAgent (context + recent journal)
+    // transcript seed: context + recent journal
     let pid = *app.state::<PtyState>().shell_pid.lock().unwrap_or_else(|e| e.into_inner());
     let jctx = journal_context(&app.state::<JournalState>().blocks.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut transcript = format!("Task: {task}\n\nContext:\n{}\n{jctx}\n", shell_context_line(pid));
+    let mut transcript =
+        format!("Task: {task}\n\nContext:\n{}\n{jctx}\n", shell_context_line(&shell_context(pid).await));
 
     // One connection pool for the whole run: each server is initialized (HTTP) or spawned
     // (stdio) once, not once per call. Dropped with this function, which reaps the children.
@@ -2533,9 +2641,7 @@ The arguments are one JSON object with the keys from the tool's signature below;
 #[tauri::command]
 async fn get_context(state: State<'_, PtyState>) -> Result<ShellContext, String> {
     let pid = *state.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
-    let cwd = pid.and_then(cwd_of_pid);
-    let (branch, dirty) = cwd.as_deref().map(git_info).unwrap_or((None, 0));
-    Ok(ShellContext { cwd, branch, dirty, shell_pid: pid })
+    Ok(shell_context(pid).await)
 }
 
 // User key rebinds: action id → chord ("ctrl+shift+k"). The frontend owns both vocabularies,
@@ -2563,6 +2669,15 @@ pub fn run() {
             // Non-fatal like mcp_server::autostart above: a menu that would not build must
             // not cost the user their shell.
             let _ = update::install_menu(app.handle());
+            // The ambient check: one background task that only asks, and reports what it
+            // learned as an event. It adds no IPC handler.
+            update::watch(app.handle());
+            // The first frame is this colour: the window is created immediately above, on this
+            // same main-thread call, and the page stays transparent for the whole wasm boot.
+            // Non-fatal like the two above — a mistimed colour must not cost the user a shell.
+            if let Ok(Some(a)) = appearance_path().and_then(|p| read_config::<Appearance>(&p)) {
+                set_window_bg(app.handle(), &a.theme, a.opacity);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2601,7 +2716,6 @@ pub fn run() {
             mcp_list_tools,
             mcp_call,
             run_slash,
-            update::update_check,
             keybindings
         ])
         .run(tauri::generate_context!())
@@ -2629,20 +2743,147 @@ mod tests {
         assert_eq!(parse_lsof_cwd(""), None);
     }
 
+    /// PATH is process-global and context_probes_do_not_serialise_on_the_runtime shadows
+    /// `git`/`lsof` on it, so every test that resolves the real ones holds this.
+    static PROBE_PATH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn probe_path_lock() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_PATH.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // the live probe on whichever OS runs the suite: lsof on macOS, /proc on Linux
     #[test]
     fn cwd_of_self_matches_current_dir() {
+        let _path = probe_path_lock();
         let cwd = cwd_of_pid(std::process::id()).expect("cwd probe gave nothing");
         assert_eq!(std::path::PathBuf::from(cwd), std::env::current_dir().unwrap());
     }
 
+    /// The engine mutex must not be held across `emit`: the reader thread, every keystroke
+    /// and every scroll queue behind it while Tauri serialises the frame twice. One helper
+    /// owns the lock, and it emits after the guard has dropped.
+    #[test]
+    fn grid_damage_is_emitted_outside_the_engine_lock() {
+        let src = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        // the spawn assignment, the reader thread's feed, and the one helper
+        assert_eq!(src.matches(concat!("engine", ".lock()")).count(), 3);
+        assert_eq!(src.matches(concat!("emit(\"grid", "-damage\"")).count(), 1);
+    }
+
+    /// An emitter serialises ~1 ms of JSON after it has taken its diff, so without EMIT_ORDER
+    /// a frame diffed second can reach the webview first — and since take_damage never
+    /// re-sends a cell it has already sent, the stale frame's content stays on screen for good.
+    #[test]
+    fn frames_reach_the_sink_in_the_order_they_were_diffed() {
+        let state = PtyState::default();
+        *state.engine.lock().unwrap() = Some(engine::TerminalEngine::new(20, 5, "Tokyo Night"));
+        let (diffed, sunk) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let nth = std::cell::Cell::new(0usize);
+                    paint_with(
+                        &state,
+                        |e| {
+                            e.feed(b"x");
+                            let d = e.take_damage();
+                            let mut v = diffed.lock().unwrap();
+                            nth.set(v.len() + 1);
+                            v.push(nth.get());
+                            Some(d)
+                        },
+                        |_| {
+                            // The later a frame was diffed, the faster it serialises — the
+                            // inversion an unordered emitter actually produces.
+                            let ms = 15 * (5 - nth.get()) as u64;
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                            sunk.lock().unwrap().push(nth.get());
+                        },
+                    );
+                });
+            }
+        });
+
+        let (diffed, sunk) = (diffed.into_inner().unwrap(), sunk.into_inner().unwrap());
+        assert_eq!(diffed, sunk, "frames reached the sink out of diff order");
+    }
+
+    /// The pty is the trust boundary: everything that reaches the shell goes through this
+    /// one function, and docs/danger-gate.md verifies that by grep. A fourth site is a
+    /// write path that has not been past the approval gate.
+    #[test]
+    fn pty_write_internal_has_exactly_three_callers() {
+        let live = |src: &'static str| src.split("#[cfg(test)]").next().unwrap();
+        let needle = concat!("pty_write_", "internal(");
+        let sites = live(include_str!("lib.rs")).matches(needle).count()
+            + live(include_str!("mcp_server.rs")).matches(needle).count();
+        // the definition, plus the pty_write command, agent_loop and mcp_server::run_gated
+        assert_eq!(sites, 4, "pty_write_internal has {sites} sites, not the definition plus three");
+
+        // and the gate stays fail-closed: a dropped sender is a denial, never an approval
+        assert!(
+            live(include_str!("lib.rs")).contains(concat!("rx.await.", "unwrap_or(false)")),
+            "agent_propose no longer defaults a lost approval to false"
+        );
+    }
+
+    #[test]
+    fn grid_area_is_clamped() {
+        let (rows, cols) = clamp_grid(1000, 1000);
+        assert!(rows as usize * cols as usize <= MAX_CELLS);
+        let worst = engine::TerminalEngine::new(cols, rows, "Tokyo Night").full_repaint();
+        let bytes = serde_json::to_string(&worst).unwrap().len();
+        assert!(bytes < 16_000_000, "worst permitted frame is {bytes} B");
+        // an ordinary geometry is untouched
+        assert_eq!(clamp_grid(50, 200), (50, 200));
+    }
+
+    /// The probes are blocking process spawns polled to PROBE_TIMEOUT. Run inline they
+    /// would serialise on the runtime: four calls against a wedged `git` would cost
+    /// 4 x PROBE_TIMEOUT. Off the runtime they overlap.
+    #[cfg(unix)]
+    #[tokio::test]
+    // PATH is process-global, so the guard has to outlive the probes it is protecting.
+    #[allow(clippy::await_holding_lock)]
+    async fn context_probes_do_not_serialise_on_the_runtime() {
+        let _path = probe_path_lock();
+        let dir = std::env::temp_dir().join(format!("tachyon-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_stub(&dir.join("git"), "sleep 30");
+        // macOS reaches git only if the cwd probe answers; Linux reads /proc and ignores this
+        write_stub(&dir.join("lsof"), &format!("printf 'n{}\\n'", dir.display()));
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", dir.display()));
+
+        let pid = Some(std::process::id());
+        let t = std::time::Instant::now();
+        let ctx = tokio::join!(
+            shell_context(pid),
+            shell_context(pid),
+            shell_context(pid),
+            shell_context(pid),
+        );
+        let waited = t.elapsed();
+
+        std::env::set_var("PATH", path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // each call did reach the wedged git, so the timing below means something
+        assert!(ctx.0.cwd.is_some() && ctx.0.branch.is_none(), "{:?}", ctx.0.cwd);
+        assert!(waited >= PROBE_TIMEOUT, "git stub was not used: {waited:?}");
+        assert!(waited < 2 * PROBE_TIMEOUT, "probes serialised: {waited:?}");
+    }
+
     #[test]
     fn cwd_of_dead_pid_is_none() {
+        let _path = probe_path_lock();
         assert_eq!(cwd_of_pid(u32::MAX), None); // above any pid_max: no such process
     }
 
     #[test]
     fn git_info_this_repo() {
+        let _path = probe_path_lock();
         // run against this crate's own directory (a git repo) so the test is
         // machine-independent — CARGO_MANIFEST_DIR resolves on any checkout, incl. CI.
         // Detached-HEAD checkouts (tags/PRs) yield "HEAD", so assert only that a branch resolved.
@@ -2755,11 +2996,16 @@ mod tests {
     // E3: a Dock/Finder launch has no shell environment. These cover the parse and the
     // give-up path; the OnceLock wrapper around them is one line.
     #[cfg(unix)]
-    fn fake_shell(tag: &str, body: &str) -> std::path::PathBuf {
+    fn write_stub(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_shell(tag: &str, body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("tachyon-shell-{tag}-{}", std::process::id()));
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_stub(&path, body);
         path
     }
 
@@ -2904,9 +3150,65 @@ mod tests {
     fn slash_usage_and_unknown_errors() {
         assert_eq!(run_slash_inner("/key groq").unwrap_err(), "usage: /key <id> <apikey>");
         assert_eq!(run_slash_inner("/foo").unwrap_err(), "unknown command: /foo — try /help");
-        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list");
+        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list|serve");
+        // a bare /mcp lands in the same arm, so it must name serve too
+        assert_eq!(run_slash_inner("/mcp").unwrap_err(), "usage: /mcp add|remove|list|serve");
         assert_eq!(run_slash_inner("/help").unwrap(), SLASH_HELP);
         assert_eq!(run_slash_inner("/").unwrap(), SLASH_HELP);
+    }
+
+    /// SLASH_HELP is the only list of commands a user ever sees. A line with no arm behind
+    /// it is a documented command that answers "unknown command".
+    #[test]
+    fn slash_help_verbs_have_a_parser_arm() {
+        // the test module is this same file: only the production half may satisfy the needle
+        let src = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        let mut checked = 0;
+        for form in SLASH_HELP.split('\u{1b}').filter_map(|s| s.strip_prefix("[36m")) {
+            // a nested form dispatches on its last literal word: `/mcp add` is matched by `"add"`
+            let verb = form
+                .split(' ')
+                .take_while(|t| !t.contains(['<', '[', '|']))
+                .last()
+                .unwrap()
+                .trim_start_matches('/');
+            // run_slash peels these two off before run_slash_inner ever runs
+            if ["update", "serve"].contains(&verb) {
+                continue;
+            }
+            let arm = format!("\"{verb}\"");
+            assert!(
+                src.contains(&format!("{arm} =>")) || src.contains(&format!("{arm} |")),
+                "/help lists {form} and no parser arm matches {arm}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "the loop went vacuous: only {checked} forms");
+    }
+
+    /// The other direction, which nothing walked before: `/providers` was a verb the parser
+    /// accepted and no surface named, so the completer offered nothing for `/prov` and the
+    /// README did not list it, yet typing it in full worked.
+    #[test]
+    fn every_parser_arm_is_listed_in_the_help() {
+        let src = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        let body = src.split_once("match cmd.as_str() {").unwrap().1;
+        let body = &body[..body.find("\n}\n").unwrap()];
+        // top-level arms only: the nested `/mcp` sub-match is indented further
+        let verbs: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("        \""))
+            .flat_map(|l| l.split_once("=>").unwrap().0.split('|'))
+            .map(|t| t.trim().trim_matches('"'))
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert!(verbs.len() > 8, "the arm scan went vacuous: {verbs:?}");
+        for verb in verbs {
+            assert!(
+                SLASH_HELP.contains(&format!("[36m/{verb}")),
+                "run_slash_inner accepts /{verb} and /help does not list it"
+            );
+        }
     }
 
     #[test]
@@ -3317,6 +3619,86 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         );
     }
 
+    // ---- Startup appearance. The window the user sees before any wasm has run. ----
+
+    /// The webview boots for over a second; whatever the window is born as is the launch
+    /// colour. `transparent` is what lets the page stop painting a backing of its own, and
+    /// on macOS wry gates that path out unless tauri has the macos-private-api feature.
+    #[test]
+    fn window_is_transparent_and_born_in_the_default_theme() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let w = &v["app"]["windows"][0];
+        assert_eq!(w["transparent"], true);
+        assert_eq!(v["app"]["macOSPrivateApi"], true);
+        assert!(
+            include_str!("../Cargo.toml")
+                .lines()
+                .any(|l| l.starts_with("tauri = ") && l.contains("macos-private-api")),
+            "the tauri dependency does not enable macos-private-api",
+        );
+        // Only settings.json can say otherwise, and a first-run user has none.
+        let [r, g, b] = engine::theme_bg("Tokyo Night");
+        assert_eq!(w["backgroundColor"], format!("#{r:02x}{g:02x}{b:02x}"));
+    }
+
+    #[test]
+    fn appearance_round_trips_and_clamps() {
+        // A window at 0% is invisible, and 0 is what an empty or hand-edited mirror reads as.
+        assert_eq!(window_bg("Tokyo Night", 0), window_bg("Tokyo Night", MIN_OPACITY));
+        assert_eq!(window_bg("Tokyo Night", 0).3, 102);
+        // Unknown themes resolve the same way here as they do in the engine's colour table.
+        assert_eq!(window_bg("no such theme", 100), window_bg("Tokyo Night", 100));
+        assert_eq!(window_bg("Solarized Light", 100), tauri::window::Color(0xfd, 0xf6, 0xe3, 255));
+
+        let dir = std::env::temp_dir().join(format!("tachyon-appearance-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        write_config(&path, &Appearance { theme: "Matrix".into(), opacity: 60 }).unwrap();
+        let back: Appearance = read_config(&path).unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!((back.theme.as_str(), back.opacity), ("Matrix", 60));
+    }
+
+    /// engine.rs's `theme_colors` and ui/src/theme.rs's `tokens` are the only two places
+    /// allowed to name a colour. Every copy elsewhere is a second source of truth, and a
+    /// stale one is what painted the launch frame in a theme the user had not chosen.
+    #[test]
+    fn no_colour_literal_outside_the_theme_tables() {
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("ui");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(ui.join("src"))
+            .unwrap()
+            .map(|f| f.unwrap().path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "rs")
+                    && p.file_name().is_some_and(|n| n != "theme.rs")
+            })
+            .collect();
+        files.push(ui.join("assets/main.css"));
+        // Reading the directory is what subjects a file added later to this too.
+        assert!(files.len() >= 13, "only {} files scanned", files.len());
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Fixtures may name colours; only shipped code may not. main.css has no test half.
+            let live = text.split("#[cfg(test)]").next().unwrap();
+            for (n, line) in live.lines().enumerate() {
+                let hex = line.split('#').skip(1).any(|rest| {
+                    let head: Vec<char> = rest.chars().take(6).collect();
+                    head.len() == 6 && head.iter().all(char::is_ascii_hexdigit)
+                });
+                assert!(!hex, "{}:{} names a colour — themes live in theme.rs", path.display(), n + 1);
+                // `rgb(…)`/`rgba(…)` is the other form the canvas and CSS accept. A digit
+                // after the paren is a literal; `{`, as in css()'s format string, is not.
+                // main.css's rgba(0,0,0,…) shadows are exempt — a drop shadow is not a theme
+                // colour, and there is no token for one.
+                let rgb = path.extension().is_some_and(|e| e == "rs")
+                    && line.split("rgb(").skip(1).chain(line.split("rgba(").skip(1)).any(|rest| {
+                        rest.starts_with(|c: char| c.is_ascii_digit())
+                    });
+                assert!(!rgb, "{}:{} names a colour — themes live in theme.rs", path.display(), n + 1);
+            }
+        }
+    }
+
     #[test]
     fn updater_endpoints_are_https_and_pubkey_is_set() {
         let conf = include_str!("../tauri.conf.json");
@@ -3367,8 +3749,8 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(seen >= 7, "only {seen} rust files scanned");
     }
 
-    /// S5: installing must not be reachable from the webview. `update_check` is the one new
-    /// handler entry in this release and it only reads.
+    /// S5: the updater must not be reachable from the webview AT ALL. The ambient check is a
+    /// Rust task that emits an event, so no handler name may mention it.
     #[test]
     fn no_install_command_is_registered() {
         let src = include_str!("lib.rs");
@@ -3378,20 +3760,28 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
             concat!("run_", "install"),
             concat!("install_", "menu"),
             concat!("tachyon", ":update"),
+            concat!("upd", "ate"),
         ] {
             assert!(!handlers.contains(bad), "{bad} is on the IPC surface");
         }
-        assert!(handlers.contains("update::update_check"));
+        // The slice really is the handler list, so the assertions above mean something.
+        assert!(handlers.contains("run_slash"));
     }
 
     #[test]
     fn slash_usage_for_provider_maintenance() {
         assert_eq!(run_slash_inner("/remove").unwrap_err(), "usage: /remove <id>");
         assert_eq!(run_slash_inner("/url claude").unwrap_err(), "usage: /url <id> <base_url>");
-        // two args where the first is not a known runtime: still the old usage line
+        // two args where the first is not a known runtime: still the old usage line, and it
+        // must name the same grammar /help does — derived, so the two cannot disagree again
+        let form = SLASH_HELP
+            .split('\u{1b}')
+            .filter_map(|s| s.strip_prefix("[36m"))
+            .find(|f| f.starts_with("/local <id> <url>"))
+            .expect("/help lost its full /local form");
         assert_eq!(
             run_slash_inner("/local mybox http://10.0.0.2:8000/v1").unwrap_err(),
-            "usage: /local <id> <base_url> <model> [key]"
+            format!("usage: {form}")
         );
         assert_eq!(
             run_slash_inner("/route command").unwrap_err(),
@@ -3700,7 +4090,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
     fn osc_unterminated_long_header_no_stall() {
         let mut sc = OscScanner::default();
         let mut noise = b"\x1b]133;".to_vec();
-        noise.extend(std::iter::repeat(b'x').take(100)); // >64: not our mark, dropped from scan
+        noise.extend(std::iter::repeat_n(b'x', 100)); // >64: not our mark, dropped from scan
         assert!(sc.feed(&noise).is_empty());
         assert!(sc.carry.is_empty());
         let blocks = sc.feed(b"\x1b]133;C\x07ok\x1b]133;D;0\x07");
@@ -4016,6 +4406,51 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(!after.contains("openai/gpt-oss-120b"), "{after}");
     }
 
+    /// The dispatch arms for the most-used verbs had no test through the real parser: their
+    /// pieces (use_provider, set_model, render_providers, parse_mcp_add) were each unit-tested
+    /// in isolation, so nothing proved run_slash_inner wired them to the right arguments.
+    #[test]
+    fn slash_verbs_round_trip_through_the_real_parser() {
+        let _env = config_env_lock();
+        let dir = std::env::temp_dir().join(format!("tachyon-slash-verbs-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tachyon")).unwrap(); // config_dir() appends it
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let keyed = run_slash_inner("/key groq gsk_supersecret").unwrap();
+        let used = run_slash_inner("/use groq qwen-x").unwrap();
+        let after_use = load_state().unwrap();
+        let modelled = run_slash_inner("/model other-x").unwrap();
+        let after_model = load_state().unwrap();
+        let keys = run_slash_inner("/keys").unwrap();
+        let providers = run_slash_inner("/providers").unwrap();
+        let added = run_slash_inner("/mcp add fs -- npx -y srv").unwrap();
+        let with_fs = load_mcp().unwrap();
+        let removed = run_slash_inner("/mcp remove fs").unwrap();
+        let without_fs = load_mcp().unwrap();
+        let twice = run_slash_inner("/mcp remove fs").unwrap_err();
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // /use takes the model as its second argument, /model retargets whoever is active
+        assert_eq!(after_use.active, "groq");
+        assert_eq!(after_use.active_provider().model, "qwen-x");
+        assert_eq!(after_model.active_provider().model, "other-x");
+        // the /providers alias is a decision, not an accident: it prints /keys or nothing
+        assert_eq!(keys, providers);
+
+        let fs = with_fs.servers.iter().find(|s| s.name == "fs").expect("mcp add wrote nothing");
+        assert_eq!((fs.command.as_str(), fs.url.as_str()), ("npx", ""));
+        assert_eq!(fs.args, ["-y", "srv"]);
+        assert!(without_fs.servers.iter().all(|s| s.name != "fs"), "mcp remove left it behind");
+        assert_eq!(twice, "unknown server: fs");
+
+        // S15: the key just saved and the provider's base_url must reach no surface
+        for out in [keyed, used, modelled, keys, added, removed] {
+            assert!(!out.contains("gsk_supersecret") && !out.contains("api.groq.com"), "{out}");
+        }
+    }
+
     /// S12. `/route` prints provider state, so it is a rendering path a credential could
     /// leak through — the same hazard render_providers carries.
     #[test]
@@ -4058,6 +4493,8 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
     /// client's full 120s.
     /// Holds CONFIG_ENV: sets XDG_CONFIG_HOME, which is process-global.
     #[tokio::test]
+    // XDG_CONFIG_HOME is process-global, so the guard has to outlive the call it is protecting.
+    #[allow(clippy::await_holding_lock)]
     async fn ai_call_deadline_fires_before_the_client_timeout() {
         let _env = config_env_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

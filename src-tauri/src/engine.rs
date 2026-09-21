@@ -9,7 +9,8 @@
 // ponytail: wide-char spacer cells are sent as a blank; combining marks ride on cell.contents();
 // upgrade only if CJK/emoji rendering shows gaps.
 
-use serde::Serialize;
+use serde::ser::SerializeTuple;
+use serde::{Serialize, Serializer};
 use vt100::{Color, Parser};
 
 // ---- IPC payload (must match the grid-damage contract byte-for-byte) ----
@@ -18,11 +19,11 @@ use vt100::{Color, Parser};
 pub struct CursorPayload {
     pub line: u16,
     pub col: u16,
-    pub shape: &'static str, // vt100 exposes no shape -> always "block"
+    pub color: [u8; 3],
     pub visible: bool,
 }
 
-#[derive(Serialize, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CellPayload {
     pub line: u16,
     pub col: u16,
@@ -33,6 +34,29 @@ pub struct CellPayload {
     pub italic: bool,
     pub inverse: bool,
     pub underline: bool,
+}
+
+// A grid frame is thousands of cells, and Tauri's `emit` serialises it and then copies the
+// result again into a JS source string, so the field names cost more than the data: as a
+// named-field object this was 127 B/cell. On the wire a cell is
+// [line, col, ch, fg, bg, flags] with the colours packed into a u32 and the four attributes
+// into one bitfield. ui/src/terminal.rs::WireCell is the other half of this contract.
+impl Serialize for CellPayload {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let pack = |c: [u8; 3]| (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+        let flags = self.bold as u8
+            | (self.italic as u8) << 1
+            | (self.inverse as u8) << 2
+            | (self.underline as u8) << 3;
+        let mut t = s.serialize_tuple(6)?;
+        t.serialize_element(&self.line)?;
+        t.serialize_element(&self.col)?;
+        t.serialize_element(&self.ch)?;
+        t.serialize_element(&pack(self.fg))?;
+        t.serialize_element(&pack(self.bg))?;
+        t.serialize_element(&flags)?;
+        t.end()
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -54,15 +78,11 @@ struct ColorTable {
     slots: [[u8; 3]; 259],
 }
 
-const fn rgb(r: u8, g: u8, b: u8) -> [u8; 3] {
-    [r, g, b]
-}
-
 impl ColorTable {
     // ansi: the 16 ANSI colors; fg/bg/cursor round out the table. 16..256 are the standard
     // xterm-256 cube + grayscale ramp (deterministic, theme-independent).
     fn new(ansi: [[u8; 3]; 16], fg: [u8; 3], bg: [u8; 3], cursor: [u8; 3]) -> Self {
-        let mut slots = [rgb(0, 0, 0); 259];
+        let mut slots = [[0, 0, 0]; 259];
         let mut i = 0;
         while i < 16 {
             slots[i] = ansi[i];
@@ -80,12 +100,12 @@ impl ColorTable {
             let r = (i / 36) % 6;
             let g = (i / 6) % 6;
             let b = i % 6;
-            slots[16 + i as usize] = rgb(level(r as u8), level(g as u8), level(b as u8));
+            slots[16 + i as usize] = [level(r as u8), level(g as u8), level(b as u8)];
         }
         // grayscale ramp: indices 232..256
         for i in 0..24u16 {
             let v = 8 + 10 * i as u8;
-            slots[232 + i as usize] = rgb(v, v, v);
+            slots[232 + i as usize] = [v, v, v];
         }
         slots[256] = fg;
         slots[257] = bg;
@@ -103,16 +123,20 @@ impl ColorTable {
     }
 }
 
-// hex helper so the theme table reads like the CSS values in main.ts
+// hex helper so the theme table reads like the CSS values
 const fn h(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
 
+/// A theme's terminal background, for the native window backing the webview paints over.
+pub(crate) fn theme_bg(name: &str) -> [u8; 3] {
+    theme_colors(name).slots[257]
+}
+
 fn theme_colors(name: &str) -> ColorTable {
     // ANSI order: black,red,green,yellow,blue,magenta,cyan,white, then bright variants.
-    // NOTE: beta (xterm.js) only themed bg/fg/cursor and used xterm's stock 16-color ANSI palette;
-    // these per-theme ANSI tables are a NEW, intentional addition so colored program output
-    // (ls --color, git diff, vim syntax) matches each theme rather than a fixed default set.
+    // The per-theme ANSI tables are intentional: colored program output (ls --color,
+    // git diff, vim syntax) matches each theme rather than a fixed default set.
     match name {
         "Dracula" => ColorTable::new(
             [
@@ -159,7 +183,7 @@ fn theme_colors(name: &str) -> ColorTable {
             ],
             h(0x00ff41), h(0x000000), h(0x00ff41),
         ),
-        // default: Tokyo Night (values from src/main.ts)
+        // default: Tokyo Night
         _ => ColorTable::new(
             [
                 h(0x15161e), h(0xf7768e), h(0x9ece6a), h(0xe0af68),
@@ -229,16 +253,11 @@ impl TerminalEngine {
         self.parser.screen().scrollback()
     }
 
-    /// Snap back to the live bottom (offset 0) and force a full re-emit. No-op (and no snapshot
-    /// nuke) when already at the bottom, so this is cheap to call on every keystroke.
+    /// Snap back to the live bottom (offset 0). The snapshot mirrors what the frontend has
+    /// painted, so it stays valid across the jump and the following `take_damage` ships only
+    /// the rows that actually differ.
     pub fn scroll_to_bottom(&mut self) {
-        if self.parser.screen().scrollback() == 0 {
-            return;
-        }
         self.parser.screen_mut().set_scrollback(0);
-        for s in &mut self.snapshot {
-            *s = None;
-        }
     }
 
     /// Resolve one screen cell to a paint-ready CellPayload.
@@ -270,22 +289,63 @@ impl TerminalEngine {
         // Hide the cursor while scrolled into history — its live position would land on
         // unrelated historical text.
         let visible = !screen.hide_cursor() && screen.scrollback() == 0;
-        CursorPayload { line, col, shape: "block", visible }
+        CursorPayload { line, col, color: self.colors.slots[258], visible }
     }
 
     /// Emit only the cells that changed since the last emit, updating the snapshot.
     // ponytail: O(rows*cols) scan per output chunk; fine to ~200x50. If paint latency shows,
     // gate on vt100's screen dirty state instead of a full rescan.
     pub fn take_damage(&mut self) -> GridDamage {
+        let default_fg = self.colors.slots[256];
+        let default_bg = self.colors.slots[257];
         let mut cells = Vec::new();
         for line in 0..self.rows {
             for col in 0..self.cols {
-                let cur = self.cell_at(line, col);
+                // Compare against the borrowed cell contents first: building a CellPayload per
+                // position (as cell_at does) allocated a String for all rows*cols cells on every
+                // scan, changed or not.
+                let (ch, fg, bg, bold, italic, inverse, underline) =
+                    match self.parser.screen().cell(line, col) {
+                        Some(c) => {
+                            let s = c.contents();
+                            (
+                                if s.is_empty() { " " } else { s },
+                                self.colors.resolve(c.fgcolor(), default_fg),
+                                self.colors.resolve(c.bgcolor(), default_bg),
+                                c.bold(),
+                                c.italic(),
+                                c.inverse(),
+                                c.underline(),
+                            )
+                        }
+                        None => (" ", default_fg, default_bg, false, false, false, false),
+                    };
                 let idx = line as usize * self.cols as usize + col as usize;
-                if self.snapshot[idx].as_ref() != Some(&cur) {
-                    self.snapshot[idx] = Some(cur.clone());
-                    cells.push(cur);
+                if let Some(p) = &self.snapshot[idx] {
+                    if p.ch == ch
+                        && p.fg == fg
+                        && p.bg == bg
+                        && p.bold == bold
+                        && p.italic == italic
+                        && p.inverse == inverse
+                        && p.underline == underline
+                    {
+                        continue;
+                    }
                 }
+                let cur = CellPayload {
+                    line,
+                    col,
+                    ch: ch.to_string(),
+                    fg,
+                    bg,
+                    bold,
+                    italic,
+                    inverse,
+                    underline,
+                };
+                self.snapshot[idx] = Some(cur.clone());
+                cells.push(cur);
             }
         }
         GridDamage { cols: self.cols, rows: self.rows, cursor: self.cursor(), application_cursor: self.parser.screen().application_cursor(), cells }
@@ -309,6 +369,91 @@ impl TerminalEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Allocation counter for the damage-scan acceptance test. Armed per-thread around the
+    // call under test so the other tests (and the harness threads) do not pollute the count.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<Option<usize>> = const { Cell::new(None) };
+        }
+
+        pub struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                let _ = LIVE.try_with(|c| c.set(c.get().map(|n| n + 1)));
+                unsafe { System.alloc(l) }
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                unsafe { System.dealloc(p, l) }
+            }
+        }
+
+        pub fn allocations(f: impl FnOnce()) -> usize {
+            LIVE.with(|c| c.set(Some(0)));
+            f();
+            LIVE.with(|c| c.take()).unwrap_or(0)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: counting::Counting = counting::Counting;
+
+    /// 200x50 with 4000 lines of varied coloured history — the geometry every performance
+    /// number in the release acceptance table is quoted for.
+    fn busy_engine() -> TerminalEngine {
+        let mut e = TerminalEngine::new(200, 50, "Tokyo Night");
+        let words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+        for n in 0..4000usize {
+            let mut line = String::new();
+            while line.len() < 40 + (n * 37) % 121 {
+                line.push_str(words[(n + line.len()) % words.len()]);
+                line.push(' ');
+            }
+            e.feed(format!("\x1b[3{}m{line}\x1b[0m\r\n", n % 8).as_bytes());
+        }
+        e
+    }
+
+    // The grid crosses IPC as JSON that Tauri then copies again into a JS source string, so
+    // bytes per cell is the scroll budget.
+    #[test]
+    fn grid_damage_stays_under_40_bytes_per_cell() {
+        let mut e = busy_engine();
+        let full = e.full_repaint();
+        let bytes = serde_json::to_string(&full).unwrap().len();
+        assert!(
+            bytes < full.cells.len() * 40,
+            "{} B for {} cells = {} B/cell",
+            bytes,
+            full.cells.len(),
+            bytes / full.cells.len()
+        );
+        // the frame that actually ships on a scroll pays the same per-cell budget
+        assert!(e.scroll_by(1));
+        let damage = e.take_damage();
+        let frame = serde_json::to_string(&damage).unwrap().len();
+        assert!(
+            frame < damage.cells.len() * 40,
+            "one-row scroll frame is {frame} B for {} cells",
+            damage.cells.len()
+        );
+    }
+
+    #[test]
+    fn take_damage_allocates_nothing_when_unchanged() {
+        let mut e = busy_engine();
+        let _ = e.full_repaint();
+        let _ = e.take_damage();
+        let n = counting::allocations(|| {
+            let d = e.take_damage();
+            assert!(d.cells.is_empty());
+        });
+        assert_eq!(n, 0, "unchanged 200x50 damage scan allocated {n} times");
+    }
 
     // The engine used to hardcode Tokyo Night and rely on a second IPC call to correct it,
     // so everything the shell printed before that call landed was painted with the dark
@@ -424,6 +569,80 @@ mod tests {
             assert!(frame == expected.cells);
             assert_eq!(expected.cursor.visible, e.scrollback() == 0);
         }
+        // Snapping to the live bottom keeps the snapshot, so only the rows that differ ship.
+        assert!(e.scroll_by(300));
+        for cell in e.take_damage().cells {
+            let idx = cell.line as usize * 80 + cell.col as usize;
+            frame[idx] = cell;
+        }
+        e.scroll_to_bottom();
+        let snap = e.take_damage();
+        assert!(snap.cells.len() < 80 * 6, "snap to bottom resent {} cells", snap.cells.len());
+        for cell in snap.cells {
+            let idx = cell.line as usize * 80 + cell.col as usize;
+            frame[idx] = cell;
+        }
+        assert!(frame == e.full_repaint().cells);
+    }
+
+    // The painter thread takes damage once per frame however many chunks the reader fed, so a
+    // dropped cell would leave text on screen that the user can read and act on.
+    #[test]
+    fn coalesced_damage_is_lossless() {
+        let mut e = TerminalEngine::new(80, 6, "Tokyo Night");
+        let mut frame = e.full_repaint().cells;
+        for n in 0..50 {
+            e.feed(format!("chunk {n} \x1b[32mgreen\x1b[0m\r\n").as_bytes());
+        }
+        for cell in e.take_damage().cells {
+            let idx = cell.line as usize * 80 + cell.col as usize;
+            frame[idx] = cell;
+        }
+        assert!(frame == e.full_repaint().cells);
+    }
+
+    #[test]
+    fn a_one_char_change_damages_exactly_one_cell() {
+        let mut e = TerminalEngine::new(20, 5, "Tokyo Night");
+        e.feed(b"abc");
+        let _ = e.full_repaint();
+        // overwrite the middle glyph in place and leave the cursor where it was
+        e.feed(b"\r\x1b[1CX\x1b[C");
+        let d = e.take_damage();
+        assert_eq!(d.cells.len(), 1);
+        assert_eq!(d.cells[0].col, 1);
+        assert_eq!(d.cells[0].ch, "X");
+    }
+
+    #[test]
+    fn the_cursor_carries_the_theme_colour() {
+        for name in ["Matrix", "Solarized Light"] {
+            let d = TerminalEngine::new(8, 2, name).full_repaint();
+            assert_eq!(d.cursor.color, theme_colors(name).slots[258]);
+        }
+        let colour = |name| TerminalEngine::new(8, 2, name).full_repaint().cursor.color;
+        assert_ne!(colour("Matrix"), colour("Solarized Light"));
+    }
+
+    // Timing is flaky on a loaded box, so it is opt-in: cargo test --release -- --ignored perf_
+    #[test]
+    #[ignore]
+    fn perf_unchanged_take_damage_under_150us() {
+        let mut e = busy_engine();
+        let _ = e.full_repaint();
+        let _ = e.take_damage();
+        // best of five passes: the first is cold, and a loaded box would otherwise flake
+        let per = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for _ in 0..100 {
+                    assert!(e.take_damage().cells.is_empty());
+                }
+                started.elapsed() / 100
+            })
+            .min()
+            .unwrap();
+        assert!(per < std::time::Duration::from_micros(150), "unchanged take_damage took {per:?}");
     }
 
     #[test]

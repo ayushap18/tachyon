@@ -8,6 +8,9 @@ if (!/^v\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(tag ?? '') || !source || !destination)
   throw new Error('Usage: node scripts/release.mjs vX.Y.Z installers release-assets');
 }
 const version = tag.slice(1);
+// First release whose updater could actually install a successor; earlier copies must be
+// replaced by hand. Named so the notes table below does not carry a stale literal.
+const SELF_UPDATE_SINCE = '0.2.6';
 const files = fs.readdirSync(source, { recursive: true }).map(file => path.join(source, file));
 const required = [
   `Tachyon_${version}_aarch64.dmg`,
@@ -47,8 +50,11 @@ if (signed) {
     // whose trusted comment lacks `version:<v>` — and no released Tauri CLI writes that field
     // (tools/sign-updater does). 0.2.7 shipped without it and no copy of 0.2.6 could install
     // it. Checked here so that mistake fails the release instead of a user's update.
-    const comment = Buffer.from(signature, 'base64').toString('utf8');
-    if (!comment.split(/[\t\n]/).includes(`version:${version}`)) {
+    // ONLY the trusted comment line: minisign leaves the untrusted one unauthenticated, so a
+    // version: field there proves nothing. Mirrors the plugin's own signed_version().
+    const trusted = Buffer.from(signature, 'base64').toString('utf8')
+      .split('\n').find(line => line.startsWith('trusted comment:')) ?? '';
+    if (!trusted.split('\t').includes(`version:${version}`)) {
       throw new Error(`${name}.sig does not record version:${version}; run tools/sign-updater before publishing`);
     }
     platforms[key] = {
@@ -66,7 +72,7 @@ fs.writeFileSync(path.join(destination, 'RELEASE_NOTES.md'), `Tachyon ${tag}
 
 Installers for all supported platforms are attached:
 
-| Platform | Download | Self-update (Tachyon 0.2.6 and later) |
+| Platform | Download | Self-update (Tachyon ${SELF_UPDATE_SINCE} and later) |
 | --- | --- | --- |
 | macOS · Apple Silicon | \`Tachyon_${version}_aarch64.dmg\` | In place: ⌘U, once Tachyon runs from /Applications |
 | Linux · x86_64 · Debian/Ubuntu | \`Tachyon_${version}_amd64.deb\` | No: install the new .deb with apt |

@@ -1,11 +1,11 @@
-//! The 6 themes -> chrome tokens, ported from src/main.ts THEMES + CHROME maps.
-//! `apply_theme` sets them as CSS variables on :root (mirroring main.ts
-//! applySettings lines 93-113) and returns the resolved tokens.
+//! The 6 themes -> chrome tokens. `apply_theme` sets them as CSS variables on
+//! :root. This table and engine.rs's `theme_colors` are the only two places in
+//! the tree that may name a colour.
 
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
-/// Font choices for the settings dropdown (main.ts line 52). The first entry is the
+/// Font choices for the settings dropdown. The first entry is the
 /// platform default.
 const FONTS_MAC: [&str; 6] = [
     "Menlo",
@@ -42,7 +42,7 @@ pub fn resolve_font(name: &str) -> &'static str {
     fonts().iter().copied().find(|f| *f == name).unwrap_or_else(default_font)
 }
 
-/// Theme names in display order (keys of THEMES in main.ts).
+/// Theme names in display order.
 pub const THEME_NAMES: [&str; 6] = [
     "Tokyo Night",
     "Dracula",
@@ -66,7 +66,7 @@ pub struct ThemeTokens {
     pub err: &'static str,
 }
 
-/// Look up tokens by theme name, falling back to Tokyo Night (main.ts `?? THEMES[...]`).
+/// Look up tokens by theme name, falling back to Tokyo Night.
 pub fn tokens(name: &str) -> ThemeTokens {
     match name {
         "Dracula" => ThemeTokens {
@@ -103,31 +103,97 @@ pub fn tokens(name: &str) -> ThemeTokens {
     }
 }
 
-/// Apply the theme's tokens as CSS variables on :root and set the body
-/// background, then return them. Mirrors main.ts applySettings lines 93-113
-/// (the CSS-variable + body-bg half; canvas font/size wiring lives elsewhere).
-pub fn apply_theme(name: &str) -> ThemeTokens {
+/// Apply the theme's tokens as CSS variables on :root. The page paints no backing of its
+/// own: `html, body` are transparent and the native window carries the theme colour, so
+/// the webview never composites a second layer over it.
+pub fn apply_theme(name: &str) {
     let t = tokens(name);
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return t;
-    };
-    if let Some(root) = doc
-        .document_element()
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
         .and_then(|e| e.dyn_into::<HtmlElement>().ok())
-    {
-        let s = root.style();
-        let _ = s.set_property("--bg", t.bg);
-        let _ = s.set_property("--fg", t.fg);
-        let _ = s.set_property("--accent", t.accent);
-        let _ = s.set_property("--surface", t.surface);
-        let _ = s.set_property("--surface-alt", t.surface_alt);
-        let _ = s.set_property("--border", t.border);
-        let _ = s.set_property("--muted", t.muted);
-        let _ = s.set_property("--ok", t.ok);
-        let _ = s.set_property("--err", t.err);
+    else {
+        return;
+    };
+    let s = root.style();
+    let _ = s.set_property("--bg", t.bg);
+    let _ = s.set_property("--fg", t.fg);
+    let _ = s.set_property("--accent", t.accent);
+    let _ = s.set_property("--surface", t.surface);
+    let _ = s.set_property("--surface-alt", t.surface_alt);
+    let _ = s.set_property("--border", t.border);
+    let _ = s.set_property("--muted", t.muted);
+    let _ = s.set_property("--ok", t.ok);
+    let _ = s.set_property("--err", t.err);
+}
+
+#[cfg(test)]
+mod tests {
+    /// The canvas is measured in Terminal's mount effect. A linked stylesheet may still be
+    /// loading then, which is what made the PTY spawn at roughly 35x8 and reflow.
+    #[test]
+    fn stylesheet_is_inlined_not_linked() {
+        let src = include_str!("app.rs");
+        assert!(!src.contains("document::Link"), "app.rs still links the stylesheet");
+        assert!(src.contains(r#"include_str!("../assets/main.css")"#), "app.rs does not inline it");
     }
-    if let Some(body) = doc.body() {
-        let _ = body.style().set_property("background", t.bg);
+
+    /// Only default-background canvas cells go see-through. Chrome paints on top of a
+    /// window the user can dial down to 40%, and a security control — the approval bar
+    /// above all — must never be hard to read against whatever is behind the window.
+    /// `#palette` is excluded on purpose: it is the dimming scrim over the terminal, and
+    /// the palette's readable surfaces are its input and its list.
+    #[test]
+    fn chrome_surfaces_stay_opaque() {
+        // Strip comments first, so a commented-out declaration cannot hide a live one.
+        let mut css = String::new();
+        let mut rest = include_str!("../assets/main.css");
+        while let Some(i) = rest.find("/*") {
+            css.push_str(&rest[..i]);
+            rest = rest[i..].split_once("*/").map_or("", |(_, r)| r);
+        }
+        css.push_str(rest);
+
+        for sel in ["#ai-bar", "#status-bar", "#settings", "#palette-input", "#palette-list", "#blocks"] {
+            let head = format!("\n{sel} {{\n");
+            let at = css.find(&head).unwrap_or_else(|| panic!("{sel} is gone from main.css")) + head.len();
+            let block = &css[at..][..css[at..].find("\n}").expect("unterminated block")];
+            let mut opaque = false;
+            for decl in block.split(';') {
+                let Some((prop, value)) = decl.split_once(':') else { continue };
+                let (prop, value) = (prop.trim(), value.trim());
+                assert!(prop != "opacity" && prop != "backdrop-filter", "{sel} fades itself: {prop}");
+                if prop.starts_with("background") {
+                    assert!(
+                        !value.contains("rgba(") && !value.contains("hsla(") && !value.contains("transparent"),
+                        "{sel} has a see-through background: {value}"
+                    );
+                    opaque |= value == "var(--surface)" || value == "var(--surface-alt)";
+                }
+            }
+            assert!(opaque, "{sel} has no opaque token background");
+        }
     }
-    t
+
+    /// The TypeScript prototype these modules were ported from is gone from the tree, so a
+    /// comment citing it by file and line sends a reader to nothing. Needles are built from
+    /// fragments so this test does not match itself.
+    #[test]
+    fn no_comment_cites_a_deleted_file() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut seen = 0;
+        for f in std::fs::read_dir(&src).unwrap() {
+            let path = f.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&path).unwrap();
+            for gone in [concat!("main", ".ts"), concat!("vim", ".ts")] {
+                assert!(!text.contains(gone), "{} cites {gone}", path.display());
+            }
+        }
+        // Reading the directory is what subjects a file added later to this too.
+        assert!(seen >= 13, "only {seen} rust files scanned");
+    }
 }

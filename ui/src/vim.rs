@@ -1,4 +1,4 @@
-//! Vim navigation over the visible terminal grid — ported from src/vim.ts.
+//! Vim navigation over the visible terminal grid.
 //! INSERT (default, keys pass to the pty) ⇄ NORMAL (⌘⇧V; i/a/Esc exit) ⇄ VISUAL (v).
 //! Motions h/j/k/l/w/b/0/$/gg/G, Ctrl-D/U, / n N search, y yank (visual).
 //!
@@ -209,7 +209,7 @@ fn do_search(v: &GridView, dir: i32, cursor: Signal<(i32, i32)>, last_search: Si
     }
 }
 
-/// NORMAL/VISUAL key dispatch — ported from src/vim.ts handleKey().
+/// NORMAL/VISUAL key dispatch.
 #[allow(clippy::too_many_arguments)]
 fn nav_key(
     state: AppState,

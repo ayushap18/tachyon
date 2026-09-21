@@ -34,15 +34,30 @@ keydown ─▶ encode_key ─▶ invoke("pty_write") ─▶ pty_write_internal �
 - `engine.rs` — `TerminalEngine` wraps a `vt100::Parser` (grid, cursor, 5000 lines of
   scrollback). `take_damage` resolves every cell against the theme's `ColorTable`, diffs it
   against the last emitted snapshot, and returns only changed cells as `GridDamage`.
-  `full_repaint` returns everything (mount, resize, theme change, scroll). While the user is
-  scrolled into history the reader thread feeds the engine but does not emit.
+  `full_repaint` returns everything (mount, resize, theme change, scroll). A cell crosses the
+  wire as the tuple `[line, col, ch, fg, bg, flags]` — colours packed into a u32, the four
+  attributes into a bitfield — mirrored by hand in `ui/src/terminal.rs::WireCell`.
+  The reader thread only feeds the engine; a second thread coalesces repaints to one per
+  ~8 ms, and skips them entirely while the user is scrolled into history. Because a frame is
+  a diff against one shared snapshot, order is load-bearing: emitters serialise on `paint`'s
+  order lock, held across the emit and taken before the engine lock, so a frame can never
+  overtake one diffed earlier. The reader thread emits nothing and takes neither.
 - `ui/src/terminal.rs` — `Term::apply` paints the cells on a 2D canvas. `encode_key` turns a
   `KeyboardEvent` into the bytes a terminal sends, honouring `application_cursor` (DECCKM)
   from the last `GridDamage`. The key and paste listeners stand down while an overlay is open
   or an input is focused, so overlay typing never leaks to the shell.
 - `term_write` feeds text into the engine for display only (⌘E output, agent narrative, slash
   results). It never touches the PTY.
-- Grid dimensions from the webview are clamped by `clamp_dim`; they size an allocation.
+- Grid dimensions from the webview are clamped by `clamp_grid`, per dimension and by area;
+  they size an allocation and every full repaint's JSON.
+- Startup: the native window is born in the saved theme (`run()` reads `settings.json` and
+  calls `set_background_color` before the first draw), and the page paints no backing of its
+  own — `html`/`body` are transparent and canvas cells in the theme background are cleared,
+  not filled. `app.rs` inlines `main.css` into the document rather than linking it, so
+  `fit()` measures a styled canvas and the PTY is spawned at the size it keeps.
+- Opacity (settings slider, 40–100, default 100) is alpha on that native backing alone, so
+  the only see-through surfaces are default-background canvas cells; glyphs, non-default
+  cell backgrounds and every chrome surface stay opaque (`chrome_surfaces_stay_opaque`).
 
 ## OSC 133 journal
 
@@ -219,14 +234,22 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
 `tauri-plugin-updater` with the endpoint and minisign pubkey compiled in from `tauri.conf.json`.
 Two halves, deliberately on opposite sides of the bridge:
 
-- **Check** — `update_check` (IPC, once per launch, from `ui/src/terminal.rs`) and `/update`
-  (via `update::slash`, peeled off in `run_slash` like `/mcp serve`). An HTTPS GET of
-  `latest.json` and a version compare; `notice` turns the result into one line or none.
-  `TACHYON_NO_UPDATE_CHECK=1` skips the launch check.
+- **Check** — `watch` (a Rust task started in `run()`: once 20 s after launch, then every
+  6 h ± 10%) and `/update` (via `update::slash`, peeled off in `run_slash` like
+  `/mcp serve`). An HTTPS GET of `latest.json` and a version compare, nothing else. `watch`
+  emits `update-available {version, notes}` — notes run through `one_line` and are capped at
+  300 chars, because `latest.json` is not signed — and `ui/src/status.rs` renders the pill,
+  the notes (a text node, never `dangerous_inner_html`) and "skip", which is a `localStorage`
+  key. `/update` answers in one line: `notice` when there is a newer version, "is the latest
+  version" only when the check actually completed, and "could not reach" when it did not.
+  `TACHYON_NO_UPDATE_CHECK=1` skips the background check for the whole session.
 - **Install** — `install_menu` adds "Check for Updates…" (`CmdOrCtrl+U`) and its
   `on_menu_event` handler calls `run_install`, which is not a command and not in
-  `generate_handler!`. The plugin downloads, verifies the signature and replaces the bundle;
-  Tachyon never restarts itself, because a live PTY holds the user's shell.
+  `generate_handler!`. A second activation while one is in flight is refused by `claim`, not
+  queued: two interleaved bundle swaps can leave no bundle at all. The plugin downloads
+  (percentage repainted in place on one line), verifies the signature and replaces the
+  bundle; a failure is named by `failure_text` from the error's variant rather than its
+  Display text. Tachyon never restarts itself, because a live PTY holds the user's shell.
 
 `install_target` (pure, table-tested) decides whether any of this can work in place:
 macOS outside AppTranslocation and an AppImage whose folder is writable are `Replaceable`;
@@ -246,12 +269,14 @@ and only when the signing secrets are set. Threat model: [danger-gate.md](danger
 | `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 | `mcp-server.json` | MCP server mode: enabled, port, **plaintext bearer token** | `/mcp serve on`, `/mcp serve off` |
+| `settings.json` | `{theme, opacity}` — read only by `run()`, to colour the window before the webview boots | `term_set_theme`, on every settings change |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
 is an `Err`, never a reset to defaults — a reset would be persisted over the user's keys by
 the next write. All writes go through `write_config`: temp file in the same directory,
-`chmod 0600`, then `rename`, so a reader sees the old file or the new one. Theme and font
-settings live in the webview's `localStorage`, not here.
+`chmod 0600`, then `rename`, so a reader sees the old file or the new one. Appearance and
+font settings live in the webview's `localStorage`, which stays authoritative; only the
+`{theme, opacity}` mirror below is on disk.
 
 Keybindings: the backend's `keybindings` command is `read_config` on `keybindings.json` and
 returns the raw `{id: chord}` map — it validates nothing. `ui/src/keymap.rs` owns both

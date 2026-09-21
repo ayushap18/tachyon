@@ -8,12 +8,14 @@
 //!     in Tauri 2, so `invoke("plugin:updater|download_and_install")` is rejected in Rust
 //!     before any handler runs;
 //!   * app commands are NOT ACL-scoped (docs/danger-gate.md), which is exactly why the
-//!     install path registers no `#[tauri::command]` at all. `update_check` is the only new
-//!     handler entry in this release and it downloads nothing, writes nothing, runs nothing;
+//!     install path registers no `#[tauri::command]` at all. This module registers none
+//!     either: the periodic check runs in Rust and reaches the webview as an event;
 //!   * installing is reached only from a native menu activation, which AppKit/GTK deliver
 //!     straight to Rust. `/update install` returns a usage string, never an install.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::menu::{Menu, MenuItem, MenuItemKind, Submenu};
 use tauri_plugin_updater::UpdaterExt;
@@ -97,12 +99,13 @@ fn can_replace(appimage: &Path) -> bool {
 
 // ---- U4: the notice ----
 
-/// One line, or None when there is nothing worth saying. `latest` is None when the check
-/// failed, was opted out of, or the running version is current. The line NEVER says
-/// "verified by Apple" or anything a user reads that way — tauri.conf.json's signing
-/// identity is ad-hoc and Apple verified nothing.
-pub(crate) fn notice(current: &str, latest: Option<&str>, target: InstallTarget) -> Option<String> {
-    let v = latest?;
+/// One line, or None when there is nothing worth saying: `newer` is None when this copy is
+/// current, and an Unsupported target has nothing to offer. A failed check is NOT None here
+/// — `check_line` reports that in words. The line NEVER says "verified by Apple" or anything
+/// a user reads that way — tauri.conf.json's signing identity is ad-hoc and Apple verified
+/// nothing.
+pub(crate) fn notice(current: &str, newer: Option<&str>, target: InstallTarget) -> Option<String> {
+    let v = newer?;
     let tail = match target {
         InstallTarget::Replaceable => format!("Press {ACC} to update in place."),
         InstallTarget::NotAppImage => {
@@ -119,12 +122,13 @@ pub(crate) fn notice(current: &str, latest: Option<&str>, target: InstallTarget)
     ))
 }
 
-/// Every failure is None: a check the user did not ask for must not surface an error.
 /// Uses `app.updater()`, never the runtime override — the compiled-in endpoint and public
-/// key are the whole security model.
-async fn latest_version(app: &AppHandle) -> Option<String> {
-    let update = app.updater().ok()?.check().await.ok()??;
-    Some(update.version)
+/// key are the whole security model. `Ok(None)` means the check completed and this copy is
+/// current; a transport or manifest failure is `Err`, never folded into `Ok(None)`.
+async fn latest(app: &AppHandle) -> Result<Option<String>, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let found = updater.check().await.map_err(|e| e.to_string())?;
+    Ok(found.map(|u| version(&u.version)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,39 +154,95 @@ pub(crate) fn parse_update(input: &str) -> Option<Result<UpdateCmd, String>> {
 /// Peeled off run_slash exactly like `mcp_server::slash`, which has no AppHandle.
 pub(crate) async fn slash(app: &AppHandle, input: &str) -> Option<Result<String, String>> {
     Some(match parse_update(input)? {
-        Ok(UpdateCmd::Check) => Ok(check_line(app).await),
+        Ok(UpdateCmd::Check) => {
+            let found = latest(app).await;
+            Ok(check_line(
+                &app.package_info().version.to_string(),
+                found.as_ref().map(Option::as_deref).map_err(String::as_str),
+                current_target(),
+            ))
+        }
         // `/update` is ungated IPC like every slash command, so this arm must stay a string.
         Ok(UpdateCmd::Install) => Err(USAGE.into()),
         Err(e) => Err(e),
     })
 }
 
-/// `/update` asked a direct question, so unlike the startup notice it always answers.
-async fn check_line(app: &AppHandle) -> String {
-    let cur = app.package_info().version.to_string();
-    let latest = latest_version(app).await;
-    let line = notice(&cur, latest.as_deref(), current_target());
-    line.unwrap_or_else(|| match latest {
-        Some(v) => format!(
+/// `/update` asked a direct question, so unlike the ambient check it always answers — and
+/// only a check that actually completed may answer "latest version".
+fn check_line(cur: &str, res: Result<Option<&str>, &str>, target: InstallTarget) -> String {
+    match res {
+        Ok(Some(v)) => notice(cur, Some(v), target).unwrap_or_else(|| format!(
             "\r\n\x1b[36m[tachyon] Tachyon {v} is available \u{2014} you have {cur}: {RELEASES}\x1b[0m\r\n"
+        )),
+        Ok(None) => format!("\r\n\x1b[36m[tachyon] Tachyon {cur} is the latest version\x1b[0m\r\n"),
+        Err(e) => format!(
+            "\r\n\x1b[31m[tachyon] could not reach the update server \u{2014} {e}. Download by hand: {RELEASES}\x1b[0m\r\n"
         ),
-        None => format!("\r\n\x1b[36m[tachyon] Tachyon {cur} is the latest version\x1b[0m\r\n"),
-    })
+    }
 }
 
-/// IPC. An https GET of the compile-time endpoint, a version compare, one string back.
-/// Downloads nothing, writes nothing, executes nothing — reachable from webview script
-/// exactly like `run_slash`, and that is acceptable and stated in danger-gate.md.
-// ponytail: one check per process launch, no cache file. A terminal is not launched in a
-// loop; add config_dir()/update.json only if telemetry ever shows the GET is a nuisance.
-#[tauri::command]
-pub(crate) async fn update_check(app: AppHandle) -> Option<String> {
+// ---- the ambient check ----
+
+/// Long enough for the frontend to have mounted and called `pty_spawn`.
+const SETTLE: Duration = Duration::from_secs(20);
+const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// `latest.json` is fetched over TLS but is NOT signed, so the notes are attacker-influenceable
+/// text. They are sanitised and capped before they cross the bridge.
+const NOTES_MAX: usize = 300;
+
+/// Spread the herd: a shared release moment must not become a spike on the endpoint. This
+/// only has to be uneven, not unpredictable, so the clock is enough and `rand` is not.
+fn jitter() -> Duration {
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) % 1000;
+    INTERVAL / 10 * n / 1000
+}
+
+/// One line of release notes, stripped of every control and invisible codepoint by the same
+/// `one_line` the approval gate uses, so the text cannot carry an escape sequence into the
+/// vt100 engine or a bidi override into what the user reads.
+fn notes(body: &str) -> String {
+    truncate_chars(&one_line(body), NOTES_MAX)
+}
+
+/// No real semver comes near this. The version is the notes' sibling in the same unsigned
+/// `latest.json`, and it reaches the same two sinks — the vt100 engine and the status bar —
+/// but semver puts no length limit on a pre-release identifier, so a manifest can carry
+/// megabytes here. Its grammar already restricts the charset to [0-9A-Za-z-.+], so length is
+/// the only thing left to enforce.
+const VERSION_MAX: usize = 64;
+
+fn version(v: &str) -> String {
+    truncate_chars(v, VERSION_MAX)
+}
+
+/// One check after SETTLE, then one every INTERVAL. It only ASKS: the answer becomes an
+/// event the status bar renders, and nothing here fetches an artifact or touches the bundle.
+/// An event rather than a printed line, because `term_write` is a silent no-op until the
+/// frontend has called `pty_spawn`, so a line painted at launch would be lost.
+pub(crate) fn watch(app: &AppHandle) {
     // An env var, not a fifth JSON file under config_dir() for one boolean.
     if std::env::var("TACHYON_NO_UPDATE_CHECK").is_ok_and(|v| v == "1") {
-        return None;
+        return;
     }
-    let cur = app.package_info().version.to_string();
-    notice(&cur, latest_version(&app).await.as_deref(), current_target())
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SETTLE).await;
+        loop {
+            if let Ok(up) = app.updater() {
+                if let Ok(Some(u)) = up.check().await {
+                    let _ = app.emit(
+                        "update-available",
+                        serde_json::json!({
+                            "version": version(&u.version),
+                            "notes": notes(u.body.as_deref().unwrap_or_default()),
+                        }),
+                    );
+                }
+            }
+            tokio::time::sleep(INTERVAL + jitter()).await;
+        }
+    });
 }
 
 // ---- U5: the install ----
@@ -214,16 +274,45 @@ pub(crate) fn install_menu(app: &AppHandle) -> tauri::Result<()> {
     }
     app.on_menu_event(|app, ev| {
         if ev.id() == MENU_ID {
-            tauri::async_runtime::spawn(run_install(app.clone()));
+            match claim() {
+                Some(guard) => {
+                    tauri::async_runtime::spawn(run_install(app.clone(), guard));
+                }
+                None => say(app, "\r\n\x1b[33m[tachyon] an update is already downloading\x1b[0m\r\n".into()),
+            }
         }
     });
     Ok(())
 }
 
+/// The accelerator is one keystroke and the handler returns as soon as it has spawned, so
+/// two presses would each pull the whole bundle and each run the plugin's rename-swap of the
+/// .app — interleaved, the second moves the first's freshly installed bundle into a TempDir
+/// that is deleted on drop. The second press is REFUSED, not queued.
+static INSTALLING: AtomicBool = AtomicBool::new(false);
+
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALLING.store(false, Ordering::Release);
+    }
+}
+
+/// ponytail: an install that hangs forever holds the flag for the process lifetime. The
+/// plugin's http client has its own timeouts, and a release-on-timeout is a second failure
+/// mode to get wrong.
+fn claim() -> Option<InstallGuard> {
+    INSTALLING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| InstallGuard)
+}
+
 /// NOT a `#[tauri::command]`. NOT in `generate_handler!`. Reached only from the menu event.
 /// Never calls `app.restart()`: a live PTY holds the user's shell, so the user decides when
-/// to quit.
-async fn run_install(app: AppHandle) {
+/// to quit. The guard is released here, on every exit path including a panic.
+async fn run_install(app: AppHandle, _guard: InstallGuard) {
     let cur = app.package_info().version.to_string();
     // Say something IMMEDIATELY. This used to print nothing until the download finished or
     // failed, so the menu item looked dead for as long as the network took.
@@ -233,9 +322,42 @@ async fn run_install(app: AppHandle) {
             "\r\n\x1b[36m[tachyon] Tachyon {v} installed \u{2014} signature checked. Quit and reopen Tachyon to use it. macOS may ask again for file-access permissions.\x1b[0m\r\n"
         ),
         Ok(None) => format!("\r\n\x1b[36m[tachyon] Tachyon {cur} is the latest version\x1b[0m\r\n"),
-        Err(e) => format!("\r\n\x1b[31m[tachyon] update failed: {e}\x1b[0m\r\n"),
+        Err(e) => format!(
+            "\r\n\x1b[31m[tachyon] update failed: {}\x1b[0m\r\n",
+            failure_text(&e, current_target())
+        ),
     };
     say(&app, msg);
+}
+
+/// Pure, and it matches the ENUM rather than the plugin's Display text, so a rewording
+/// upstream cannot silently turn a refused signature into a generic failure.
+fn failure_text(e: &tauri_plugin_updater::Error, target: InstallTarget) -> String {
+    use tauri_plugin_updater::Error as E;
+    // Where to get the build by hand depends on how this copy is installed.
+    let by_hand = match target {
+        InstallTarget::NotAppImage => format!("update through your package manager: {RELEASES}"),
+        InstallTarget::Translocated => {
+            format!("move Tachyon to /Applications and retry, or download it: {RELEASES}")
+        }
+        _ => format!("download it by hand: {RELEASES}"),
+    };
+    match e {
+        E::MissingSignedVersion | E::SignedVersionMismatch { .. } | E::Minisign(_) => {
+            format!("the download's signature was refused \u{2014} nothing was installed. {by_hand}")
+        }
+        E::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => {
+            "not enough disk space \u{2014} nothing was installed".into()
+        }
+        E::Reqwest(_) | E::Network(_) => {
+            "could not reach the download \u{2014} check your connection".into()
+        }
+        E::TargetNotFound(_) | E::TargetsNotFound(_) => format!("no build for this platform. {by_hand}"),
+        E::AuthenticationFailed => "the admin prompt was cancelled \u{2014} nothing was installed".into(),
+        E::DebInstallFailed | E::PackageInstallFailed => format!("the package install failed. {by_hand}"),
+        // The enum is #[non_exhaustive] and most of its variants have no advice to add.
+        _ => e.to_string(),
+    }
 }
 
 /// term_write feeds the DISPLAY engine only; it holds no PTY writer.
@@ -245,21 +367,40 @@ fn say(app: &AppHandle, msg: String) {
 
 /// Ok(None) = already current. The plugin does the GET, the manifest parse, the monotonic
 /// version compare and the minisign verification; none of that is overridden here.
-async fn install(app: &AppHandle) -> Result<Option<String>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+async fn install(app: &AppHandle) -> Result<Option<String>, tauri_plugin_updater::Error> {
+    let Some(update) = app.updater()?.check().await? else {
         return Ok(None);
     };
     say(app, format!(
         "\x1b[36m[tachyon] downloading Tachyon {} \u{2014} the signature is checked before anything is installed\u{2026}\x1b[0m\r\n",
-        update.version
+        version(&update.version)
     ));
-    // No progress bar: the closures are deliberately empty.
+    let (mut done, mut last) = (0usize, None);
     update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Some(update.version.clone()))
+        .download_and_install(
+            |chunk, total| {
+                done += chunk;
+                if let Some(p) = pct(done, total, &mut last) {
+                    // A leading \r with no newline repaints the same line in place.
+                    say(app, format!("\r\x1b[36m[tachyon] downloading \u{2014} {p}%\x1b[0m"));
+                }
+            },
+            || {},
+        )
+        .await?;
+    Ok(Some(version(&update.version)))
+}
+
+/// Some only when the whole-percent value CHANGED, and only when the total is known.
+/// Without the throttle every network chunk becomes a `term_write` plus a `grid-damage`
+/// emit, which is the webview flood the scroll work exists to stop.
+fn pct(done: usize, total: Option<u64>, last: &mut Option<u8>) -> Option<u8> {
+    let total = total.filter(|t| *t > 0)?;
+    let p = (done as u64 * 100 / total).min(100) as u8;
+    (*last != Some(p)).then(|| {
+        *last = Some(p);
+        p
+    })
 }
 
 #[cfg(test)]
@@ -378,6 +519,119 @@ mod tests {
                 assert!(!s.contains(bad), "{t:?} line says {bad}: {s}");
             }
         }
+    }
+
+    /// Offline, behind a captive portal or against a corrupt manifest, `/update` used to
+    /// answer "is the latest version" — an assertion it had not earned.
+    #[test]
+    fn check_line_never_claims_latest_on_error() {
+        let failed = check_line("0.2.8", Err("dns error"), InstallTarget::Replaceable);
+        assert!(failed.contains("could not reach") && failed.contains("dns error"), "{failed}");
+        assert!(!failed.contains("latest version"), "{failed}");
+        assert!(failed.contains(RELEASES), "{failed}");
+
+        let current = check_line("0.2.8", Ok(None), InstallTarget::Replaceable);
+        assert!(current.contains("0.2.8 is the latest version"), "{current}");
+
+        let newer = check_line("0.2.8", Ok(Some("0.2.9")), InstallTarget::Replaceable);
+        assert!(newer.contains("0.2.9 is available") && newer.contains(ACC), "{newer}");
+        // Nothing here can update in place, so the answer is the download page, not silence.
+        let unsupported = check_line("0.2.8", Ok(Some("0.2.9")), InstallTarget::Unsupported);
+        assert!(unsupported.contains("0.2.9 is available") && unsupported.contains(RELEASES), "{unsupported}");
+    }
+
+    #[test]
+    fn install_claim_is_single_flight() {
+        let first = claim().expect("nothing else holds it");
+        assert!(claim().is_none(), "a second \u{2318}U must be refused, not queued");
+        drop(first);
+        assert!(claim().is_some(), "the flag must clear when the install returns");
+    }
+
+    #[test]
+    fn pct_only_fires_on_a_whole_percent_change() {
+        let mut last = None;
+        // A server that sends no content-length gives no percentage rather than a wrong one.
+        assert_eq!(pct(0, None, &mut last), None);
+        assert_eq!(pct(1, Some(100), &mut last), Some(1));
+        assert_eq!(pct(1, Some(100), &mut last), None);
+        // Sub-percent progress paints nothing; crossing the boundary paints once.
+        assert_eq!(pct(19, Some(1000), &mut last), None);
+        assert_eq!(pct(20, Some(1000), &mut last), Some(2));
+        // A total that lies short must not produce 3200%.
+        assert_eq!(pct(32, Some(1), &mut last), Some(100));
+    }
+
+    #[test]
+    fn failure_text_names_the_signature_refusal() {
+        use tauri_plugin_updater::Error as E;
+        let refused = failure_text(&E::MissingSignedVersion, InstallTarget::Replaceable);
+        assert!(refused.contains("signature was refused"), "{refused}");
+        assert!(refused.contains("nothing was installed") && refused.contains(RELEASES), "{refused}");
+        // The typed arms must not leak the plugin's raw Debug/Display text.
+        assert!(!refused.contains("requireSignedVersion"), "{refused}");
+
+        let mismatch = E::SignedVersionMismatch {
+            signed: "0.2.6".into(),
+            announced: "0.2.9".into(),
+        };
+        assert_eq!(failure_text(&mismatch, InstallTarget::Replaceable), refused);
+
+        let offline = failure_text(&E::Network("connect refused".into()), InstallTarget::Replaceable);
+        assert!(offline.contains("check your connection"), "{offline}");
+
+        // The tail is what the user can actually do, so it follows the install target.
+        let deb = failure_text(&E::DebInstallFailed, InstallTarget::NotAppImage);
+        assert!(deb.contains("package manager"), "{deb}");
+        assert!(failure_text(&E::AuthenticationFailed, InstallTarget::Translocated).contains("cancelled"));
+        // Unmatched variants still say something rather than nothing.
+        assert!(!failure_text(&E::UnsupportedArch, InstallTarget::Replaceable).is_empty());
+    }
+
+    #[test]
+    fn notes_are_sanitised_before_they_cross_ipc() {
+        let raw = format!(
+            "\u{1b}]0;pwn\u{7}line1\r\nline2\u{202e}evil\u{2028}sep\u{2029}para{}",
+            "filler ".repeat(600)
+        );
+        let out = notes(&raw);
+        assert!(!out.chars().any(|c| c.is_control() || is_invisible(c)), "{out}");
+        assert!(!out.contains('\n') && !out.contains('\r'), "{out}");
+        // Zl/Zp are neither, and CSS breaks the status bar's single line on both.
+        assert!(!out.contains('\u{2028}') && !out.contains('\u{2029}'), "{out}");
+        assert!(out.chars().count() <= NOTES_MAX, "{} chars", out.chars().count());
+        assert!(out.contains("line1; line2"), "{out}");
+    }
+
+    /// The version is the notes' sibling in the same unsigned document and lands in the same
+    /// two sinks, but semver accepts a pre-release identifier of any length.
+    #[test]
+    fn a_long_version_is_capped_before_it_crosses_ipc() {
+        // A valid semver: the plugin's `parse_version` accepts a pre-release of any length.
+        let raw = format!("9.9.9-{}", "a".repeat(100_000));
+        assert!(version(&raw).chars().count() <= VERSION_MAX);
+        let line = check_line("0.2.9", Ok(Some(&version(&raw))), InstallTarget::Replaceable);
+        assert!(line.chars().count() < 400, "{} chars reach the vt100 engine", line.chars().count());
+
+        // and no manifest version reaches a sink without going through it
+        let live = include_str!("update.rs").split("#[cfg(test)]").next().unwrap();
+        for needle in [concat!("u.ver", "sion"), concat!("update.ver", "sion")] {
+            let total = live.matches(needle).count();
+            let capped = live.matches(&format!("version(&{needle})")).count();
+            assert_eq!(capped, total, "{} uncapped {needle} in update.rs", total - capped);
+        }
+    }
+
+    /// The periodic task must be provably incapable of fetching an artifact.
+    #[test]
+    fn the_check_path_never_downloads() {
+        let src = include_str!("update.rs");
+        let start = src.find("pub(crate) fn watch").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        for bad in [concat!("down", "load"), concat!("ins", "tall")] {
+            assert!(!body.contains(bad), "the check path names {bad}:\n{body}");
+        }
+        assert!(body.contains("check()"), "the slice missed the body of watch");
     }
 
     #[test]

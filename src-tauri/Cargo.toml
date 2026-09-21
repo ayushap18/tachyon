@@ -1,6 +1,6 @@
 [package]
 name = "tachyon"
-version = "0.2.8"
+version = "0.2.9"
 description = "An AI-native terminal with a Rust engine and reviewed shell commands"
 authors = ["Ayush"]
 edition = "2021"
@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# macos-private-api: without it wry gates the WKWebView drawsBackground=false path out, so
+# the webview paints opaque white over the themed NSWindow backing (wry wkwebview/mod.rs).
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
 # In-app update (see src/update.rs). Brings minisign-verify + tar/flate2/zip transitively;
 # reqwest with rustls-tls is already here, so the AppImage stays OpenSSL-free.

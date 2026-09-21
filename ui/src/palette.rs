@@ -1,6 +1,6 @@
-//! Command palette (⌘P). Ported from src/main.ts lines 387-502: a subsequence
-//! fuzzy filter over static actions + provider switches (from `provider_state`)
-//! + recent journal commands, with arrow/enter/esc navigation.
+//! Command palette (⌘P): a subsequence fuzzy filter over static actions +
+//! provider switches (from `provider_state`) + recent journal commands, with
+//! arrow/enter/esc navigation.
 
 use std::collections::HashSet;
 
@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::{AppState, Overlay, VimMode};
-use crate::bridge::{invoke, NoArgs, WriteArgs};
+use crate::bridge::{invoke, IdArgs, NoArgs, WriteArgs};
 use crate::keymap::{label, Action};
 
 #[wasm_bindgen]
@@ -19,11 +19,6 @@ extern "C" {
     // namespace missing) is an Err rather than a WASM unwind.
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "app"], js_name = getVersion, catch)]
     fn tauri_get_version() -> Result<js_sys::Promise, JsValue>;
-}
-
-#[derive(Serialize)]
-struct IdArgs {
-    id: String,
 }
 
 /// `provider_add_local` args — registers a discovered local runtime (keyless).

@@ -72,9 +72,9 @@ remote code execution, so:
   from `tauri.conf.json` through `generate_context!`. The plugin's one runtime override
   (`updater_builder`) and any custom version comparator are forbidden by a test that greps the
   source; every endpoint must be `https://`.
-- *No install command exists on the IPC surface.* `update_check` is the one updater entry in
-  `generate_handler!`; it does an HTTPS GET and a version compare, and downloads, writes and runs
-  nothing. `/update install` returns a usage string. Installing starts only from a native menu
+- *No updater command exists on the IPC surface at all.* `generate_handler!` names nothing from
+  `update.rs`; the background check is a Rust task that does an HTTPS GET and a version compare
+  and reports what it found as an event. `/update install` returns a usage string. Installing starts only from a native menu
   item (⌘U / Ctrl+U), which AppKit/GTK deliver straight to Rust — webview script cannot
   synthesize it. A test proves no handler name reaches the install path.
 - *The plugin is not granted to the webview.* `capabilities/default.json` is the members of
@@ -191,8 +191,9 @@ and is stopped only by the token.
 *other users and the browser*, not the user's own processes. A process that holds it can:
 
 - call `read_journal` and `get_context` with **no approval**: the last 50 commands, up to
-  4000 characters of each one's output, the cwd and git state. If you `cat .env` with the
-  server on, a token holder can read it. This is the feature's largest unguarded surface.
+  4000 characters of each one's output, the `cwd`, the git `branch` and `dirty` count, and
+  the shell's pid (`shell_pid`) and name (`shell`). If you `cat .env` with the server on, a
+  token holder can read it. This is the feature's largest unguarded surface.
 - **propose** commands. It cannot run them. `run_command` reaches the PTY only through
   `run_gated` → `agent_propose` → a human Enter; there is no allowlist, no trusted-client
   mode, no auto-approve, and no timeout that approves. A process running as you could
