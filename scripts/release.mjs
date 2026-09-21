@@ -42,8 +42,17 @@ if (signed) {
   const platforms = {};
   for (const [key, name] of Object.entries(updater)) {
     if (!required.includes(name)) pick(name);
+    const signature = pick(`${name}.sig`).toString('utf8').trim();
+    // tauri.conf.json sets requireSignedVersion, so the installed app refuses a signature
+    // whose trusted comment lacks `version:<v>` — and no released Tauri CLI writes that field
+    // (tools/sign-updater does). 0.2.7 shipped without it and no copy of 0.2.6 could install
+    // it. Checked here so that mistake fails the release instead of a user's update.
+    const comment = Buffer.from(signature, 'base64').toString('utf8');
+    if (!comment.split(/[\t\n]/).includes(`version:${version}`)) {
+      throw new Error(`${name}.sig does not record version:${version}; run tools/sign-updater before publishing`);
+    }
     platforms[key] = {
-      signature: pick(`${name}.sig`).toString('utf8').trim(),
+      signature,
       // Pinned to the tag: only the manifest itself is fetched through releases/latest.
       url: `https://github.com/ayushap18/tachyon/releases/download/${tag}/${name}`,
     };

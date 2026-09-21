@@ -161,6 +161,22 @@ jobs:
           path: installers
           merge-multiple: true
       - run: npm run test:release
+      # The bundler's signatures stop at `timestamp:…\tfile:…`; requireSignedVersion needs
+      # `version:` too, and no released Tauri CLI writes it. Re-sign here, where every
+      # platform's artifact is present, with the same key — see tools/sign-updater.
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.frontend.outputs.updater == 'true'
+      - name: Re-sign updater artifacts with the release version
+        if: needs.frontend.outputs.updater == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          pubkey="$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)"
+          cargo build --release --locked --manifest-path tools/sign-updater/Cargo.toml
+          find installers -type f \( -name '*.app.tar.gz' -o -name '*.AppImage' \) -print0 |
+            xargs -0 -n1 -I{} tools/sign-updater/target/release/sign-updater {} "$version" "$pubkey"
       - name: Verify all installers, generate checksums and latest.json
         env:
           UPDATER_SIGNED: ${{ needs.frontend.outputs.updater }}

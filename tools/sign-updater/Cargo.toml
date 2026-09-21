@@ -1,0 +1,13 @@
+[package]
+name = "sign-updater"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, like ui/: a release-time tool, never linked into the app.
+[workspace]
+
+[dependencies]
+minisign = "0.7"
+minisign-verify = "0.2"
+base64 = "0.22"

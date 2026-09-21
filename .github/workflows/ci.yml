@@ -51,6 +51,11 @@ jobs:
         run: cargo test
         working-directory: ui
 
+      # Holds the updater signing key at release time, so it is tested and built --locked.
+      - name: Updater signer tests
+        run: cargo test --locked
+        working-directory: tools/sign-updater
+
       - name: Frontend compiles to wasm
         run: cargo check --target wasm32-unknown-unknown
         working-directory: ui

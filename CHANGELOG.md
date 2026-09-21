@@ -4,6 +4,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.8 — 2026-09-21
+
+### Fixed
+- **No installed copy could install an update.** `requireSignedVersion` makes the app refuse a
+  signature that does not record `version:<v>` in its minisign trusted comment — the control
+  that stops a tampered manifest replaying an old signed release. tauri-plugin-updater 2.12
+  enforces the field, but no released Tauri CLI writes it (checked through 2.11.5), so 0.2.6
+  shipped verifying something nothing could produce, and rejected 0.2.7. Releases are now
+  re-signed by `tools/sign-updater` with the same key, recording the version, and
+  `scripts/release.mjs` refuses to publish a signature without it. **0.2.7 cannot be installed
+  in-app by anyone; installed 0.2.6 copies update straight to this release.**
+- The update menu item printed nothing until the download finished or failed, so it looked
+  dead for as long as the network took. It now says it is checking, then what it is
+  downloading.
+
 ## 0.2.7 — 2026-09-21
 
 ### Documentation

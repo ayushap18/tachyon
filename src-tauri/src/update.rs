@@ -225,6 +225,9 @@ pub(crate) fn install_menu(app: &AppHandle) -> tauri::Result<()> {
 /// to quit.
 async fn run_install(app: AppHandle) {
     let cur = app.package_info().version.to_string();
+    // Say something IMMEDIATELY. This used to print nothing until the download finished or
+    // failed, so the menu item looked dead for as long as the network took.
+    say(&app, "\r\n\x1b[36m[tachyon] checking for updates\u{2026}\x1b[0m\r\n".into());
     let msg = match install(&app).await {
         Ok(Some(v)) => format!(
             "\r\n\x1b[36m[tachyon] Tachyon {v} installed \u{2014} signature checked. Quit and reopen Tachyon to use it. macOS may ask again for file-access permissions.\x1b[0m\r\n"
@@ -232,7 +235,11 @@ async fn run_install(app: AppHandle) {
         Ok(None) => format!("\r\n\x1b[36m[tachyon] Tachyon {cur} is the latest version\x1b[0m\r\n"),
         Err(e) => format!("\r\n\x1b[31m[tachyon] update failed: {e}\x1b[0m\r\n"),
     };
-    // term_write feeds the DISPLAY engine only; it holds no PTY writer.
+    say(&app, msg);
+}
+
+/// term_write feeds the DISPLAY engine only; it holds no PTY writer.
+fn say(app: &AppHandle, msg: String) {
     term_write(app.clone(), app.state::<PtyState>(), msg);
 }
 
@@ -243,6 +250,10 @@ async fn install(app: &AppHandle) -> Result<Option<String>, String> {
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
         return Ok(None);
     };
+    say(app, format!(
+        "\x1b[36m[tachyon] downloading Tachyon {} \u{2014} the signature is checked before anything is installed\u{2026}\x1b[0m\r\n",
+        update.version
+    ));
     // No progress bar: the closures are deliberately empty.
     update
         .download_and_install(|_, _| {}, || {})

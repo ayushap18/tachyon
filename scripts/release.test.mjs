@@ -20,9 +20,15 @@ function fixture(t) {
   return { source, output, run };
 }
 
+// What tools/sign-updater writes: base64 of a minisign box whose trusted comment records the
+// version. release.mjs refuses a signed build whose .sig files lack it.
+const sigFor = (name, version = '0.2.1') =>
+  Buffer.from(`untrusted comment: signature from tauri secret key\nRUTest\ntrusted comment: timestamp:1\tfile:${name}\tversion:${version}\nsig\n`).toString('base64');
+const content = name => (name.endsWith('.sig') ? sigFor(name.slice(0, -4)) : `file ${name}\n`);
+
 test('complete platform set produces verifiable checksums, versioned notes and latest.json', t => {
   const { source, output, run } = fixture(t);
-  for (const name of [...names, ...signedNames]) fs.writeFileSync(path.join(source, name), `file ${name}\n`);
+  for (const name of [...names, ...signedNames]) fs.writeFileSync(path.join(source, name), content(name));
   const result = run(true);
   assert.equal(result.status, 0, result.stderr);
   const checksums = fs.readFileSync(path.join(output, 'SHA256SUMS'), 'utf8').trim().split('\n');
@@ -46,7 +52,7 @@ test('complete platform set produces verifiable checksums, versioned notes and l
     assert.ok(url.startsWith('https://github.com/ayushap18/tachyon/releases/download/v0.2.1/'), url);
     assert.ok(signature.length > 0);
   }
-  assert.equal(latest.platforms['darwin-aarch64'].signature, 'file Tachyon.app.tar.gz.sig');
+  assert.equal(latest.platforms['darwin-aarch64'].signature, sigFor('Tachyon.app.tar.gz'));
 });
 
 // No signing secrets yet: the release still ships, the updater simply is not offered it.
@@ -74,7 +80,7 @@ test('missing, empty and duplicate installers block publication', t => {
 
 test('a signed build missing one .sig blocks publication', t => {
   const { source, output, run } = fixture(t);
-  for (const name of [...names, ...signedNames]) fs.writeFileSync(path.join(source, name), 'file');
+  for (const name of [...names, ...signedNames]) fs.writeFileSync(path.join(source, name), content(name));
   fs.rmSync(path.join(source, 'Tachyon_0.2.1_amd64.AppImage.sig'));
   const result = run(true);
   assert.notEqual(result.status, 0);
@@ -84,6 +90,24 @@ test('a signed build missing one .sig blocks publication', t => {
 
 // README hardcodes installer filenames, which carry the version; it drifted 3 releases behind
 // the manifests before anything noticed. tauri.conf.json is the name the bundler actually emits.
+// 0.2.7 shipped exactly this: stock Tauri signatures with no version field, which every
+// installed 0.2.6 refused under requireSignedVersion. It must now block the release instead.
+test('a signature that does not record the release version blocks publication', t => {
+  const { source, output, run } = fixture(t);
+  for (const name of [...names, ...signedNames]) fs.writeFileSync(path.join(source, name), content(name));
+  const stock = Buffer.from('untrusted comment: x\nRUTest\ntrusted comment: timestamp:1\tfile:Tachyon.app.tar.gz\nsig\n').toString('base64');
+  fs.writeFileSync(path.join(source, 'Tachyon.app.tar.gz.sig'), stock);
+  let result = run(true);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not record version:0\.2\.1/);
+  assert.ok(!fs.existsSync(path.join(output, 'latest.json')));
+  // and a signature for a DIFFERENT version is the replay the field exists to stop
+  fs.writeFileSync(path.join(source, 'Tachyon.app.tar.gz.sig'), sigFor('Tachyon.app.tar.gz', '0.2.0'));
+  result = run(true);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not record version:0\.2\.1/);
+});
+
 test('README installer names carry the shipped version', () => {
   const root = new URL('../', import.meta.url);
   const { version } = JSON.parse(fs.readFileSync(new URL('src-tauri/tauri.conf.json', root), 'utf8'));

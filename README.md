@@ -24,13 +24,13 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
-| macOS · Apple Silicon | `Tachyon_0.2.7_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
-| Debian / Ubuntu · x86_64 | `Tachyon_0.2.7_amd64.deb` | `sudo apt install ./Tachyon_0.2.7_amd64.deb` |
-| Linux · x86_64 | `Tachyon_0.2.7_amd64.AppImage` | Make executable, then launch (below). |
+| macOS · Apple Silicon | `Tachyon_0.2.8_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.8_amd64.deb` | `sudo apt install ./Tachyon_0.2.8_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.8_amd64.AppImage` | Make executable, then launch (below). |
 
 ```sh
-chmod +x Tachyon_0.2.7_amd64.AppImage
-./Tachyon_0.2.7_amd64.AppImage
+chmod +x Tachyon_0.2.8_amd64.AppImage
+./Tachyon_0.2.8_amd64.AppImage
 ```
 
 Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
@@ -38,7 +38,7 @@ through apt; AppImage compatibility still depends on the host distribution. If A
 reports a FUSE error, try:
 
 ```sh
-./Tachyon_0.2.7_amd64.AppImage --appimage-extract-and-run
+./Tachyon_0.2.8_amd64.AppImage --appimage-extract-and-run
 ```
 
 Builds are **not signed by Apple**. If macOS blocks the first launch, use **System Settings →
@@ -49,7 +49,7 @@ an update does not ask again. Download `SHA256SUMS` alongside your installer to 
 # Linux: verifies the downloaded installers; skips those you did not download.
 sha256sum --ignore-missing -c SHA256SUMS
 # macOS: compare the printed digest with the corresponding SHA256SUMS entry.
-shasum -a 256 Tachyon_0.2.7_aarch64.dmg
+shasum -a 256 Tachyon_0.2.8_aarch64.dmg
 ```
 
 ### Updating
@@ -79,7 +79,7 @@ signature. Set `TACHYON_NO_UPDATE_CHECK=1` to skip the launch check. Details and
 3. Configure a provider with `/key <id> <apikey>`, or use `/local` to discover a local model.
 4. Ask for a command, review the proposed text, then choose whether to run it.
 
-**v0.2.7** documents how the updater signing key is created and why it must be backed up. **v0.2.6** added per-task model routing (`/route`), in-app updates, and a reworked danger gate
+**v0.2.8** is the first release the in-app updater can actually install (0.2.7 was signed in a form installed copies refuse). **v0.2.7** documented the updater signing key. **v0.2.6** added per-task model routing (`/route`), in-app updates, and a reworked danger gate
 that catches 71% of a held-out destructive corpus, up from 24%. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ### Keyboard
