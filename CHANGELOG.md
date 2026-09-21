@@ -4,6 +4,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.5 — 2026-09-21
+
+### Fixed
+- **The shell's first output was painted in the wrong theme.** The terminal engine hardcoded
+  the Tokyo Night palette at construction and relied on a second IPC round trip to correct it,
+  so the prompt and anything an rc file echoed were drawn with the dark palette and left on a
+  light background until something redamaged those cells — a dark slab over most of a large
+  window, with scattered correctly-coloured cells where later output landed. The theme now
+  travels with `pty_spawn`, so the engine starts with the right palette and the window in which
+  it could be wrong no longer exists. Live theme switching is unchanged.
+
 ## 0.2.4 — 2026-09-21
 
 ### Security
