@@ -4,6 +4,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.6 — 2026-09-21
+
+### Security
+- **The install could be triggered from the webview via a spoofed menu item.** Installs were
+  meant to start only from a native menu item, but the webview held menu permissions, so
+  script could create its own item carrying the install ID and bind it to ⌘C — pressed
+  constantly in a terminal. The webview no longer holds `core:menu` or `core:tray`, and a test
+  pins its exact capability list so they cannot return.
+- **A tampered update manifest could force a downgrade.** The manifest is not signed and the
+  "older version refused" check read only the version it claimed. `requireSignedVersion` is now
+  on, and a test asserts it stays on and that no insecure-transport or downgrade flag is set.
+
+
+### Changed
+- **OpenAI-compatible providers could answer with at most 1024 tokens.** Every non-Anthropic
+  request (OpenAI, Groq, Gemini, Kimi, DeepSeek, Mistral, local runtimes) hardcoded
+  `max_tokens: 1024` while Anthropic got 4096, which silently truncated agent replies on
+  thinking models. Both shapes now send one `AI_MAX_TOKENS` of 4096. A cap is a ceiling, not a
+  target, but a provider that bills or rate-limits by requested tokens may see the difference.
+- Each AI call has its own time limit instead of a shared 120 s: ⌘K 20 s, ⌘E and ⌘B 45 s,
+  the agent 120 s.
+- The danger gate collapses whitespace before matching and anchors the patterns that used to
+  flag prose (`man shutdown`), so `rm  -rf` with two spaces is caught and fewer benign commands
+  turn the bar red. On the held-out corpus in `evals/baseline/gate.json`, recall rose from
+  24.4% (11/45) to **71.1% (32/45)** and false positives fell from 14.3% (6/42) to **4.8%
+  (2/42)**. It is still a warn-only substring check, and the approval keypress is still the
+  control.
+- Launched from Finder or the Dock, Tachyon asks the login shell for provider keys and for the
+  `PATH` a stdio MCP server needs, instead of seeing neither.
+
+### Added
+- `/route <task> <id> [model]` sends one task — `command`, `explain` or `agent` — to its own
+  provider and model; `/route` prints the table, `/route <task> off` resets one. Routes ship
+  empty: until you set one, everything uses the active provider exactly as before. A route to a
+  removed provider falls back to the active one, never to a provider you did not pick.
+- In-app updates. Tachyon checks once per launch (`TACHYON_NO_UPDATE_CHECK=1` to skip) and
+  `/update` checks on demand. The `.dmg` and `.AppImage` builds install with ⌘U / Ctrl+U from a
+  native menu item, after checking the minisign signature; the `.deb` build does not update
+  itself and points you at the releases page. Nothing in the webview can start an install.
+  **Updates are delivered only by signed releases.** This is the first version carrying the
+  updater, so it can receive later versions but cannot update itself to 0.2.6; the release
+  that follows must be built with the signing key present for the check to find anything
+  installable.
+
 ## 0.2.5 — 2026-09-21
 
 ### Fixed

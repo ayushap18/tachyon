@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, KeyboardEvent};
 
-use crate::bridge::{invoke, listen, WriteArgs};
+use crate::bridge::{invoke, listen, NoArgs, WriteArgs};
 
 const FONT_PX: f64 = 14.0;
 const DEFAULT_FG: [u8; 3] = [0xc0, 0xc6, 0xc6];
@@ -700,6 +700,13 @@ fn setup(mut keys_loaded: Signal<bool>) {
         }
         if let Some(e) = key_err {
             crate::bridge::term_write(format!("\r\n\x1b[33m[tachyon] keybindings: {e} — using defaults\x1b[0m\r\n"));
+        }
+        // One https GET, one line, no download and no install — the install chord is a
+        // native menu item the webview cannot reach. Silent on every failure.
+        if let Ok(v) = invoke("update_check", NoArgs {}).await {
+            if let Some(s) = v.as_string() {
+                crate::bridge::term_write(s);
+            }
         }
         // The engine already has this theme (passed to pty_spawn), so this is no longer a
         // colour correction — it is just the initial full repaint, and it is idempotent.

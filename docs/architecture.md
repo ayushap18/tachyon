@@ -78,15 +78,24 @@ there is no in-memory cache to go stale. `mutate()` is the only writer and holds
 Keys: `local_models::key_for` returns the saved key, else the conventional env var
 (`env_key_name`: `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, …, `<ID>_API_KEY` for a custom id). It
 is resolved per request and never written into `Provider`, so an env key cannot reach
-`providers.json` or the webview. A Finder/Dock launch does not inherit the shell's
-environment; `/help` says so.
+`providers.json` or the webview. A Finder/Dock launch inherits no shell environment, so
+`key_for` falls back to `login_env()` — `$SHELL -lc '/usr/bin/env -0'` run once through
+`output_with_timeout`, populated on the first miss, empty on any failure. It is read, never
+`set_var`'d: the PTY child keeps inheriting the environment the user actually launched with.
+`mcp_stdio::spawn` takes `PATH` from the same map so a bare `npx` resolves from the Dock.
 
 Built-ins are re-added by `merge_defaults` on every load, except ids in
 `ProviderState.hidden`. `/remove <id>` deletes a provider (and its key), records a built-in
 in `hidden`, and moves `active` if it pointed there; `/use <id>` un-hides. The last provider
 cannot be removed.
 
-`ai_call(system, user)` is the only function that talks to a model. `kind == "anthropic"`
+`ai_call(task, system, user)` is the only function that talks to a model. Each call site
+names its `Task` in Rust — `Command` (⌘K), `Explain` (⌘E, ⌘B, `ai_complete`), `Agent` (⌘J) —
+and no IPC command takes one. `ProviderState::provider_for(task)` picks the provider from
+`routes` (set by `/route <task> <id> [model]`, stored in `providers.json`, empty by default);
+a missing route, or one naming a removed provider, resolves to the active provider and never
+to a second one. `Task::deadline` caps one call at 20 s / 45 s / 120 s, below the client's
+own 120 s timeout. Both request shapes send `AI_MAX_TOKENS` (4096). `kind == "anthropic"`
 posts to `/v1/messages` (on `base_url` when set — a proxy or gateway, `/url <id> <base_url>` —
 else `api.anthropic.com`; see `anthropic_url`); everything else posts the OpenAI shape to
 `{base_url}/chat/completions`, with no auth header when there is no key, which is what makes
@@ -205,13 +214,35 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   32 bytes from `/dev/urandom`, minted on first enable and kept after that. To rotate it:
   `/mcp serve off`, delete the file, `/mcp serve on`.
 
+## Self-update (`update.rs`)
+
+`tauri-plugin-updater` with the endpoint and minisign pubkey compiled in from `tauri.conf.json`.
+Two halves, deliberately on opposite sides of the bridge:
+
+- **Check** — `update_check` (IPC, once per launch, from `ui/src/terminal.rs`) and `/update`
+  (via `update::slash`, peeled off in `run_slash` like `/mcp serve`). An HTTPS GET of
+  `latest.json` and a version compare; `notice` turns the result into one line or none.
+  `TACHYON_NO_UPDATE_CHECK=1` skips the launch check.
+- **Install** — `install_menu` adds "Check for Updates…" (`CmdOrCtrl+U`) and its
+  `on_menu_event` handler calls `run_install`, which is not a command and not in
+  `generate_handler!`. The plugin downloads, verifies the signature and replaces the bundle;
+  Tachyon never restarts itself, because a live PTY holds the user's shell.
+
+`install_target` (pure, table-tested) decides whether any of this can work in place:
+macOS outside AppTranslocation and an AppImage whose folder is writable are `Replaceable`;
+a macOS app run straight off the `.dmg` is `Translocated`; a `.deb`, source build or
+`--appimage-extract-and-run` is `NotAppImage` and is pointed at the releases page. The menu
+item exists only when the target is `Replaceable`. `.github/workflows/release.yml` and
+`scripts/release.mjs` build and publish `latest.json`, the macOS `.app.tar.gz` and the `.sig`s,
+and only when the signing secrets are set. Threat model: [danger-gate.md](danger-gate.md).
+
 ## Config files
 
 `config_dir()` is `$XDG_CONFIG_HOME/tachyon`, else `$HOME/.config/tachyon`, else an error.
 
 | File | Contents | Written by |
 |---|---|---|
-| `providers.json` | provider list, active id, hidden built-ins, **plaintext API keys** (env-var keys are never written) | `/key`, `/use`, `/model`, `/local`, `/url`, `/remove` |
+| `providers.json` | provider list, active id, hidden built-ins, per-task `routes`, **plaintext API keys** (env-var keys are never written) | `/key`, `/use`, `/model`, `/local`, `/url`, `/remove`, `/route` |
 | `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 | `mcp-server.json` | MCP server mode: enabled, port, **plaintext bearer token** | `/mcp serve on`, `/mcp serve off` |
@@ -243,6 +274,7 @@ status bar · `settings.rs`, `theme.rs` appearance · `bridge.rs` IPC.
 | `src-tauri/src/mcp_stdio.rs` `mod tests` | stdio transport against fake servers written in `sh`: happy path, `isError`, exit, timeout + reaping (unix only) | same |
 | `src-tauri/src/engine.rs` `mod tests` | damage diffing, colours, scroll, resize | same |
 | `src-tauri/src/local_models.rs` `mod tests` | discovery and model listing against an in-test `TcpListener` stub, env-key precedence, error hints, key never in an error | same |
+| `src-tauri/src/update.rs` `mod tests` | `install_target` over macOS / AppImage / `.deb` / other, the notice wording, `/update` parsing; static tests in `lib.rs` pin the https endpoints, the capability file, and that no install command is registered. `run_install` needs a real update and is not covered | same |
 | `src-tauri/src/mcp_server.rs` `mod tests` | admission (Host, Origin, bearer, constant-time compare), JSON-RPC dispatch, tool input validation, token/config round-trip, `wait_block`, `agent_claim`, and the real HTTP server on an ephemeral port with a stub `Backend` (401, 403, initialize → tools/list → tools/call). `run_gated` itself needs an `AppHandle` and is not covered | same |
 | `ui/src/*.rs` | key encoding, selection, vim motions, keymap parsing/matching — pure logic, runs on the host | `cd ui && cargo test` |
 | `evals/` | model-facing behaviour; the keyless checks run in CI | see README → Evaluation |

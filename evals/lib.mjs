@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { AI_MAX_TOKENS } from "./rust-source.mjs";
 
 export const DIR = new URL(".", import.meta.url).pathname;
 
@@ -89,6 +90,28 @@ export function loadProviders(keylessHint) {
     process.exit(1);
   }
   if (models) bench = bench.flatMap((p) => models.map((model) => ({ ...p, model })));
+  // --route <task>: benchmark whatever the app would actually call for that task
+  // (ProviderState::provider_for), so a routing default can be chosen from a number
+  // rather than a guess. An unset or dangling route resolves to `active`, same as the app.
+  const route = argValue("--route");
+  if (route) {
+    if (only || models) {
+      console.error("--route is exclusive with --provider/--model");
+      process.exit(1);
+    }
+    // Mirrors ProviderState::provider_for (lib.rs): a missing route, or one naming a
+    // provider that no longer exists, resolves to the ACTIVE provider — and never
+    // carries the dead route's model override with it.
+    const r = config.routes?.[route];
+    const live = r != null && providers.some((p) => p.id === r.provider);
+    const id = live ? r.provider : config.active;
+    if (!live) console.error(`route ${route}: ${r ? `provider ${r.provider} is gone` : "unset"} — using active ${id}`);
+    bench = bench.filter((p) => p.id === id).map((p) => (live && r.model ? { ...p, model: r.model } : p));
+    if (bench.length === 0) {
+      console.error(`route ${route}: ${id} has no key`);
+      process.exit(1);
+    }
+  }
 
   if (bench.length === 0) {
     console.error(
@@ -119,7 +142,7 @@ async function ask(p, system, prompt) {
       // no `temperature` here: current Claude models reject it with a 400
       msg = await client.messages.create({
         model: p.model,
-        max_tokens: 1024,
+        max_tokens: AI_MAX_TOKENS,
         system,
         messages: [{ role: "user", content: prompt }],
       });
@@ -148,7 +171,7 @@ async function ask(p, system, prompt) {
     signal: AbortSignal.timeout(120000), // a hung socket would otherwise stall the whole run
     body: JSON.stringify({
       model: p.model,
-      max_tokens: 1024,
+      max_tokens: AI_MAX_TOKENS,
       temperature: 0, // run-to-run diffs should mean the prompt or model changed, not the dice
       messages: [
         { role: "system", content: system },

@@ -13,6 +13,8 @@
 //   node evals/run.mjs --provider groq --model openai/gpt-oss-120b   # …with a model override
 //   node evals/run.mjs --provider groq --models openai/gpt-oss-120b,openai/gpt-oss-20b
 //                                         # several models, one row each
+//   node evals/run.mjs --route command    # the provider+model the app would use for
+//                                         #   that task (routes in providers.json)
 //   node evals/run.mjs --limit 20         # cap NL cases for a quick run
 //   node evals/run.mjs --all              # also include keyless localhost providers
 //   node evals/run.mjs --context          # append the Context block the app sends
@@ -131,7 +133,9 @@ function finish({ at, provider, model, context, promptSha256, rescoredAt, cases,
   };
   // a run where every request failed is not a score: keep it for debugging, never promote it
   const noResult = failIfAllErrored(`${provider} (${model})`, totals.errors, cases.length);
-  const data = { at, harness: "run", provider, model, context, promptSha256, rescoredAt, totals, cases: cases.sort((a, b) => a.id.localeCompare(b.id)) };
+  // `route` is provenance only (undefined drops out of the JSON) — a route IS a
+  // (provider, model), so the artifact name and every reader stay unchanged.
+  const data = { at, harness: "run", provider, model, route: argValue("--route"), context, promptSha256, rescoredAt, totals, cases: cases.sort((a, b) => a.id.localeCompare(b.id)) };
   arts.push(writeArtifact(artifactName(provider, model), data, flag("--write") && !noResult));
 }
 

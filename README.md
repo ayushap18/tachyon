@@ -24,13 +24,13 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
-| macOS · Apple Silicon | `Tachyon_0.2.2_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
-| Debian / Ubuntu · x86_64 | `Tachyon_0.2.2_amd64.deb` | `sudo apt install ./Tachyon_0.2.2_amd64.deb` |
-| Linux · x86_64 | `Tachyon_0.2.2_amd64.AppImage` | Make executable, then launch (below). |
+| macOS · Apple Silicon | `Tachyon_0.2.6_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.6_amd64.deb` | `sudo apt install ./Tachyon_0.2.6_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.6_amd64.AppImage` | Make executable, then launch (below). |
 
 ```sh
-chmod +x Tachyon_0.2.2_amd64.AppImage
-./Tachyon_0.2.2_amd64.AppImage
+chmod +x Tachyon_0.2.6_amd64.AppImage
+./Tachyon_0.2.6_amd64.AppImage
 ```
 
 Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
@@ -38,18 +38,39 @@ through apt; AppImage compatibility still depends on the host distribution. If A
 reports a FUSE error, try:
 
 ```sh
-./Tachyon_0.2.2_amd64.AppImage --appimage-extract-and-run
+./Tachyon_0.2.6_amd64.AppImage --appimage-extract-and-run
 ```
 
-Builds are **unsigned**. If macOS blocks first launch, use **System Settings → Privacy &
-Security → Open Anyway**. Download `SHA256SUMS` alongside your installer to verify integrity:
+Builds are **not signed by Apple**. If macOS blocks the first launch, use **System Settings →
+Privacy & Security → Open Anyway** — once, at first install; see [Updating](#updating) for why
+an update does not ask again. Download `SHA256SUMS` alongside your installer to verify integrity:
 
 ```sh
 # Linux: verifies the downloaded installers; skips those you did not download.
 sha256sum --ignore-missing -c SHA256SUMS
 # macOS: compare the printed digest with the corresponding SHA256SUMS entry.
-shasum -a 256 Tachyon_0.2.2_aarch64.dmg
+shasum -a 256 Tachyon_0.2.6_aarch64.dmg
 ```
+
+### Updating
+
+From v0.2.6 Tachyon checks for a newer release once per launch and prints one line if there is
+one; `/update` asks on demand. Whether it can then replace itself depends on how you installed it:
+
+| Installed from | Updates in place? | How |
+| --- | --- | --- |
+| `.dmg` (macOS) | Yes, once Tachyon runs from Applications | **⌘U** (Tachyon menu → Check for Updates…). Run straight off the mounted `.dmg`, it is told to move itself first. |
+| `.AppImage` | Yes, if the folder holding the AppImage is writable | **Ctrl+U**. `--appimage-extract-and-run` cannot update in place. |
+| `.deb` | **No** | Download the new `.deb` and `sudo apt install ./<file>.deb`. The notice links the releases page. |
+
+The update is downloaded by Tachyon and installed only after its **minisign signature checks
+out** against a public key compiled into the app — Apple verifies nothing here. It is never
+triggered from the webview, only from that native menu item. Tachyon does not restart itself
+(a live shell is running); quit and reopen to use the new version. Because it is not downloaded
+through a browser, the update carries no quarantine flag and Gatekeeper does not ask again,
+but macOS **may** ask once more for file-access permissions, since each build has a new ad-hoc
+signature. Set `TACHYON_NO_UPDATE_CHECK=1` to skip the launch check. Details and limits:
+[docs/danger-gate.md](docs/danger-gate.md).
 
 ### First launch
 
@@ -58,8 +79,8 @@ shasum -a 256 Tachyon_0.2.2_aarch64.dmg
 3. Configure a provider with `/key <id> <apikey>`, or use `/local` to discover a local model.
 4. Ask for a command, review the proposed text, then choose whether to run it.
 
-**v0.2.2** fixes output hidden behind the status bar and stray pixels after text redraws,
-building on the scrolling and Linux packaging fixes in v0.2.1. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**v0.2.6** adds per-task model routing (`/route`), in-app updates, and a reworked danger gate
+that catches 71% of a held-out destructive corpus, up from 24%. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ### Keyboard
 
@@ -90,7 +111,10 @@ One more chord, deliberately not in the table: when an **external** agent propos
 MCP server mode, approving it takes **⌘⏎** (`Ctrl+⏎` on Linux), not Enter — those proposals arrive
 uninvited and take focus, so a stray Enter must not approve one. The built-in agent keeps plain Enter.
 
-Slash commands (`/keys`, `/model`, `/models`, `/local`, `/mcp …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
+⌘U / Ctrl+U (install an update) is a native menu item, not a keymap entry, and is present only
+when this copy can update in place — see [Updating](#updating).
+
+Slash commands (`/keys`, `/model`, `/models`, `/local`, `/route`, `/update`, `/mcp …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
 
 ## Features
 
@@ -219,11 +243,11 @@ Tasks not completed:
 
 **Danger gate on its own** (`npm run eval:gate`)
 
-_2026-09-20 (UTC) · 45 destructive + 42 benign held-out commands · 10 gate patterns · no model involved_
+_2026-09-21 (UTC) · 45 destructive + 42 benign held-out commands · 33 gate patterns · no model involved_
 
 | Recall (destructive commands flagged) | False positives (benign commands flagged) |
 |---|---|
-| 24.4% (11/45) | 14.3% (6/42) |
+| 71.1% (32/45) | 4.8% (2/42) |
 <!--EVAL:END-->
 
 ## Evaluation
@@ -255,10 +279,21 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /local <id> <url> <model> [key]    add any OpenAI-compatible endpoint by hand
 /url <id> <base_url>               point a provider at a proxy or gateway
 /remove <id>                       remove a provider (/use <id> restores a built-in)
+/route                             which provider+model each task uses (command explain agent)
+/route <task> <id> [model]         route one task; /route <task> off resets it
+/update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
 ```
 
 Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Everything non-Anthropic is called
 through the OpenAI-compatible `/chat/completions` shape, so local runtimes work unchanged.
+
+**Routing tasks to models.** Three tasks call a model: `command` (⌘K), `explain` (⌘E and the
+⌘B summaries) and `agent` (⌘J). By default all three use the active provider (`/use`).
+`/route agent groq qwen/qwen3.8-27b` sends only the agent to that provider and model; `/route`
+alone prints the table, and `/route agent off` hands the task back to the active provider. A
+route naming a provider you have since removed falls back to the active one — never to a
+provider you did not choose. Each task also has its own time limit (⌘K 20 s, explain 45 s,
+agent 120 s), so a stalled provider fails a ⌘K quickly instead of hanging it.
 
 **Local and open models.** `/local` with no arguments probes the usual ports concurrently and reports
 what is actually running:
@@ -279,8 +314,9 @@ Ollama, LM Studio, llama.cpp's server, vLLM and Jan are probed. Keyless endpoint
 or, if none is saved, from the conventional environment variable — `GROQ_API_KEY`, `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, and `<ID>_API_KEY` for anything else. An env-sourced key is used for the request and
 **never written to disk**. `/keys` shows the source, never the key; keys never cross into the webview.
-One caveat worth knowing: an app launched from Finder or the Dock does not inherit your shell
-environment, so the env-var path works when you start Tachyon from a shell.
+An app launched from Finder or the Dock inherits no shell environment, so on the first miss
+Tachyon asks your login shell (`$SHELL -lc`) what it would have exported — once, in Rust, with
+a 2 s timeout, never written to disk. The env-var path therefore works from the Dock too.
 
 **When a model disappears.** Providers retire models. A completion that fails with a 404 now says the
 model looks unavailable and points at `/models`, instead of surfacing an opaque HTTP error.
@@ -362,7 +398,11 @@ npm run tauri build -- --config '{"build":{"beforeBuildCommand":""}}'
 This is the arrangement used by [the release workflow](.github/workflows/release.yml): web
 assets built on Ubuntu 24.04, native Linux packages built on Ubuntu 22.04, and macOS packages
 built on Apple Silicon. A new release publishes only after all three installers are present,
-with SHA-256 checksums. Maintainers can rebuild an existing tag through the workflow's
+with SHA-256 checksums. When the `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets are set, it also signs the updater
+artifacts and publishes `latest.json`; without them the release still ships, but installed
+copies are not offered it. A repair run does not move GitHub's `latest` release, so the updater
+does not see it — a fix that must reach installed copies needs a new tag. Maintainers can rebuild an existing tag through the workflow's
 **Run workflow** form; tags must match the versions in both Cargo manifests and app config.
 
 ## Tests
@@ -374,7 +414,7 @@ cargo check --locked --manifest-path ui/Cargo.toml --target wasm32-unknown-unkno
 npm run eval:selftest               # gate extraction + matcher vs lib.rs's test vectors
 npm run eval:gate                   # gate recall / false-positive rate on the corpus
 npm run eval:agent:selftest         # agent-loop eval against a scripted mock model
-npm run test:release                # rejects missing/empty/duplicate installers
+npm run test:release                # rejects missing/empty/duplicate installers or .sigs; checks latest.json
 ```
 
 All keyless; CI runs these on macOS and Ubuntu.

@@ -9,6 +9,7 @@
 //   node evals/agent.mjs                       # every keyed provider, every task
 //   node evals/agent.mjs --provider groq --limit 3
 //   node evals/agent.mjs --provider groq --models openai/gpt-oss-120b,openai/gpt-oss-20b
+//   node evals/agent.mjs --route agent         # the provider+model the app would use for that task
 //   node evals/agent.mjs --baseline evals/baseline/agent-groq-openai-gpt-oss-120b.json   # per-task diff
 //   node evals/agent.mjs --write               # promote to evals/baseline/, re-render the README block
 //   node evals/agent.mjs --mock                # scripted fake model, no key, no network
@@ -236,7 +237,8 @@ for (const p of bench) {
   // a run where every task errored is not a score: keep it for debugging, never promote it
   const noResult = failIfAllErrored(`${p.id} (${p.model})`, totals.errors, n);
   // maxSteps / sandbox: the conditions the completion rate was earned under
-  const data = { at: new Date().toISOString(), harness: "agent", provider: p.id, model: p.model, promptSha256: sha256(AI_AGENT), maxSteps: MAX_STEPS, sandbox: HAS_SANDBOX, totals, tasks: runs };
+  // `route` is provenance only; undefined drops out of the JSON (see run.mjs)
+  const data = { at: new Date().toISOString(), harness: "agent", provider: p.id, model: p.model, route: argValue("--route"), promptSha256: sha256(AI_AGENT), maxSteps: MAX_STEPS, sandbox: HAS_SANDBOX, totals, tasks: runs };
   // written per model as it finishes, so a later model's failure cannot cost this one
   arts.push(mock ? data : writeArtifact(`agent-${artifactName(p.id, p.model)}`, scrubUser(data), flag("--write") && !noResult));
 }

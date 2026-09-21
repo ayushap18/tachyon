@@ -2,6 +2,7 @@ mod engine;
 mod local_models;
 mod mcp_server;
 mod mcp_stdio;
+mod update;
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -56,6 +57,39 @@ fn output_with_timeout(mut cmd: std::process::Command) -> Option<std::process::O
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+// A .dmg user launches from the Dock or Finder, which inherits none of the shell
+// environment — no GROQ_API_KEY, and a minimal PATH in which a bare `npx` does not
+// resolve. Ask the login shell what it would have given us.
+//
+// `-0` because a value may contain newlines; `-lc` because .zprofile/.profile are what set
+// these and only a LOGIN shell sources them. Split out from login_env() so the timeout path
+// is testable without touching the process-global SHELL.
+fn shell_env(shell: &str) -> std::collections::BTreeMap<String, String> {
+    if shell.is_empty() {
+        return Default::default();
+    }
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg("-lc").arg("/usr/bin/env -0");
+    // Any failure or timeout yields an empty map, i.e. exactly today's behaviour.
+    let Some(out) = output_with_timeout(cmd) else {
+        return Default::default();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|e| e.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Populated on the FIRST MISS, never at startup, so a slow rc file costs nothing on the
+/// happy path. Rust-side only: it never crosses IPC, and it deliberately does not
+/// std::env::set_var — that would change what the PTY child inherits, and the user's shell
+/// is not ours to rewrite.
+pub(crate) fn login_env() -> &'static std::collections::BTreeMap<String, String> {
+    static ENV: std::sync::OnceLock<std::collections::BTreeMap<String, String>> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| shell_env(&std::env::var("SHELL").unwrap_or_default()))
 }
 
 // Grid dimensions come from the webview and size a rows*cols allocation in the engine
@@ -644,22 +678,62 @@ fn term_set_theme(app: AppHandle, state: State<PtyState>, name: String) {
     }
 }
 
+// Lowercase, and matched against a whitespace-normalized command (see is_dangerous), so
+// every pattern here uses single spaces. Anchored where the bare word false-positives on
+// prose and on read-only tools: `man shutdown`, `last reboot`, `brew install mkfsgui` are
+// all things a user types. A pattern that cries wolf costs more than one that stays silent,
+// because a gate nobody believes is a gate nobody reads.
+// MUST stay a plain `&[&str]` literal — evals/rust-source.mjs extracts it verbatim.
 const DANGER_PATTERNS: &[&str] = &[
+    // recursive delete. Bare "rm -r" is DELIBERATELY absent: `rm -r build/` is routine,
+    // and flagging it would make red mean nothing.
     "rm -rf",
     "rm -fr",
+    "rm -r -f",
+    "rm --recursive",
+    "rm -r ~",
+    "rm -r /",
     "sudo rm",
+    "-exec rm",
+    "xargs rm",
+    "-delete",
+    // raw devices and filesystems
     "of=/dev",
-    "mkfs",
     "> /dev/sd",
+    "mkfs.",
+    "mkfs ",
+    "newfs_",
+    "diskutil erase",
+    "secureerase",
+    "shred ",
+    // unrecoverable by design
+    "crontab -r",
+    "git clean -f",
+    "reset --hard",
+    "push --force",
+    "system prune",
+    // permissions and process nukes
     "chmod -r 777 /",
+    "chmod -r 000",
+    "chown -r",
     ":(){",
-    "shutdown",
-    "reboot",
+    "kill -9 -1",
+    // piping the network straight into a root shell
+    "| sudo sh",
+    "| sudo bash",
+    // power. Anchored: the bare words appear in man pages, log output and commit messages.
+    "sudo shutdown",
+    "shutdown -",
+    "sudo reboot",
 ];
 
-// ponytail: lowercase substring scan — warn-only UI, false positives accepted by design
+// ponytail: lowercase substring scan — warn-only UI, false positives accepted by design.
+// Ceiling: substrings cannot see through the shell, so `$(echo rm) -rf ~` and `r\m -rf ~`
+// still pass. Lexing the command is the upgrade, and is its own release.
 pub fn is_dangerous(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
+    // Normalize whitespace runs to one space before scanning, so `rm  -rf /` and a
+    // tab-separated variant hit the same pattern as `rm -rf /`.
+    let lower = cmd.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
     DANGER_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
@@ -691,6 +765,55 @@ struct ProviderState {
     // serde(default) so a providers.json written before this field still loads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hidden: Vec<String>,
+    // per-task provider overrides; key = Task::name(). STRING keys ON PURPOSE: an unknown
+    // key must be inert, not a parse error — read_config turns a parse error into
+    // "providers.json is corrupt … refusing to overwrite it", which would lock the user
+    // out of their saved KEYS over a typo in a hand-edited task name.
+    // BTreeMap, not HashMap: deterministic output in a file people edit by hand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    routes: std::collections::BTreeMap<String, Route>,
+}
+
+/// A task's provider, by id. NEVER a base_url and NEVER a key: everything here is
+/// printable, and `/route` prints it. Empty `model` = the provider's own model.
+#[derive(Clone, Default, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct Route {
+    provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    model: String,
+}
+
+/// What an ai_call is FOR. Chosen in Rust at each call site; never an IPC argument.
+// ponytail: three variants. ⌘B summarize is the same shape of work as ⌘E and is
+// unmeasured — add a variant when a keyed eval shows it wants its own model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Task { Command, Explain, Agent }
+
+impl Task {
+    const ALL: [Task; 3] = [Task::Command, Task::Explain, Task::Agent];
+
+    fn name(self) -> &'static str {
+        match self { Task::Command => "command", Task::Explain => "explain", Task::Agent => "agent" }
+    }
+
+    // kept here so the type owns both directions of its own string form
+    fn parse(s: &str) -> Option<Task> {
+        let s = s.to_lowercase();
+        Task::ALL.into_iter().find(|t| t.name() == s)
+    }
+
+    /// Ceiling on ONE ai_call. HTTP_REQUEST_TIMEOUT (120s) is the agent's budget and used
+    /// to be everyone's; a ⌘K that hangs two minutes for one line is the worst latency
+    /// bug in the app, and this is the whole fix.
+    // ponytail: three hardcoded durations. Make it a Route field if anyone runs a provider
+    // slow enough to need it.
+    fn deadline(self) -> std::time::Duration {
+        match self {
+            Task::Command => std::time::Duration::from_secs(20),
+            Task::Explain => std::time::Duration::from_secs(45),
+            Task::Agent => HTTP_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 // IPC-safe views: never carry the raw key across the Tauri bridge into the webview.
@@ -762,6 +885,7 @@ impl ProviderState {
                 builtin("mistral", "openai", "https://api.mistral.ai/v1", "mistral-large-latest"),
             ],
             hidden: Vec::new(),
+            routes: Default::default(),
         }
     }
 
@@ -783,6 +907,8 @@ impl ProviderState {
             return Err(format!("{id} is the only provider left \u{2014} add another before removing it"));
         }
         self.providers.retain(|p| p.id != id);
+        // same mutate() call as the removal, so no route can outlive its provider on disk
+        self.routes.retain(|_, r| r.provider != id);
         if ProviderState::defaults().providers.iter().any(|d| d.id == id) && !self.hidden.iter().any(|h| h == id) {
             self.hidden.push(id.into());
         }
@@ -836,6 +962,37 @@ impl ProviderState {
             .find(|p| p.id == self.active)
             .cloned()
             .unwrap_or_else(|| ProviderState::defaults().providers.remove(0))
+    }
+
+    /// The provider+model for `task`. A missing route, or one naming a provider that no
+    /// longer exists, resolves to the ACTIVE provider — deliberately NOT the way
+    /// active_provider bottoms out (defaults().providers.remove(0) = claude/claude-opus-5).
+    /// A dangling route must never silently spend on Opus, and the ⌘K prompt carries the
+    /// shell context and journal tail, so it must never reach a provider the user did not
+    /// name for that task. There is no fallback chain: one provider, no retry.
+    fn provider_for(&self, task: Task) -> Provider {
+        let Some(r) = self.routes.get(task.name()) else { return self.active_provider() };
+        let Some(p) = self.providers.iter().find(|p| p.id == r.provider) else {
+            return self.active_provider();
+        };
+        let mut p = p.clone();
+        if !r.model.is_empty() {
+            p.model = r.model.clone();
+        }
+        p
+    }
+
+    fn set_route(&mut self, task: Task, id: &str, model: Option<&str>) -> Result<(), String> {
+        self.find_mut(id)?; // "unknown provider: {id}"
+        self.routes.insert(
+            task.name().into(),
+            Route { provider: id.into(), model: model.unwrap_or_default().into() },
+        );
+        Ok(())
+    }
+
+    fn clear_route(&mut self, task: Task) {
+        self.routes.remove(task.name());
     }
 }
 
@@ -978,13 +1135,20 @@ fn provider_add_local(id: String, base_url: String, model: String, key: String) 
 // ---- AI completion ----
 // Request/response shaping lives in pure helpers so they unit-test without a network.
 
-// max_tokens is 4096, not the 1024 the OpenAI body uses: claude-opus-5 thinks by default and
-// thinking tokens count against the cap, so 1024 could be spent before the answer starts.
+// One cap for both request shapes. 4096, not the 1024 the OpenAI body used to send: a
+// thinking model spends the cap before the answer starts (that was the anthropic-only fix),
+// and the SAME hazard applies to a reasoning model on an OpenAI-compatible provider — where
+// it hits the 12-step agent loop, not ⌘K. It is a CEILING, not a target: a one-line ⌘K reply
+// stops at EOS and bills the same either way (evals/baseline/groq-qwen-qwen3.8-27b.json:
+// tokensOut 1405 over 104 NL cases).
 // No thinking/effort/temperature params — the model is user-set and older ones reject them.
+// ponytail: one number; make it per-task when a measured task wants a different one.
+const AI_MAX_TOKENS: u32 = 4096;
+
 fn build_anthropic_body(model: &str, system: &str, user: &str) -> serde_json::Value {
     serde_json::json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": AI_MAX_TOKENS,
         "system": system,
         "messages": [{"role": "user", "content": user}]
     })
@@ -993,7 +1157,7 @@ fn build_anthropic_body(model: &str, system: &str, user: &str) -> serde_json::Va
 fn build_openai_body(model: &str, system: &str, user: &str) -> serde_json::Value {
     serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": AI_MAX_TOKENS,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -1048,8 +1212,8 @@ fn http_client() -> Result<reqwest::Client, String> {
 
 // The key appears ONLY in request headers — never in any error/log string.
 // Shared core for ai_complete / nl_to_command / explain_last_error — one HTTP path.
-async fn ai_call(system: &str, user: &str) -> Result<String, String> {
-    let p = load_state()?.active_provider();
+async fn ai_call(task: Task, system: &str, user: &str) -> Result<String, String> {
+    let p = load_state()?.provider_for(task);
     // saved key, else the conventional env var — resolved per request, never written back
     let key = local_models::key_for(&p).0;
     let client = http_client()?;
@@ -1073,9 +1237,18 @@ async fn ai_call(system: &str, user: &str) -> Result<String, String> {
         }
         r
     };
-    let resp = req.send().await.map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
+    // the deadline covers send AND the body read: a provider that answers headers and then
+    // stalls mid-body hangs just as long as one that never answers at all.
+    let fetch = async {
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    };
+    let (status, body) = tokio::time::timeout(task.deadline(), fetch)
+        .await
+        .map_err(|_| format!("{}: no reply in {}s", p.id, task.deadline().as_secs()))?
+        .map_err(|e| format!("{}: {}", p.id, e.without_url()))?;
     if !status.is_success() {
         return Err(local_models::completion_error(&p, &key, status.as_u16(), &body));
     }
@@ -1084,7 +1257,9 @@ async fn ai_call(system: &str, user: &str) -> Result<String, String> {
 
 #[tauri::command]
 async fn ai_complete(system: String, user: String) -> Result<String, String> {
-    ai_call(&system, &user).await
+    // the signature stays (system, user): the task is picked here, in Rust, so no IPC
+    // caller can select a route. See task_is_never_an_ipc_argument.
+    ai_call(Task::Explain, &system, &user).await
 }
 
 // ---- NL→command (⌘K) + error autopsy (⌘E) ----
@@ -1211,7 +1386,7 @@ async fn nl_to_command(
     let pid = *pty.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
     let jctx = journal_context(&journal.blocks.lock().unwrap_or_else(|e| e.into_inner()));
     let user = format!("{request}\n\nContext:\n{}\n{jctx}", shell_context_line(pid));
-    let command = one_line(&strip_fences(&ai_call(&with_env(AI_SYSTEM), &user).await?));
+    let command = one_line(&strip_fences(&ai_call(Task::Command, &with_env(AI_SYSTEM), &user).await?));
     if command.is_empty() {
         return Err("no command returned".into());
     }
@@ -1231,7 +1406,7 @@ async fn explain_last_error(journal: State<'_, JournalState>) -> Result<String, 
     };
     let cmd = if b.command.is_empty() { "(unknown)" } else { &b.command };
     let prompt = format!("Command: {cmd}\nExit code: {}\nOutput:\n{}", b.exit_code, tail_chars(&b.output, 3000));
-    ai_call(AI_EXPLAIN, &prompt).await
+    ai_call(Task::Explain, AI_EXPLAIN, &prompt).await
 }
 
 // Per-block explain (⌘B "explain" button): same AI_EXPLAIN prompt as ⌘E, but for an
@@ -1240,7 +1415,7 @@ async fn explain_last_error(journal: State<'_, JournalState>) -> Result<String, 
 async fn explain_output(command: String, exit_code: i64, output: String) -> Result<String, String> {
     let cmd = if command.is_empty() { "(unknown)" } else { &command };
     let prompt = format!("Command: {cmd}\nExit code: {exit_code}\nOutput:\n{}", tail_chars(&output, 2000));
-    ai_call(AI_EXPLAIN, &prompt).await
+    ai_call(Task::Explain, AI_EXPLAIN, &prompt).await
 }
 
 // ---- MCP client (Streamable HTTP + stdio) ----
@@ -1712,15 +1887,17 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add any local/OpenAI-compatible endpoint\r\n",
     "\x1b[36m/url <id> <base_url>\x1b[0m        point a provider at a proxy/gateway\r\n",
     "\x1b[36m/remove <id>\x1b[0m                remove a provider (/use <id> restores a built-in)\r\n",
+    "\x1b[36m/route\x1b[0m                      which provider+model each task uses (command explain agent)\r\n",
+    "\x1b[36m/route <task> <id> [model]\x1b[0m  route one task; /route <task> off resets it\r\n",
     "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n",
     "\x1b[36m/mcp add <name> -- <cmd> [args]\x1b[0m  add a local MCP server (stdio) \x1b[31m— Tachyon will run <cmd>\x1b[0m\r\n",
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers (transport, full command line) and their tools\r\n",
     "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (you approve each command)\r\n",
+    "\x1b[36m/update\x1b[0m                     check for a newer Tachyon (install: \u{2318}U / Ctrl+U)\r\n",
     "\x1b[90mbuilt-in ids: claude openai groq gemini kimi deepseek mistral\x1b[0m\r\n",
     "\x1b[90me.g. /local ollama http://localhost:11434/v1 llama3.2\x1b[0m\r\n",
     "\x1b[90mno saved key? GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY… (<ID>_API_KEY) is used, never saved.\x1b[0m\r\n",
-    "\x1b[90m  only if tachyon was started from a shell \u{2014} a Finder/Dock launch does not inherit your env.\x1b[0m\r\n",
 );
 
 fn render_providers(st: &ProviderState) -> String {
@@ -1737,6 +1914,23 @@ fn render_providers(st: &ProviderState) -> String {
         // model before key status: padding only lines up on text that carries no ANSI codes
         out.push_str(&format!("{mark} {:<9} \x1b[90m{:<26}\x1b[0m {keyed}\r\n", p.id, p.model));
     }
+    out
+}
+
+/// Routing is invisible otherwise: a ⌘K that silently spends on a route the user set
+/// last week is the failure this prints away. Reads a Provider and prints exactly two
+/// String fields — no base_url, no key, structurally.
+fn render_routes(st: &ProviderState) -> String {
+    let mut out = String::from("\r\n\x1b[36m[tachyon] routes\x1b[0m\r\n");
+    for t in Task::ALL {
+        let p = st.provider_for(t);
+        let src = if st.routes.contains_key(t.name()) { "" } else { " \x1b[90m(active)\x1b[0m" };
+        out.push_str(&format!(
+            "  {:<8} \x1b[90m{:<10}\x1b[0m \x1b[90m{}\x1b[0m{src}\r\n",
+            t.name(), p.id, p.model
+        ));
+    }
+    out.push_str("\x1b[90ma task with no route uses the active provider (/use)\x1b[0m\r\n");
     out
 }
 
@@ -1777,6 +1971,33 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
             mutate(|s| s.set_model(&active, model.clone()))?;
             Ok(format!("\r\n\x1b[36m[tachyon] {active} model: {model}\x1b[0m\r\n"))
         }
+        "route" => match rest.as_slice() {
+            [] => Ok(render_routes(&load_state()?)),
+            [task, spec, model @ ..] => {
+                let t = Task::parse(task)
+                    .ok_or_else(|| format!("unknown task: {task} \u{2014} command explain agent"))?;
+                if spec.eq_ignore_ascii_case("off") {
+                    mutate(|s| {
+                        s.clear_route(t);
+                        Ok(())
+                    })?;
+                    return Ok(format!(
+                        "\r\n\x1b[36m[tachyon] {} \u{2192} active provider\x1b[0m\r\n",
+                        t.name()
+                    ));
+                }
+                let m = model.first().copied();
+                mutate(|s| s.set_route(t, spec, m))?;
+                // echo what the route RESOLVES to, not what was typed: a bare id inherits
+                // the provider's own model, and the user has to be able to see which.
+                let p = load_state()?.provider_for(t);
+                Ok(format!(
+                    "\r\n\x1b[36m[tachyon] {} \u{2192} {} \u{b7} {}\x1b[0m\r\n",
+                    t.name(), p.id, p.model
+                ))
+            }
+            _ => Err("usage: /route [<task> <id> [model] | <task> off]".into()),
+        },
         "local" => match rest.as_slice() {
             [id, url, model, key @ ..] => {
                 let (id, url) = (id.to_string(), url.to_string());
@@ -1864,12 +2085,16 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
 // (async): /mcp list does blocking HTTP — must not run on the main thread.
 // Never rejects: errors come back as printable red ANSI text.
 #[tauri::command(async)]
-fn run_slash(app: AppHandle, input: String) -> String {
-    // `/mcp serve …` starts a listener that needs the AppHandle, which run_slash_inner
-    // (pure, unit-tested) deliberately does not take — so it is peeled off here.
-    mcp_server::slash(&app, &input)
-        .unwrap_or_else(|| run_slash_inner(&input))
-        .unwrap_or_else(|e| format!("\r\n\x1b[31m[tachyon] {e}\x1b[0m\r\n"))
+async fn run_slash(app: AppHandle, input: String) -> String {
+    // `/update` and `/mcp serve …` need the AppHandle, which run_slash_inner (pure,
+    // unit-tested) deliberately does not take — so they are peeled off here. (async fn
+    // rather than the sync one this used to be: `/update` awaits an https GET, and tauri
+    // spawns both shapes onto the same runtime, so /mcp list's blocking is unchanged.)
+    match update::slash(&app, &input).await {
+        Some(r) => r,
+        None => mcp_server::slash(&app, &input).unwrap_or_else(|| run_slash_inner(&input)),
+    }
+    .unwrap_or_else(|e| format!("\r\n\x1b[31m[tachyon] {e}\x1b[0m\r\n"))
 }
 
 // ---- Agent loop (⌘J) ----
@@ -2137,7 +2362,7 @@ async fn ai_call_abortable(app: &AppHandle, system: &str, user: &str) -> Result<
         }
     };
     tokio::select! {
-        r = ai_call(system, user) => r,
+        r = ai_call(Task::Agent, system, user) => r,
         _ = abort => Err("aborted".into()),
     }
 }
@@ -2328,11 +2553,16 @@ fn keybindings() -> Result<std::collections::HashMap<String, String>, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             app.manage(PtyState::default());
             app.manage(JournalState::default());
             app.manage(AgentState::default());
             mcp_server::autostart(app.handle());
+            // The ONLY trigger that can install an update. Adds no IPC handler.
+            // Non-fatal like mcp_server::autostart above: a menu that would not build must
+            // not cost the user their shell.
+            let _ = update::install_menu(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2371,6 +2601,7 @@ pub fn run() {
             mcp_list_tools,
             mcp_call,
             run_slash,
+            update::update_check,
             keybindings
         ])
         .run(tauri::generate_context!())
@@ -2517,6 +2748,56 @@ mod tests {
     #[test]
     fn dangerous_negatives() {
         for cmd in ["ls -la", "git status", "npm run dev", "rm file.txt", "grep -rf pattern .", "mkdir -p src"] {
+            assert!(!is_dangerous(cmd), "{cmd}");
+        }
+    }
+
+    // E3: a Dock/Finder launch has no shell environment. These cover the parse and the
+    // give-up path; the OnceLock wrapper around them is one line.
+    #[cfg(unix)]
+    fn fake_shell(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("tachyon-shell-{tag}-{}", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_env_is_parsed_nul_separated() {
+        // a value with a newline in it is why `env -0` and not `env`
+        let sh = fake_shell("env", r"printf 'A=1\0B=two\nlines\0'");
+        let env = shell_env(sh.to_str().unwrap());
+        std::fs::remove_file(&sh).unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("two\nlines"));
+        assert!(shell_env("").is_empty());
+        assert!(shell_env("/nonexistent/shell").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_login_shell_returns_empty_within_probe_timeout() {
+        let sh = fake_shell("hang", "sleep 30");
+        let t = std::time::Instant::now();
+        let env = shell_env(sh.to_str().unwrap());
+        let waited = t.elapsed();
+        std::fs::remove_file(&sh).unwrap();
+        // output_with_timeout kills AND reaps on overrun, so no zombie outlives this.
+        assert!(env.is_empty());
+        assert!(waited < PROBE_TIMEOUT + std::time::Duration::from_secs(2), "{waited:?}");
+    }
+
+    // The two halves of the v0.2.6 gate rework: padding no longer hides a match, and the
+    // bare power words no longer fire on prose. Kept apart from the vector tests above
+    // because those two lists are replayed by the JS port (evals/rust-source.mjs).
+    #[test]
+    fn whitespace_and_anchored_patterns() {
+        for cmd in ["rm  -rf /", "rm\t-rf /", "rm -r -f node_modules", "find . -delete", "git reset --hard HEAD~20"] {
+            assert!(is_dangerous(cmd), "{cmd}");
+        }
+        for cmd in ["man shutdown", "last reboot", "git commit -m 'reboot the onboarding flow'", "brew install mkfsgui", "diskutil list"] {
             assert!(!is_dangerous(cmd), "{cmd}");
         }
     }
@@ -2902,7 +3183,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
 
     #[test]
     fn merge_defaults_keeps_user_and_adds_missing() {
-        let mut s = ProviderState { active: "groq".into(), providers: vec![builtin("groq", "openai", "x", "m")], hidden: Vec::new() };
+        let mut s = ProviderState { active: "groq".into(), providers: vec![builtin("groq", "openai", "x", "m")], hidden: Vec::new(), routes: Default::default() };
         s.providers[0].key = "keep".into();
         s.merge_defaults();
         assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().key, "keep");
@@ -3006,6 +3287,103 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(out.contains("✓key saved") && !out.contains("sk-saved-secret"));
     }
 
+    // ---- Updater invariants. These are greps, not behaviour tests: the properties they
+    // pin are "a line is absent from the tree", which no runtime test can observe. ----
+
+    /// Granting `updater:*` here would hand webview script
+    /// invoke("plugin:updater|download_and_install"). Plugin commands ARE ACL-scoped in
+    /// Tauri 2, so this file is the enforcement — not an oversight.
+    ///
+    /// `core:default` is spelled out minus `core:menu` and `core:tray`: menu events reach
+    /// every global listener by id string alone, so a webview that could create a menu item
+    /// with id `tachyon:update` would own a trigger for `run_install`. The UI only uses
+    /// core.invoke, event.listen, app.getVersion and path.homeDir.
+    #[test]
+    fn capability_never_grants_the_updater_plugin() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(
+            v["permissions"],
+            serde_json::json!([
+                "core:path:default",
+                "core:event:default",
+                "core:window:default",
+                "core:webview:default",
+                "core:app:default",
+                "core:image:default",
+                "core:resources:default",
+                "opener:default"
+            ])
+        );
+    }
+
+    #[test]
+    fn updater_endpoints_are_https_and_pubkey_is_set() {
+        let conf = include_str!("../tauri.conf.json");
+        let insecure = concat!("dangerousInsecure", "TransportProtocol");
+        assert!(!conf.contains(insecure), "insecure transport");
+        let v: serde_json::Value = serde_json::from_str(conf).unwrap();
+        let u = &v["plugins"]["updater"];
+        assert!(!u["pubkey"].as_str().unwrap().is_empty());
+        // The manifest is unsigned; without this an inflated `version` paired with an old
+        // release's real url+signature forces a downgrade (plugin config.rs doc comment).
+        assert_eq!(u["requireSignedVersion"], true);
+        for bad in ["allowDowngrades", "dangerousAcceptInvalidCerts", "dangerousAcceptInvalidHostnames"] {
+            assert!(u.get(bad).is_none(), "{bad} weakens update verification");
+        }
+        let eps = u["endpoints"].as_array().unwrap();
+        assert!(!eps.is_empty());
+        for e in eps {
+            assert!(e.as_str().unwrap().starts_with("https://"), "{e}");
+        }
+    }
+
+    /// S1/S3: the endpoint, the public key and the version comparator reach the binary only
+    /// through generate_context! at compile time. The plugin's runtime overrides are the
+    /// only way past that, so they must appear nowhere in the tree. Built from fragments so
+    /// this test does not match itself.
+    #[test]
+    fn update_source_never_overrides_the_endpoint() {
+        let forbidden = [
+            concat!("updater_", "builder"),
+            concat!("dangerousInsecure", "TransportProtocol"),
+            concat!("version_", "comparator"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut seen = 0;
+        for f in std::fs::read_dir(&src).unwrap() {
+            let path = f.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&path).unwrap();
+            for bad in forbidden {
+                assert!(!text.contains(bad), "{} contains {bad}", path.display());
+            }
+        }
+        // Reading the directory rather than a list of include_str! is what makes a file
+        // added later subject to this too; the count only proves the walk ran.
+        assert!(seen >= 7, "only {seen} rust files scanned");
+    }
+
+    /// S5: installing must not be reachable from the webview. `update_check` is the one new
+    /// handler entry in this release and it only reads.
+    #[test]
+    fn no_install_command_is_registered() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler!").unwrap();
+        let handlers = &src[start..start + src[start..].find("])").unwrap()];
+        for bad in [
+            concat!("run_", "install"),
+            concat!("install_", "menu"),
+            concat!("tachyon", ":update"),
+        ] {
+            assert!(!handlers.contains(bad), "{bad} is on the IPC surface");
+        }
+        assert!(handlers.contains("update::update_check"));
+    }
+
     #[test]
     fn slash_usage_for_provider_maintenance() {
         assert_eq!(run_slash_inner("/remove").unwrap_err(), "usage: /remove <id>");
@@ -3015,10 +3393,17 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
             run_slash_inner("/local mybox http://10.0.0.2:8000/v1").unwrap_err(),
             "usage: /local <id> <base_url> <model> [key]"
         );
-        for cmd in ["/models", "/local", "/remove", "/url"] {
+        assert_eq!(
+            run_slash_inner("/route command").unwrap_err(),
+            "usage: /route [<task> <id> [model] | <task> off]"
+        );
+        assert_eq!(
+            run_slash_inner("/route bogus groq").unwrap_err(),
+            "unknown task: bogus \u{2014} command explain agent"
+        );
+        for cmd in ["/models", "/local", "/remove", "/url", "/route", "/update"] {
             assert!(SLASH_HELP.contains(cmd), "{cmd} missing from /help");
         }
-        assert!(SLASH_HELP.contains("Finder"));
     }
 
     #[test]
@@ -3037,7 +3422,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert_eq!(
             build_openai_body("m", "sys", "hi"),
             serde_json::json!({
-                "model": "m", "max_tokens": 1024,
+                "model": "m", "max_tokens": 4096,
                 "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
             })
         );
@@ -3500,6 +3885,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
             active: "openai".into(),
             providers: vec![builtin("openai", "openai", "https://api.openai.com/v1", "gpt-4o")],
             hidden: vec!["groq".into()],
+            routes: Default::default(),
         };
         st.providers[0].key = "sk-saved-secret".into();
 
@@ -3512,5 +3898,224 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         let mut keys: Vec<&str> = v.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["active", "hidden", "providers"]);
+    }
+
+    // ---- R1/R2/R3: task routing, per-task deadline, one token cap ----
+
+    /// S8: there is no fallback chain. A route that is missing, or that names a provider
+    /// that is gone, lands on the provider the user chose — never on defaults()[0],
+    /// which is claude/claude-opus-5 and would silently spend on Opus.
+    #[test]
+    fn route_unset_or_dangling_resolves_to_active_not_claude() {
+        let mut s = ProviderState::defaults();
+        s.use_provider("groq").unwrap();
+        assert_eq!(s.provider_for(Task::Command).id, "groq"); // no route at all
+
+        s.routes.insert("command".into(), Route { provider: "gone".into(), model: String::new() });
+        let p = s.provider_for(Task::Command);
+        assert_eq!(p.id, "groq");
+        assert_ne!(p.id, "claude");
+    }
+
+    #[test]
+    fn route_model_override_does_not_mutate_the_provider() {
+        let mut s = ProviderState::defaults();
+        let own = s.providers.iter().find(|p| p.id == "groq").unwrap().model.clone();
+        s.set_route(Task::Explain, "groq", Some("llama-3.3-70b")).unwrap();
+        assert_eq!(s.provider_for(Task::Explain).model, "llama-3.3-70b");
+        assert_eq!(s.providers.iter().find(|p| p.id == "groq").unwrap().model, own);
+        // an empty model means "the provider's own", not ""
+        s.set_route(Task::Explain, "groq", None).unwrap();
+        assert_eq!(s.provider_for(Task::Explain).model, own);
+    }
+
+    #[test]
+    fn set_route_rejects_an_unknown_provider() {
+        let mut s = ProviderState::defaults();
+        assert_eq!(s.set_route(Task::Agent, "nope", None).unwrap_err(), "unknown provider: nope");
+        assert!(s.routes.is_empty());
+    }
+
+    #[test]
+    fn remove_drops_routes_naming_the_id() {
+        let mut s = ProviderState::defaults();
+        s.set_route(Task::Command, "mistral", None).unwrap();
+        s.set_route(Task::Agent, "groq", None).unwrap();
+        s.remove("mistral").unwrap();
+        assert!(!s.routes.contains_key("command"));
+        assert_eq!(s.routes["agent"].provider, "groq");
+        s.clear_route(Task::Agent);
+        assert!(s.routes.is_empty());
+    }
+
+    #[test]
+    fn providers_json_without_routes_still_loads() {
+        let old = r#"{"active":"groq","providers":[{"id":"groq","kind":"openai","base_url":"u","model":"m","key":"k"}]}"#;
+        let s: ProviderState = serde_json::from_str(old).unwrap();
+        assert!(s.routes.is_empty());
+        assert_eq!(s.active_provider().key, "k");
+        // an untouched state writes neither field, so an older build still reads the file
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("routes") && !json.contains("hidden"), "{json}");
+    }
+
+    /// XDG_CONFIG_HOME is process-global and cargo runs tests in parallel threads, so
+    /// every test that drives the real config path (load_state/mutate/providers_path)
+    /// holds this for as long as the variable is set.
+    static CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poison is irrelevant here: the guarded data is (), the env var is reset by the
+    /// next taker anyway, so one panicking test must not wedge the whole suite.
+    fn config_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Same disk path as load_state/save_state, which are write_config/read_config plus
+    /// merge_defaults — called below. Avoids XDG_CONFIG_HOME, which is process-global.
+    #[test]
+    fn routes_survive_a_disk_round_trip() {
+        let dir = std::env::temp_dir().join(format!("tachyon-routes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+
+        let mut s = ProviderState::defaults();
+        s.set_route(Task::Command, "groq", Some("llama-3.3-70b")).unwrap();
+        write_config(&path, &s).unwrap();
+
+        let mut back: ProviderState = read_config(&path).unwrap().unwrap();
+        back.merge_defaults(); // what load_state does
+        assert_eq!(back.routes["command"].provider, "groq");
+        assert_eq!(back.provider_for(Task::Command).model, "llama-3.3-70b");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slash_route_round_trip() {
+        let _env = config_env_lock();
+        let dir = std::env::temp_dir().join(format!("tachyon-slash-route-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tachyon")).unwrap(); // config_dir() appends it
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let set = run_slash_inner("/route command groq openai/gpt-oss-120b").unwrap();
+        let listed = run_slash_inner("/route").unwrap();
+        let off = run_slash_inner("/route command off").unwrap();
+        let after = run_slash_inner("/route").unwrap();
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(set.contains("command \u{2192} groq \u{b7} openai/gpt-oss-120b"), "{set}");
+        assert!(listed.contains("openai/gpt-oss-120b"), "{listed}");
+        // only the routed task loses the (active) marker
+        for line in listed.lines().filter(|l| l.starts_with("  ")) {
+            let routed = line.contains("command");
+            assert_eq!(routed, !line.contains("(active)"), "{line}");
+        }
+        assert!(off.contains("command \u{2192} active provider"), "{off}");
+        assert!(!after.contains("openai/gpt-oss-120b"), "{after}");
+    }
+
+    /// S12. `/route` prints provider state, so it is a rendering path a credential could
+    /// leak through — the same hazard render_providers carries.
+    #[test]
+    fn render_routes_prints_no_credential() {
+        let mut s = ProviderState::defaults();
+        let mut p = builtin("gw", "openai", "https://gw.example/v1?api-key=URLSECRET", "m");
+        p.key = "sk-secret".into();
+        s.providers.push(p);
+        s.set_route(Task::Explain, "gw", None).unwrap();
+
+        let out = render_routes(&s);
+        assert!(out.contains("explain") && out.contains("gw"), "{out}");
+        assert!(
+            !out.contains("URLSECRET") && !out.contains("sk-secret") && !out.contains("base_url"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn task_parse_is_case_insensitive_and_total() {
+        for t in Task::ALL {
+            assert_eq!(Task::parse(t.name()), Some(t));
+            assert_eq!(Task::parse(&t.name().to_uppercase()), Some(t));
+        }
+        for junk in ["", "summary", "command ", "agents"] {
+            assert_eq!(Task::parse(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn deadlines_are_ordered_and_agent_matches_the_client() {
+        assert!(Task::Command.deadline() < Task::Explain.deadline());
+        assert!(Task::Explain.deadline() < Task::Agent.deadline());
+        // the agent path is provably unchanged from 0.2.5: its ceiling IS the client timeout
+        assert_eq!(Task::Agent.deadline(), HTTP_REQUEST_TIMEOUT);
+    }
+
+    /// A provider that accepts the connection and then says nothing — a wedged local
+    /// Ollama is the realistic case. Before the per-task deadline this hung a ⌘K for the
+    /// client's full 120s.
+    /// Holds CONFIG_ENV: sets XDG_CONFIG_HOME, which is process-global.
+    #[tokio::test]
+    async fn ai_call_deadline_fires_before_the_client_timeout() {
+        let _env = config_env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // hold the accepted socket open, unanswered, past the deadline
+            let held: Vec<_> = listener.incoming().filter_map(Result::ok).take(1).collect();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(held);
+        });
+
+        let dir = std::env::temp_dir().join(format!("tachyon-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tachyon")).unwrap(); // config_dir() appends it
+        let mut st = ProviderState::defaults();
+        st.add_local("silent".into(), format!("http://127.0.0.1:{port}/v1"), "m".into(), "sk-secret".into());
+        st.use_provider("silent").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        write_config(&providers_path().unwrap(), &st).unwrap();
+        assert_eq!(load_state().unwrap().provider_for(Task::Command).id, "silent");
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ai_call(Task::Command, "sys", "hi"),
+        )
+        .await
+        .expect("the 20s task deadline must fire well inside 30s")
+        .unwrap_err();
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(err.contains("no reply in 20s"), "{err}");
+        // built from p.id only: no url, no host, no port, no key
+        assert!(
+            !err.contains(&port.to_string()) && !err.contains("127.0.0.1") && !err.contains("sk-secret"),
+            "{err}"
+        );
+    }
+
+    /// S10. `Task` is chosen in Rust at each call site; no bridge caller may name one, or
+    /// webview script could point ⌘B at the user's most expensive provider.
+    #[test]
+    fn task_is_never_an_ipc_argument() {
+        let lines: Vec<&str> = include_str!("lib.rs").lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim_start().starts_with("#[tauri::command") {
+                continue;
+            }
+            for (n, sig) in lines.iter().enumerate().skip(i + 1).take(3) {
+                assert!(!sig.contains("Task"), "lib.rs:{}: {sig}", n + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn both_bodies_use_the_same_cap() {
+        for b in [build_anthropic_body("m", "s", "u"), build_openai_body("m", "s", "u")] {
+            assert_eq!(b["max_tokens"], AI_MAX_TOKENS);
+        }
     }
 }

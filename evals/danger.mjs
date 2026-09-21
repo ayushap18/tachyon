@@ -4,6 +4,7 @@
 import { DANGER_PATTERNS } from "./rust-source.mjs";
 
 export function isDangerous(cmd) {
-  const lower = cmd.toLowerCase();
+  // mirrors Rust's to_lowercase() + split_whitespace().join(" ")
+  const lower = cmd.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
   return DANGER_PATTERNS.some((p) => lower.includes(p));
 }

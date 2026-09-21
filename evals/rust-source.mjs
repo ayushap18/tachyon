@@ -41,6 +41,13 @@ function constStr(name) {
   return s;
 }
 
+// A plain numeric const. The eval harness must send the request shape the app sends;
+// a hardcoded copy here would silently measure a different one.
+function constNum(name) {
+  const m = new RegExp(`const ${name}: u32 = (\\d+);`).exec(SRC);
+  return m ? Number(m[1]) : fail(name);
+}
+
 // every string literal between the `[` that ends `anchor` and its closing `]`
 function strList(anchor, what) {
   const m = anchor.exec(SRC);
@@ -65,6 +72,7 @@ function strList(anchor, what) {
 
 export const AI_SYSTEM = constStr("AI_SYSTEM");
 export const AI_AGENT = constStr("AI_AGENT");
+export const AI_MAX_TOKENS = constNum("AI_MAX_TOKENS");
 export const DANGER_PATTERNS = strList(/const DANGER_PATTERNS: &\[&str\] = &\[/, "DANGER_PATTERNS");
 
 // The Rust unit-test vectors for is_dangerous. A function, not a const: only the

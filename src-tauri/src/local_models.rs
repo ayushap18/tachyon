@@ -49,8 +49,16 @@ pub(crate) fn resolve_key(p: &Provider, env: impl Fn(&str) -> Option<String>) ->
     }
 }
 
+/// Our env first, then the login shell's. Split out of `key_for` so the precedence is
+/// testable without a real login shell.
+pub(crate) fn env_or_login(name: &str, login: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    std::env::var(name).ok().or_else(|| login.get(name).cloned())
+}
+
 pub(crate) fn key_for(p: &Provider) -> (String, &'static str) {
-    resolve_key(p, |name| std::env::var(name).ok())
+    // A Dock/Finder launch inherits no shell environment, so an exported GROQ_API_KEY is
+    // invisible to us. crate::login_env() probes for it, once, only when we missed.
+    resolve_key(p, |name| env_or_login(name, crate::login_env()))
 }
 
 // ---- URLs ----
@@ -332,6 +340,33 @@ mod tests {
         st.set_key("groq", "gsk_saved".into()).unwrap();
         let groq = st.providers.iter().find(|p| p.id == "groq").unwrap().clone();
         assert_eq!(resolve_key(&groq, env), ("gsk_saved".to_string(), "saved"));
+    }
+
+    // E3: the login-shell map is a LAST resort. A saved key and our own environment both
+    // outrank it, so turning the probe on cannot change which key an existing user sends.
+    #[test]
+    fn saved_key_still_beats_the_login_shell_map() {
+        // a synthetic id, so a developer's real GROQ_API_KEY cannot decide this test
+        let login = std::collections::BTreeMap::from([("E3_PROBE_API_KEY".to_string(), "k_from_login".to_string())]);
+        let env = |name: &str| env_or_login(name, &login);
+        let saved = provider("e3-probe", "openai", "", "m", "k_saved");
+        assert_eq!(resolve_key(&saved, &env), ("k_saved".to_string(), "saved"));
+        // and with nothing saved the login shell is what rescues the Dock launch
+        let bare = provider("e3-probe", "openai", "", "m", "");
+        assert_eq!(resolve_key(&bare, &env), ("k_from_login".to_string(), "env"));
+    }
+
+    #[test]
+    fn login_env_is_consulted_only_after_std_env_var_misses() {
+        // PATH is always set for a test process; the TACHYON_* names never are.
+        let login = std::collections::BTreeMap::from([
+            ("PATH".to_string(), "/login/shell/path".to_string()),
+            ("TACHYON_NO_SUCH_VAR".to_string(), "from-login".to_string()),
+        ]);
+        assert_eq!(env_or_login("PATH", &login), std::env::var("PATH").ok());
+        assert_ne!(env_or_login("PATH", &login).as_deref(), Some("/login/shell/path"));
+        assert_eq!(env_or_login("TACHYON_NO_SUCH_VAR", &login).as_deref(), Some("from-login"));
+        assert_eq!(env_or_login("TACHYON_ALSO_UNSET", &login), None);
     }
 
     #[test]

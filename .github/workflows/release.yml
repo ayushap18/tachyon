@@ -25,6 +25,10 @@ jobs:
     # The prebuilt dx 0.7.9 needs GLIBC_2.39. Its WASM output is portable;
     # the native Linux app must still be compiled on the older 22.04 base.
     runs-on: ubuntu-24.04
+    outputs:
+      # 'true' only when the signing secret exists AND this tag ships an updater pubkey.
+      # Otherwise the release still ships, with no updater artifacts and no latest.json.
+      updater: ${{ steps.check.outputs.updater }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,6 +37,10 @@ jobs:
         with:
           node-version: 22
       - name: Check tag matches package versions
+        id: check
+        env:
+          # A boolean, never the key: the key itself is handed only to the bundle step.
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         run: |
           node --input-type=module <<'JS'
           import fs from 'node:fs';
@@ -43,6 +51,14 @@ jobs:
             const version = file.endsWith('.json') ? JSON.parse(text).version : text.match(/^version = "([^"]+)"/m)?.[1];
             if (`v${version}` !== tag) throw new Error(`${file}: ${version} does not match ${tag}`);
           }
+          // Signing against the placeholder would ship updates no installed build can verify.
+          const pubkey = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).plugins?.updater?.pubkey ?? '';
+          const hasKey = process.env.HAS_KEY === 'true';
+          if (hasKey && pubkey.startsWith('PLACEHOLDER')) {
+            throw new Error('TAURI_SIGNING_PRIVATE_KEY is set but tauri.conf.json plugins.updater.pubkey is still the placeholder');
+          }
+          // A tag cut before the updater existed has no pubkey: repair it the way it was built.
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `updater=${hasKey && pubkey !== ''}\n`);
           JS
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,7 +86,8 @@ jobs:
         include:
           - os: macos-14
             platform: macos-aarch64
-            bundles: dmg
+            # `app` is what the updater tarball is made from; dmg alone is not relied on to emit it.
+            bundles: app,dmg
           - os: ubuntu-22.04
             platform: linux-x86_64
             bundles: appimage,deb
@@ -107,10 +124,14 @@ jobs:
         env:
           # Allows the AppImage-based Linux bundler tools to run without mounting FUSE.
           APPIMAGE_EXTRACT_AND_RUN: '1'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # createUpdaterArtifacts follows the secret: with it on and no key, the bundler
+          # refuses to build ("A public key has been found, but no private key").
           args: >-
             --bundles ${{ matrix.bundles }}
-            --config '{"build":{"beforeBuildCommand":""}}'
+            --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":${{ needs.frontend.outputs.updater }}}}'
       - uses: actions/upload-artifact@v4
         with:
           name: installers-${{ matrix.platform }}
@@ -118,11 +139,13 @@ jobs:
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/macos/*.app.tar.gz*
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
           if-no-files-found: error
           retention-days: 14
 
   publish:
-    needs: bundle
+    needs: [frontend, bundle]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -138,7 +161,9 @@ jobs:
           path: installers
           merge-multiple: true
       - run: npm run test:release
-      - name: Verify all installers and generate checksums
+      - name: Verify all installers, generate checksums and latest.json
+        env:
+          UPDATER_SIGNED: ${{ needs.frontend.outputs.updater }}
         run: node scripts/release.mjs "$RELEASE_TAG" installers release-assets
       - name: Upload complete release
         env:
@@ -152,6 +177,11 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" release-assets/*.dmg release-assets/*.deb \
             release-assets/*.AppImage release-assets/SHA256SUMS --clobber
+          # release.mjs writes latest.json only for a signed build, after checking every .sig.
+          if [ -f release-assets/latest.json ]; then
+            gh release upload "$RELEASE_TAG" release-assets/*.app.tar.gz release-assets/*.sig \
+              release-assets/latest.json --clobber
+          fi
           if echo "$RELEASE_TAG" | grep -q -- '-'; then
             gh release edit "$RELEASE_TAG" --prerelease
           fi

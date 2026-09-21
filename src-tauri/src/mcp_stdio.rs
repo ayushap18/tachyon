@@ -36,11 +36,13 @@ impl StdioConn {
     }
 
     fn spawn(command: &str, args: &[String]) -> Result<Self, String> {
-        // ponytail: the child inherits Tachyon's PATH. Launched from Finder or a .desktop
-        // file that is the minimal system PATH, so a bare `npx` may not resolve — use an
-        // absolute path in /mcp add. Resolve through the login shell if this bites.
         let mut child = Command::new(command)
             .args(args)
+            // A Finder/Dock or .desktop launch gives us the minimal system PATH, in which a
+            // bare `npx` does not resolve. The login shell's PATH is the one the user's
+            // `/mcp add … -- <cmd>` was written against. Absent (probe failed), we inherit
+            // Tachyon's, exactly as before.
+            .envs(crate::login_env().get("PATH").map(|p| ("PATH", p)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // servers log to stderr by convention; inherited, that lands on whatever

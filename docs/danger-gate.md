@@ -65,8 +65,41 @@ PTY writer, so painted text cannot run.
 no `key`). `ai_call` is the single HTTP path; the key appears only in request headers, and
 errors are built from `without_url()` plus a truncated body.
 
-**The lexical check.** `is_dangerous` lowercases the command and looks for any substring in
-`DANGER_PATTERNS`. `nl_to_command` and `agent_loop` attach the result as `danger`; the UI
+**The updater cannot be driven from the webview** (`src-tauri/src/update.rs`). An updater is
+remote code execution, so:
+
+- *The trust anchor is compiled in.* The endpoint and the minisign public key reach the binary
+  from `tauri.conf.json` through `generate_context!`. The plugin's one runtime override
+  (`updater_builder`) and any custom version comparator are forbidden by a test that greps the
+  source; every endpoint must be `https://`.
+- *No install command exists on the IPC surface.* `update_check` is the one updater entry in
+  `generate_handler!`; it does an HTTPS GET and a version compare, and downloads, writes and runs
+  nothing. `/update install` returns a usage string. Installing starts only from a native menu
+  item (⌘U / Ctrl+U), which AppKit/GTK deliver straight to Rust — webview script cannot
+  synthesize it. A test proves no handler name reaches the install path.
+- *The plugin is not granted to the webview.* `capabilities/default.json` is the members of
+  `core:default` minus `core:menu` and `core:tray`, plus `opener:default`. Plugin commands,
+  unlike app commands, *are* ACL-scoped, so `invoke("plugin:updater|download_and_install")` is
+  refused in Rust. Menu is excluded because menu events reach Rust by id string alone: a
+  webview allowed to build menus could create its own `tachyon:update` item.
+- *Only the artifact is signed, not `latest.json`.* Whoever can serve the manifest cannot make
+  Tachyon install an unsigned build, but could pair an inflated version with an older release's
+  real url and signature. `requireSignedVersion` makes the plugin compare the announced version
+  against the one inside the signature's trusted comment, so that rollback fails; the monotonic
+  version compare (never overridden) refuses a replayed old manifest. Freezing users on their
+  current version is not stopped. Release signatures must carry `version:` in the trusted
+  comment, or every install fails closed.
+
+This is defense in depth, not the boundary. Webview script already holds a strictly stronger
+capability — `pty_write` and `/mcp add … -- <cmd>` run arbitrary shell as you (see
+[Limitations](#limitations)) — and a webview-triggered install of a signature-checked,
+version-monotonic official build would not be an escalation over that.
+
+**The lexical check.** `is_dangerous` lowercases the command, collapses runs of whitespace to
+one space, and looks for any substring in `DANGER_PATTERNS`. Normalizing first means `rm  -rf`
+with two spaces cannot slip past a pattern written with one. The patterns that would otherwise
+match prose are anchored (`sudo shutdown`, `shutdown -`, not bare `shutdown`), because a gate
+that flags `man shutdown` teaches people to ignore red. `nl_to_command` and `agent_loop` attach the result as `danger`; the UI
 turns the bar red and shows `⚠ destructive`. It runs in Rust so the webview cannot skip it.
 `TOOL:` proposals get the same flag from `tool_is_dangerous`: a destructive-sounding tool
 name (`write`, `delete`, `exec`, `run`, `shell`, `kill`, …) or arguments that trip
@@ -77,20 +110,23 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
 
 - **The gate warns; it does not block.** A flagged command is approved with the same single
   Enter as any other. Nothing is ever refused.
-- **The match is trivially evadable.** `rm -r -f ~`, `rm  -rf` with two spaces,
-  `find . -delete`, `git clean -fdx`, `curl … | sh`, `$(echo cm0gLXJm | base64 -d) ~`, and any
-  alias or variable indirection pass unflagged. It also false-positives: `echo "rm -rf"` and
-  `grep reboot syslog` are flagged. `npm run eval:gate` measures both rates on a held-out
-  corpus; that number, not this list, is the gate's quality.
+- **The match is still evadable, because it is substrings and not a shell parser.** Anything
+  that hides the verb from a literal scan passes: `$(echo cm0gLXJm | base64 -d) ~`, `r\m -rf ~`,
+  `curl … | sh` without `sudo`, and any alias or variable indirection. Effects the gate has no
+  word for — `mv ~ /dev/null`, `> important.file`, `dropdb production` — pass too. It still
+  false-positives on commands that merely *contain* a dangerous string: `echo 'never run rm -rf /'`
+  and `grep -rn 'rm -rf' scripts/`. Lexing the command (Limitation 1 below) is the fix; until
+  then `npm run eval:gate` measures both rates on a held-out corpus, and that number, not this
+  list, is the gate's quality.
 - **`pty_write` is ungated IPC.** `tauri.conf.json` sets `withGlobalTauri: true` and
   `csp: null`, and app commands are not capability-scoped. Any script running in the webview
   can call `window.__TAURI__.core.invoke("pty_write", {data: "…\n"})` and execute a command
   with no approval. The same goes for `mcp_call`, and for `ai_complete`, which spends the
   stored key on any prompt. The webview loads only the bundled WASM today, so this needs an
   injection bug first — but the invariant above defends against the model, not the webview.
-- **⌘K does not strip embedded newlines.** `strip_fences` trims only the ends, so a two-line
-  model reply executes its first line on arrival. The ⌘B rerun button strips `\r`/`\n`; this
-  path does not yet.
+- ⌘K and agent proposals are folded to one line by `one_line`, so `\n`, bare `\r`, tabs and
+  invisible format characters cannot reach the PTY unseen; what the approver reads is what is
+  written.
 - **The MCP tool check is a name heuristic.** `tool_is_dangerous` substring-matches the tool
   name, so a destructive tool called `apply` is unflagged and `list_skills` is flagged. Like
   the shell check it only colours the gate.
@@ -112,6 +148,23 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
 - **Approval is human-in-the-loop, not a sandbox.** An approved command runs as you, with your
   credentials. The 20-second step timeout stops the agent waiting; it does not kill the
   command. Approval fatigue over a 12-step run is a real failure mode.
+- **The route table is webview-writable.** `run_slash("/route agent claude")` changes which
+  provider receives the agent transcript, exactly as `run_slash("/use …")` already changes
+  the active provider — `run_slash` is ungated IPC like `pty_write`. Not a regression, and not
+  claimed away. What routing never does is fall back: a missing or dangling route resolves to
+  the active provider, never to a second one the user did not name.
+- **A compromised CI can sign an update every installed Tachyon will accept.** The minisign key
+  lives in GitHub Actions secrets; signature checking proves that key signed the build and
+  nothing more. Holding the key behind a reviewed GitHub Environment, or signing offline, is
+  the mitigation, and neither is in place yet.
+- **Each update is a new ad-hoc code signature.** `tauri.conf.json` signs with the ad-hoc
+  identity `-`, so every build has a fresh cdhash and macOS privacy grants (file access and
+  the like) tied to the old one **may** prompt again once after an update. That is the
+  mechanism, not a measured result; the install message warns about it.
+- **A `workflow_dispatch` repair does not reach the updater.** The updater reads
+  `releases/latest/download/latest.json`, and `release.yml` marks a release `latest` only on a
+  tag push. Repairing an existing tag replaces its assets without moving that pointer, so a
+  fix that must reach installed copies is cut as a new tag.
 
 ## Threat model: Tachyon as an MCP server
 
@@ -199,8 +252,10 @@ and is stopped only by the token.
 
 1. Lex the command (flags, pipelines, `$(…)`) and classify by effect instead of substring.
 2. Make a dangerous approval a different action from an ordinary one, not the same Enter.
-3. A dedicated prefill command that strips control characters, so no model text containing
-   `\n` reaches the PTY.
+3. ~~A dedicated prefill command that strips control characters, so no model text containing
+   `\n` reaches the PTY.~~ Done — `one_line` does the stripping in `nl_to_command` and
+   `parse_agent_reply`. The residual is only that it lives in those two call sites rather than
+   in one prefill command both go through.
 4. A CSP, `withGlobalTauri` off, and per-command capabilities, so webview script cannot reach
    `pty_write`, `mcp_call` or `ai_complete` by name.
 5. Run agent commands in a constrained child (own PTY, container or read-only mounts, no

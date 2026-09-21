@@ -10,10 +10,10 @@
 //! Matching is prefix-only, never subsequence: `/mo` must not offer `/mcp remove`, and a
 //! subsequence match would also shrink Tab's common prefix to uselessness.
 
-/// KEEP IN SYNC BY HAND with SLASH_HELP, src-tauri/src/lib.rs:1635-1649 — separate
+/// KEEP IN SYNC BY HAND with SLASH_HELP, src-tauri/src/lib.rs:1879-1901 — separate
 /// crates (ui is deliberately outside the src-tauri workspace), so no test can compare
 /// them. Drift shows up as a row missing from the list, never as a wrong command.
-pub const SLASH_ROWS: [(&str, &str); 16] = [
+pub const SLASH_ROWS: [(&str, &str); 19] = [
     ("/keys", "list providers, active, key source"),
     ("/key <id> <apikey>", "set a provider's API key"),
     ("/use <id> [model]", "switch active provider (+ optional model)"),
@@ -24,11 +24,14 @@ pub const SLASH_ROWS: [(&str, &str); 16] = [
     ("/local <id> <url> <model> [key]", "add any OpenAI-compatible endpoint"),
     ("/url <id> <base_url>", "point a provider at a proxy/gateway"),
     ("/remove <id>", "remove a provider"),
+    ("/route", "which provider+model each task uses"),
+    ("/route <task> <id> [model]", "route a task: command explain agent (off resets)"),
     ("/mcp add <name> <url>", "add a remote MCP server"),
     ("/mcp add <name> -- <cmd> [args]", "add a local MCP server (Tachyon will run <cmd>)"),
     ("/mcp remove <name>", "remove an MCP server"),
     ("/mcp list", "list MCP servers and their tools"),
     ("/mcp serve on|off|status", "let external agents use this terminal"),
+    ("/update", "check for a newer Tachyon"),
     ("/help", "this list"),
 ];
 
@@ -135,6 +138,12 @@ pub fn list_key(key: &str, sel: Option<usize>, n: usize) -> ListOp {
 /// rule as SLASH_ROWS: drift costs a missing row, never a wrong command.
 pub const LOCAL_IDS: [&str; 5] = ["ollama", "lmstudio", "llamacpp", "vllm", "jan"];
 
+/// KEEP IN SYNC BY HAND with Task::ALL, src-tauri/src/lib.rs — same rule as SLASH_ROWS:
+/// drift costs a missing row, never a wrong command.
+// ponytail: a third hand-synced table. The crates are deliberately in separate
+// workspaces, so no test can compare them.
+pub const TASK_IDS: [&str; 3] = ["command", "explain", "agent"];
+
 /// SLASH_ROWS advertises on|off|status; parse_serve also takes `on <port>`, and a port is
 /// never suggestible (mcp_server.rs:500-517).
 const SERVE_WORDS: [&str; 3] = ["on", "off", "status"];
@@ -146,6 +155,7 @@ pub enum Slot {
     Provider { revivable: bool },
     Model(Option<String>), // None = the active provider (/model)
     Runtime,
+    Task, // command | explain | agent
     McpName,
     Serve,
     Nothing, // API key, base_url, port, a NEW mcp name, free text
@@ -207,6 +217,12 @@ pub fn spot(input: &str) -> Spot {
         // Unprovable here => never offered. The model argument is optional anyway
         // (resolve_runtime picks the first model when it is None), so this costs nothing.
         ("local", 1) => nothing,
+        ("route", 0) => at(Slot::Task, " <id>"),
+        ("route", 1) => at(Slot::Provider { revivable: false }, " [model]"),
+        // `/route <task> off` takes no third argument — do not fire the provider_models
+        // round trip (wants_models, below) on a word that is not a provider id.
+        ("route", 2) if !args[1].eq_ignore_ascii_case("off") =>
+            at(Slot::Model(Some(args[1].into())), ""),
         ("mcp", 1) => match args[0].to_lowercase().as_str() {
             "remove" => at(Slot::McpName, ""),
             "serve" => at(Slot::Serve, ""),
@@ -275,6 +291,7 @@ pub fn arg_rows(input: &str, cx: &Ctx) -> Vec<(String, &'static str)> {
             }
         }
         Slot::Runtime => (LOCAL_IDS.iter().map(|s| (*s).to_string()).collect(), "runtime"),
+        Slot::Task => (TASK_IDS.iter().map(|s| (*s).to_string()).collect(), "task"),
         Slot::McpName => (cx.mcp.clone(), "mcp"),
         Slot::Serve => (SERVE_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
     };
@@ -347,6 +364,8 @@ mod tests {
             forms("/local ollama"),
             ["/local", "/local <id> [model]", "/local <id> <url> <model> [key]"]
         );
+        assert_eq!(forms("/r"), ["/remove <id>", "/route", "/route <task> <id> [model]"]);
+        assert_eq!(forms("/u"), ["/use <id> [model]", "/url <id> <base_url>", "/update"]);
         assert_eq!(forms("/mcp a"), ["/mcp add <name> <url>", "/mcp add <name> -- <cmd> [args]"]);
         assert_eq!(forms("/mcp serve on"), ["/mcp serve on|off|status"]);
         // prefix, not subsequence: /mcp remove must not match /mo
@@ -360,11 +379,15 @@ mod tests {
             SLASH_ROWS.iter().map(|(f, _)| f.split(' ').next().unwrap()).collect();
         verbs.sort_unstable();
         verbs.dedup();
-        // the arms of run_slash_inner, lib.rs:1679-1789; the `providers` alias is
-        // deliberately absent (one row per thing, /keys already shows it)
+        // the arms of run_slash_inner, lib.rs:1938-2083, plus `/update` which run_slash
+        // peels off first; the `providers` alias is deliberately absent (one row per
+        // thing, /keys already shows it)
         assert_eq!(
             verbs,
-            ["/help", "/key", "/keys", "/local", "/mcp", "/model", "/models", "/remove", "/url", "/use"]
+            [
+                "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models", "/remove",
+                "/route", "/update", "/url", "/use"
+            ]
         );
     }
 
@@ -649,6 +672,21 @@ mod tests {
     }
 
     #[test]
+    fn route_slots_follow_position() {
+        assert_eq!(spot("/route ").slot, Slot::Task);
+        assert_eq!(spot("/route command ").slot, Slot::Provider { revivable: false });
+        assert_eq!(spot("/route command groq ").slot, Slot::Model(Some("groq".into())));
+        assert_eq!(spot("/route command off ").slot, Slot::Nothing);
+    }
+
+    #[test]
+    fn route_never_fires_models_for_off() {
+        assert_eq!(wants_models("/route command off ", &cx()), None);
+        // the reset word is not a provider id, so it must not become one on the next token
+        assert!(arg_rows("/route command off ", &cx()).is_empty());
+    }
+
+    #[test]
     fn wants_models_is_the_only_network_trigger() {
         let empty = Ctx { active: "groq".into(), ..Ctx::default() };
         assert_eq!(wants_models("/use groq ", &empty).as_deref(), Some("groq"));
@@ -668,6 +706,9 @@ mod tests {
             "/local ollama ",
             "/local lmstudio ",
             "/local ollama llama3.2 ",
+            "/route ",
+            "/route command ",
+            "/route command off ",
         ] {
             assert_eq!(wants_models(input, &empty), None, "{input}");
         }
