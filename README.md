@@ -24,13 +24,13 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
-| macOS · Apple Silicon | `Tachyon_0.2.6_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
-| Debian / Ubuntu · x86_64 | `Tachyon_0.2.6_amd64.deb` | `sudo apt install ./Tachyon_0.2.6_amd64.deb` |
-| Linux · x86_64 | `Tachyon_0.2.6_amd64.AppImage` | Make executable, then launch (below). |
+| macOS · Apple Silicon | `Tachyon_0.2.7_aarch64.dmg` | Open the DMG and drag Tachyon into Applications. |
+| Debian / Ubuntu · x86_64 | `Tachyon_0.2.7_amd64.deb` | `sudo apt install ./Tachyon_0.2.7_amd64.deb` |
+| Linux · x86_64 | `Tachyon_0.2.7_amd64.AppImage` | Make executable, then launch (below). |
 
 ```sh
-chmod +x Tachyon_0.2.6_amd64.AppImage
-./Tachyon_0.2.6_amd64.AppImage
+chmod +x Tachyon_0.2.7_amd64.AppImage
+./Tachyon_0.2.7_amd64.AppImage
 ```
 
 Linux binaries are built on **Ubuntu 22.04**. The `.deb` installs WebKitGTK/GTK dependencies
@@ -38,7 +38,7 @@ through apt; AppImage compatibility still depends on the host distribution. If A
 reports a FUSE error, try:
 
 ```sh
-./Tachyon_0.2.6_amd64.AppImage --appimage-extract-and-run
+./Tachyon_0.2.7_amd64.AppImage --appimage-extract-and-run
 ```
 
 Builds are **not signed by Apple**. If macOS blocks the first launch, use **System Settings →
@@ -49,7 +49,7 @@ an update does not ask again. Download `SHA256SUMS` alongside your installer to 
 # Linux: verifies the downloaded installers; skips those you did not download.
 sha256sum --ignore-missing -c SHA256SUMS
 # macOS: compare the printed digest with the corresponding SHA256SUMS entry.
-shasum -a 256 Tachyon_0.2.6_aarch64.dmg
+shasum -a 256 Tachyon_0.2.7_aarch64.dmg
 ```
 
 ### Updating
@@ -79,7 +79,7 @@ signature. Set `TACHYON_NO_UPDATE_CHECK=1` to skip the launch check. Details and
 3. Configure a provider with `/key <id> <apikey>`, or use `/local` to discover a local model.
 4. Ask for a command, review the proposed text, then choose whether to run it.
 
-**v0.2.6** adds per-task model routing (`/route`), in-app updates, and a reworked danger gate
+**v0.2.7** documents how the updater signing key is created and why it must be backed up. **v0.2.6** added per-task model routing (`/route`), in-app updates, and a reworked danger gate
 that catches 71% of a held-out destructive corpus, up from 24%. See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ### Keyboard
@@ -404,6 +404,29 @@ artifacts and publishes `latest.json`; without them the release still ships, but
 copies are not offered it. A repair run does not move GitHub's `latest` release, so the updater
 does not see it — a fix that must reach installed copies needs a new tag. Maintainers can rebuild an existing tag through the workflow's
 **Run workflow** form; tags must match the versions in both Cargo manifests and app config.
+
+### Updater signing key
+
+Updates are verified against a minisign public key compiled into every build, so the key has to
+exist before the first release that ships it. Generate it once:
+
+```sh
+./node_modules/.bin/tauri signer generate -w ~/.tauri/tachyon-updater.key -p '<password>'
+```
+
+The command is `tauri signer`, not `tauri signing`. Paste the contents of
+`~/.tauri/tachyon-updater.key.pub` into `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`,
+then store the private key and its password as the two repository secrets:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY          -R <owner>/<repo> < ~/.tauri/tachyon-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R <owner>/<repo> < ~/.tauri/tachyon-updater.password
+```
+
+**Back the private key up somewhere other than this machine.** Every installed copy trusts only
+the public key it was built with. If the private key is lost, no installed Tachyon can accept
+another update, and every user has to reinstall by hand. Rotating the key has the same effect,
+so treat it as permanent.
 
 ## Tests
 

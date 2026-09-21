@@ -4,6 +4,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Entries
 Unreleased were reconstructed from `git log`; versions are the ones named in commit subjects.
 No commit is labelled 0.1.2.
 
+## 0.2.7 — 2026-09-21
+
+### Documentation
+- How to create the updater signing key. The README said the two repository secrets had to
+  exist but never said how to produce them; it now gives the command (`tauri signer
+  generate` — not `tauri signing`), how to store the key and password as secrets, and why the
+  private key must be backed up off the machine: every installed copy trusts only the public
+  key it was built with, so a lost key means no installed Tachyon can update again.
+
+### Notes
+- The first update delivered by the in-app updater. Installed 0.2.6 copies are offered this
+  release through `/update` and install it in place.
+
 ## 0.2.6 — 2026-09-21
 
 ### Security
