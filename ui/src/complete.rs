@@ -12,7 +12,7 @@
 
 /// The form column must match SLASH_HELP in src-tauri/src/lib.rs; the test
 /// `surfaces_agree_with_the_backend` parses that file and fails if they drift.
-pub const SLASH_ROWS: [(&str, &str); 21] = [
+pub const SLASH_ROWS: [(&str, &str); 25] = [
     ("/keys", "list providers, active, key source"),
     ("/providers", "same table as /keys"),
     ("/key <id> <apikey>", "set a provider's API key"),
@@ -31,6 +31,10 @@ pub const SLASH_ROWS: [(&str, &str); 21] = [
     ("/mcp remove <name>", "remove an MCP server"),
     ("/mcp list", "list MCP servers and their tools"),
     ("/mcp serve on|off|status", "let external agents use this terminal (on <port> to pick one)"),
+    ("/mcp agent add <name> [scopes]", "register one agent: its own token and scopes"),
+    ("/mcp agent list", "registered agents, their scopes and last seen — never a token"),
+    ("/mcp agent show <name>", "that agent's client config, with its token"),
+    ("/mcp agent revoke <name>", "revoke one agent, from its next request"),
     ("/update", "check for a newer Tachyon"),
     ("/crash", "last panics, from the local crash.log"),
     ("/help", "this list"),
@@ -145,6 +149,9 @@ pub const TASK_IDS: [&str; 3] = ["command", "explain", "agent"];
 /// never suggestible (`parse_serve` in mcp_server.rs).
 const SERVE_WORDS: [&str; 3] = ["on", "off", "status"];
 
+/// The verbs `parse_agent` (mcp_server.rs) accepts, in the order SLASH_ROWS lists them.
+const AGENT_WORDS: [&str; 4] = ["add", "list", "show", "revoke"];
+
 /// What may be suggested for the token under the cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Slot {
@@ -155,7 +162,9 @@ pub enum Slot {
     Task, // command | explain | agent
     McpName,
     Serve,
-    Nothing, // API key, base_url, port, a NEW mcp name, free text
+    AgentVerb,
+    AgentName, // an agent already in the registry: show | revoke
+    Nothing,   // API key, base_url, port, a NEW mcp/agent name, scopes, free text
 }
 
 /// A slot plus what the form still owes after it, so an accepted row teaches the next
@@ -175,6 +184,10 @@ pub struct Ctx {
     pub providers: Vec<String>,
     pub hidden: Vec<String>,
     pub mcp: Vec<String>,
+    /// Registered MCP-server agent names, from the `hub_state` command — names only. There
+    /// is deliberately no command that hands the webview a token, so an empty list here
+    /// means "nothing to suggest", never "ask for the registry".
+    pub agents: Vec<String>,
     pub models: Option<(String, Vec<String>)>, // (provider id, its model ids)
 }
 
@@ -223,8 +236,17 @@ pub fn spot(input: &str) -> Spot {
         ("mcp", 1) => match args[0].to_lowercase().as_str() {
             "remove" => at(Slot::McpName, ""),
             "serve" => at(Slot::Serve, ""),
+            "agent" => at(Slot::AgentVerb, ""),
             _ => nothing, // `add` takes a NEW name; `list` takes nothing
         },
+        // `/mcp agent add` takes a NEW name — never one already registered, which is the
+        // one thing `add` refuses. `list` takes nothing.
+        ("mcp", 2) if args[0].eq_ignore_ascii_case("agent") => {
+            match args[1].to_lowercase().as_str() {
+                "show" | "revoke" => at(Slot::AgentName, ""),
+                _ => nothing,
+            }
+        }
         _ => nothing,
     }
 }
@@ -294,6 +316,8 @@ pub fn arg_rows(input: &str, cx: &Ctx) -> Vec<(String, &'static str)> {
         Slot::Task => (TASK_IDS.iter().map(|s| (*s).to_string()).collect(), "task"),
         Slot::McpName => (cx.mcp.clone(), "mcp"),
         Slot::Serve => (SERVE_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
+        Slot::AgentVerb => (AGENT_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
+        Slot::AgentName => (cx.agents.clone(), "agent"),
     };
     let lower = typing.to_lowercase();
     let head =
@@ -366,7 +390,22 @@ mod tests {
         );
         assert_eq!(forms("/r"), ["/remove <id>", "/route", "/route <task> <id> [model]"]);
         assert_eq!(forms("/u"), ["/use <id> [model]", "/url <id> <base_url>", "/update"]);
-        assert_eq!(forms("/mcp a"), ["/mcp add <name> <url>", "/mcp add <name> -- <cmd> [args]"]);
+        assert_eq!(
+            forms("/mcp a"),
+            [
+                "/mcp add <name> <url>",
+                "/mcp add <name> -- <cmd> [args]",
+                "/mcp agent add <name> [scopes]",
+                "/mcp agent list",
+                "/mcp agent show <name>",
+                "/mcp agent revoke <name>",
+            ]
+        );
+        assert_eq!(
+            forms("/mcp agent s"),
+            ["/mcp agent show <name>"],
+            "the agent verbs are prefix-filtered like every other row"
+        );
         assert_eq!(forms("/mcp serve on"), ["/mcp serve on|off|status"]);
         // prefix, not subsequence: /mcp remove must not match /mo
         assert_eq!(forms("/mo"), ["/model <model>", "/models [id]"]);
@@ -486,15 +525,17 @@ mod tests {
             providers: vec!["groq".into(), "gemini".into(), "openai".into()],
             hidden: vec!["anthropic".into()],
             mcp: vec!["fs".into(), "gh".into()],
+            agents: vec!["codex".into(), "claude-code".into()],
             models: Some(("groq".into(), vec!["llama3.2".into(), "llama-guard".into()])),
         }
     }
 
     /// One input per cell of the grammar table.
-    const SPREAD: [&str; 22] = [
+    const SPREAD: [&str; 26] = [
         "/", "/us", "/keys ", "/help ", "/key ", "/key gr", "/key groq ", "/use ", "/use gr",
         "/use groq ", "/model ", "/models ", "/url ", "/url groq ", "/remove ", "/local ",
         "/local ollama ", "/local mybox ", "/mcp ", "/mcp remove ", "/mcp serve ", "/zzz ",
+        "/mcp agent ", "/mcp agent show ", "/mcp agent revoke ", "/mcp agent add ",
     ];
 
     #[test]
@@ -530,6 +571,14 @@ mod tests {
             ("/mcp list ", Slot::Nothing, ""),
             ("/mcp serve ", Slot::Serve, ""),
             ("/mcp serve on ", Slot::Nothing, ""),
+            ("/mcp agent ", Slot::AgentVerb, ""),
+            ("/mcp agent show ", Slot::AgentName, ""),
+            ("/mcp agent revoke ", Slot::AgentName, ""),
+            ("/mcp agent list ", Slot::Nothing, ""),
+            // a NEW name, and then its scopes: neither is ever suggested
+            ("/mcp agent add ", Slot::Nothing, ""),
+            ("/mcp agent add codex ", Slot::Nothing, ""),
+            ("/mcp agent show codex ", Slot::Nothing, ""),
             ("/zzz ", Slot::Nothing, ""),
             ("/zzz a ", Slot::Nothing, ""),
         ];
@@ -553,6 +602,10 @@ mod tests {
             "/local ollama http://x m ",
             "/mcp serve on ",
             "/mcp add srv ",
+            // a token is minted, never typed, and a scope list is not an id
+            "/mcp agent add ",
+            "/mcp agent add codex ",
+            "/mcp agent add codex read,",
         ] {
             assert_eq!(spot(input).slot, Slot::Nothing, "{input}");
             assert!(arg_rows(input, &cx()).is_empty(), "{input}");
@@ -685,10 +738,15 @@ mod tests {
             providers: vec!["groq".into(), "gemini".into(), "gpt|4".into()],
             hidden: vec!["a<b>".into()],
             mcp: vec!["fs".into(), "my[srv]".into()],
+            // parse_agent_name refuses both of these, so neither can reach the registry —
+            // but Ctx is filled from an IPC reply, and safe_row is what this asserts
+            agents: vec!["codex".into(), "c\u{202e}x".into()],
             models: Some(("groq".into(), vec!["gpt|4".into(), "ok-model".into(), "ok-2".into()])),
         };
         let mut checked = 0;
-        for input in ["/model ", "/model g", "/use ", "/key ", "/mcp remove ", "/route command "] {
+        for input in
+            ["/model ", "/model g", "/use ", "/key ", "/mcp remove ", "/route command ", "/mcp agent show "]
+        {
             for (row, _) in arg_rows(input, &cx) {
                 assert!(accept_text(&row, input).is_some(), "{input} -> {row} cannot be accepted");
                 checked += 1;
@@ -732,6 +790,36 @@ mod tests {
         readme.sort_unstable();
         assert_eq!(readme, rows, "README.md and SLASH_ROWS have drifted");
 
+        // The form column is all the three comparisons above see, and for most rows that is
+        // enough. These four also make a CLAIM: "with its token" is the difference between a
+        // command that prints a live bearer token and one that does not, and a README that
+        // contradicts it teaches the user the wrong thing about the only token render there is.
+        // Only these rows, because three others deliberately word themselves differently today.
+        let agent_rows = |pairs: Vec<(&str, &str)>| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = pairs
+                .iter()
+                .filter(|(f, _)| f.starts_with("/mcp agent"))
+                // SLASH_HELP is Rust source, so its em dash is still an escape here
+                .map(|(f, d)| (f.trim().into(), d.replace("\\u{2014}", "\u{2014}").trim().into()))
+                .collect();
+            v.sort();
+            v
+        };
+        let help_pairs = help
+            .split("\\x1b[36m")
+            .skip(1)
+            .map(|s| {
+                let (form, rest) = s.split_once("\\x1b[0m").expect("a help line with no reset");
+                (form, rest.split("\\r\\n").next().unwrap())
+            })
+            .collect();
+        let readme_pairs =
+            between(RM, "```\n/keys", "```").lines().filter_map(|l| l.split_once("  ")).collect();
+        let want = agent_rows(SLASH_ROWS.to_vec());
+        assert_eq!(want.len(), 4, "the /mcp agent rows are gone, so this compares nothing");
+        assert_eq!(agent_rows(help_pairs), want, "SLASH_HELP describes /mcp agent differently");
+        assert_eq!(agent_rows(readme_pairs), want, "README.md describes /mcp agent differently");
+
         let runtimes = between(LOCAL, "LOCAL_RUNTIMES: &[(&str, &str)] = &[", "];");
         let ids: Vec<&str> = runtimes
             .lines()
@@ -754,6 +842,26 @@ mod tests {
         assert!(desc.contains("<port>"), "{desc}");
         assert!(!form.contains("port"), "{form}");
         assert_eq!(accept_text(form, "/mcp s").as_deref(), Some("/mcp serve "));
+    }
+
+    /// `show`/`revoke` name an agent that already exists; `add` names one that must not.
+    /// Offering a registered name where `add` refuses it would teach a guaranteed error, the
+    /// same rule the hidden-provider case follows.
+    #[test]
+    fn agent_slots_offer_registered_names_only_where_one_is_wanted() {
+        let cx = cx();
+        assert_eq!(
+            arg_rows("/mcp agent ", &cx).iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            ["/mcp agent add", "/mcp agent list", "/mcp agent show", "/mcp agent revoke"]
+        );
+        for input in ["/mcp agent show ", "/mcp agent revoke ", "/mcp agent REVOKE "] {
+            let rows: Vec<String> = arg_rows(input, &cx).into_iter().map(|(l, _)| l).collect();
+            assert_eq!(rows.len(), 2, "{input}");
+            assert!(rows.iter().all(|r| r.ends_with("codex") || r.ends_with("claude-code")), "{rows:?}");
+        }
+        assert!(arg_rows("/mcp agent add ", &cx).is_empty(), "a new name must not be suggested");
+        // and with nothing registered the slot is simply empty, never a fallback list
+        assert!(arg_rows("/mcp agent show ", &Ctx::default()).is_empty());
     }
 
     #[test]

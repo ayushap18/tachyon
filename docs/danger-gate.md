@@ -144,7 +144,10 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
   `/mcp list`, IPC and error strings, not off the disk.
 - **Painted text is not sanitised.** `term_write` interprets escape sequences, so model or
   tool text can overwrite what is on screen. It cannot execute; it can mislead the approver.
-- **The proposal is a single-line input.** A long command is not fully visible without scrolling.
+- **A proposal past `MAX_COMMAND_CHARS` is shown cut.** The proposal is rendered above the
+  bar in a read-only block, wrapped, so a long command is readable in full — to 4096
+  characters. The server refuses a longer `command` outright; a built-in-agent proposal over
+  the cap is shown cut and says so, and approving it still runs the part that was not shown.
 - **Approval is human-in-the-loop, not a sandbox.** An approved command runs as you, with your
   credentials. The 20-second step timeout stops the agent waiting; it does not kill the
   command. Approval fatigue over a 12-step run is a real failure mode.
@@ -186,19 +189,33 @@ header forces fails in the browser. Under all of that the page still needs the b
 which it has no way to read. A page served from `http://localhost:*` passes the Origin check
 and is stopped only by the token.
 
-**What the local process can and cannot do.** The token lives in `mcp-server.json`, mode
-0600. Any process running as the user can read that file — so treat the token as keeping out
-*other users and the browser*, not the user's own processes. A process that holds it can:
+**What the local process can and cannot do.** Every registered agent has its own token, and
+they all live in `mcp-server.json`, mode 0600. Any process running as the user can read that
+file — so treat a token as keeping out *other users and the browser*, not the user's own
+processes. What a token buys is decided by the scopes recorded beside it, enforced in Rust at
+one table (`TOOL_SCOPES`), and asked both when the tools are listed and when one is called: a
+tool the caller has no scope for is answered exactly like a tool that does not exist, so a
+refusal never reveals what else is there. A process that holds a token can:
 
-- call `read_journal` and `get_context` with **no approval**: the last 50 commands, up to
-  4000 characters of each one's output, the `cwd`, the git `branch` and `dirty` count, and
-  the shell's pid (`shell_pid`) and name (`shell`). If you `cat .env` with the server on, a
-  token holder can read it. This is the feature's largest unguarded surface.
-- **propose** commands. It cannot run them. `run_command` reaches the PTY only through
-  `run_gated` → `agent_propose` → a human Enter; there is no allowlist, no trusted-client
-  mode, no auto-approve, and no timeout that approves. A process running as you could
-  already run commands as you — what it gains here is the chance to do so with your
-  approval, in your live shell, which matters for a sandboxed or remote-driven client.
+- call `get_context` with **no approval** (scope `read`, granted by default): the `cwd`, the
+  git `branch` and `dirty` count, and the shell's pid (`shell_pid`) and name (`shell`).
+- call `read_journal` with **no approval** *if* the agent was granted the `journal` scope —
+  the last 50 commands and up to 4000 characters of each one's output. It is **not** in the
+  default grant, because it is the feature's largest unguarded surface: if you `cat .env`
+  with the server on, an agent holding `journal` can read it. The `default` agent migrated
+  from a 0.2.9 single token keeps it, because that token already had it.
+- **propose** commands (scope `propose`, granted by default). It cannot run them.
+  `run_command` reaches the PTY only through `open_gate` → `run_gated` → `agent_propose` → a
+  human ⌘⏎; there is no allowlist, no trusted-client mode, no auto-approve, and no timeout
+  that approves. A process running as you could already run commands as you — what it gains
+  here is the chance to do so with your approval, in your live shell, which matters for a
+  sandboxed or remote-driven client.
+
+Revoking one agent (`/mcp agent revoke <name>`) takes effect on that agent's next request and
+touches nobody else's. It also drops that name's settled proposals, so re-adding the name
+(the way a token is rotated) does not hand the new holder the old one's verdicts and output.
+A proposal already on the bar is left alone — it still owns the approval slot, and the user
+answers it as they would any other.
 
 **What is enforced, and where** (all in `mcp_server.rs` unless noted):
 
@@ -213,8 +230,17 @@ and is stopped only by the token.
   never queues and never overwrites the parked sender. `AgentRunGuard` is constructed only
   after the claim is won, so the busy path cannot release someone else's claim, and every
   exit including a panic frees ⌘J.
-- *The requester is named.* The proposal carries `external: true` and the bar reads
-  `external agent · run? ⌘⏎ approve · esc deny` (`Ctrl+⏎` off macOS).
+- *The requester is named.* The proposal carries `external: true` and the agent name its
+  **token** bought — never anything the client said about itself — so the bar reads
+  `codex · run? ⌘⏎ approve · esc deny` (`Ctrl+⏎` off macOS). An external proposal that
+  arrives with no name is fail-closed: `approvable` in `ui/src/ai_bar.rs` renders it for
+  denial only and the key handler refuses to approve it, so an unidentified requester cannot
+  be waved through by a chord.
+- *A denial quiets the bar.* After any denial nothing reaches the bar for 30 s — not the agent
+  that was refused, and not any other. The refusal carries `retry_after_ms` and tells the
+  denied agent not to re-send. One agent may hold one undecided proposal, the hub four; all of
+  it is decided in `proposals::budget`, above the `Backend`, so a refused proposal never
+  reaches a terminal and never raises a bar.
 - *A stray keystroke is not a decision.* External proposals are unsolicited: the bar takes
   focus while you are typing in the shell, so the Enter meant for your own command would
   otherwise approve one you never read. They therefore need a deliberate chord — ⌘⏎ /
@@ -224,30 +250,38 @@ and is stopped only by the token.
   appearing is discarded backend-side and the proposal is shown again.
 - *No proposal without a shell.* Until `pty_spawn` has run there is no webview listening, so
   `run_gated` refuses rather than park a proposal nobody can answer.
-- *The token stays put.* Generated from `/dev/urandom`, compared with `ct_eq`, rendered only
-  by `render_status` for `/mcp serve status` — through `term_write`, so it reaches the display
-  engine and never the PTY, the journal or a model transcript. `ServeConfig` has no `Debug`
-  impl. Nothing in the module logs, and no response or error echoes request headers.
+- *The tokens stay put.* Generated from `/dev/urandom`, compared with `ct_eq`, rendered only
+  by `render_agent_config` for `/mcp agent show <name>` and only while the listener is up —
+  through `term_write`, so a token reaches the display engine and never the PTY, the journal
+  or a model transcript. `/mcp serve status` lists who may connect and prints no secret.
+  Neither `ServeConfig` nor `AgentToken` has a `Debug` impl, and `hub_state` — the webview's
+  whole view of the hub — carries no token and no command text. Nothing in the module logs,
+  and no response or error echoes request headers.
 
 **Limitations specific to server mode:**
 
 - **It is still human-in-the-loop, not a sandbox.** Everything under [Limitations](#limitations)
-  applies to external proposals unchanged: the lexical check warns and does not block, a
-  long command scrolls out of a single-line input, and an approved command runs as you.
+  applies to external proposals unchanged: the lexical check warns and does not block, and
+  an approved command runs as you.
 - **Approval fatigue is worse here.** The built-in agent stops after 12 steps; an external
-  client can propose for ever, and each denial is answered instantly. `MIN_REVIEW` defeats an
-  Enter already in flight, not a person typing blind for longer than a second.
-- **A pending proposal outlives its client.** If the client times out or disconnects, the
-  proposal stays in the bar until you decide. Approve it and the command runs with nobody
+  client can propose for ever. The 30 s denial cooldown and the one-live-proposal cap slow a
+  re-sending loop down; neither stops a client that simply keeps asking, and `MIN_REVIEW`
+  defeats an Enter already in flight, not a person typing blind for longer than a second.
+- **A pending proposal outlives its client.** `run_command` now answers within 25 s with a
+  `proposal_id` rather than holding the client's HTTP call, so the proposal normally outlives
+  the request that made it; and if the client gives up or disconnects entirely, the proposal
+  still stays in the bar until you decide. Approve it and the command runs with nobody
   reading the result.
-- **The 20-second wait does not kill the command.** `run_command` then returns
-  `Exit code: unknown`, releases the slot, and the next approved command is written into
+- **The 20-second wait does not kill the command.** The proposal then settles as
+  `Exit code: unknown` and releases the slot, and the next approved command is written into
   whatever is still running in the foreground.
-- **Plain HTTP on loopback.** A process that can sniff `lo0` sees the token; one that can do
+- **Plain HTTP on loopback.** A process that can sniff `lo0` sees a token; one that can do
   that can usually read the file anyway.
-- **`run_gated` has no automated test.** It needs an `AppHandle`. Its parts are tested
-  (`agent_claim`, `parse_run_args`, `wait_block`, `admit`, the HTTP server against a stub);
-  the ordering of claim → propose → write is verified the way `agent_loop`'s is, by reading it.
+- **`run_gated` has no behavioural test.** It needs an `AppHandle`. Its parts are tested
+  (`agent_claim`, `parse_run_args`, `wait_block`, `admit`, the proposal store, the HTTP server
+  against a stub); that the PTY write still sits after the `!approved` return, and that
+  `agent_propose`, `MIN_REVIEW`, `decision_stands` and `agent_decide(bool)` are unchanged, is
+  asserted by grep in `the_approval_gate_is_unchanged`.
 
 ## What would make it stronger
 
@@ -263,6 +297,9 @@ and is stopped only by the token.
    inherited credentials) so approval is not the only control.
 6. Per-tool MCP policy, with destructive-hint annotations shown in the gate.
 7. Strip escape sequences before `term_write`, and delimit tool output in the transcript as data.
-8. For server mode: scope tokens per client, with a read-only scope; gate `read_journal` or redact its output; rate-limit proposals after a denial.
+8. For server mode: ~~scope tokens per client, with a read-only scope; gate `read_journal`~~ —
+   done: one token per agent, `TOOL_SCOPES` enforced in Rust, and `journal` off by default.
+   ~~rate-limit proposals after a denial~~ — done: `DENY_COOLDOWN`. The residual is redacting
+   `read_journal`'s output for an agent that does hold the scope.
 
 Bypass reports are welcome — see [SECURITY.md](../SECURITY.md).
