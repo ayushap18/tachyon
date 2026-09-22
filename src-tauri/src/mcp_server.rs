@@ -593,16 +593,88 @@ pub(crate) fn autostart(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// Records what reached the "terminal" and answers like a user who denies `rm`.
-    #[derive(Default)]
-    struct Stub(Mutex<Vec<String>>);
+    ///
+    /// It also stands in for `run_gated`'s single-driver gate. `run_gated` needs an
+    /// `AppHandle`, which a unit test cannot build, so the stub claims the REAL
+    /// `agent_claim` over a plain `AgentState` — what an N-client test then observes over
+    /// the wire is the production claim, not a mock of it. When the turn lock grows a
+    /// registry, these tests exercise the new one.
+    struct Stub {
+        /// Commands that actually RAN: pushed after the claim is won, so `len()` is how
+        /// many clients reached the terminal.
+        log: Mutex<Vec<String>>,
+        /// The one approval slot, claimed exactly as `run_gated` claims it.
+        slot: AgentState,
+        /// Every client that got as far as `run_command`, winners and losers alike.
+        attempts: AtomicUsize,
+        /// How many attempts the holder waits for before releasing. The N-client test sets
+        /// it to N so the winner is provably still inside when the last loser arrives; a
+        /// sleep would make that a race the test itself could lose.
+        hold_until: AtomicUsize,
+        /// Who is inside the gated region. A second entrant finding this `Some` is the turn
+        /// lock broken, whatever the claim reported.
+        holder: Mutex<Option<u64>>,
+        inside: AtomicUsize,
+        /// High-water mark of `inside`. Anything above 1 is two drivers on one PTY.
+        peak: AtomicUsize,
+    }
+
+    impl Default for Stub {
+        fn default() -> Self {
+            Stub {
+                log: Mutex::default(),
+                slot: AgentState::default(),
+                attempts: AtomicUsize::new(0),
+                hold_until: AtomicUsize::new(1), // no waiting unless a test asks for it
+                holder: Mutex::default(),
+                inside: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    /// The harness's `AgentRunGuard`: built only after the claim is won, releases on every
+    /// exit including an unwind — "a panicking holder frees the slot" is this Drop.
+    struct Turn<'a>(&'a Stub);
+
+    impl Drop for Turn<'_> {
+        fn drop(&mut self) {
+            *self.0.holder.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.0.inside.fetch_sub(1, SeqCst);
+            self.0.slot.running.store(false, SeqCst);
+        }
+    }
 
     impl Backend for Stub {
         fn run_command(&self, command: &str) -> Result<String, String> {
-            self.0.lock().unwrap().push(command.to_string());
+            // One token for all N clients (per-agent tokens are a later milestone), so a
+            // client's identity rides in the command text: `agent 3`.
+            let id: u64 = command.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            self.attempts.fetch_add(1, SeqCst);
+            // Fail fast, never queue: `run_gated`'s claim, minus the AppHandle.
+            agent_claim(&self.slot).map_err(|_| BUSY.to_string())?;
+            let _turn = Turn(self);
+            self.peak.fetch_max(self.inside.fetch_add(1, SeqCst) + 1, SeqCst);
+            {
+                let mut h = self.holder.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(h.is_none(), "agent {id} entered while agent {h:?} still held the slot");
+                *h = Some(id);
+            }
+            self.log.lock().unwrap_or_else(|e| e.into_inner()).push(command.to_string());
+            // Hold the slot until every client has tried. Bounded, so a wrong `hold_until`
+            // fails the test instead of hanging it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.attempts.load(SeqCst) < self.hold_until.load(SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if command == "panic" {
+                panic!("holder died mid-command"); // the escape a_panicking_holder_frees_the_slot pulls
+            }
             if command.starts_with("rm") {
                 Err(DENIED.into())
             } else {
@@ -749,7 +821,7 @@ mod tests {
         assert!(handle_rpc(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string(), &stub).is_none());
         let sneaky = json!({ "jsonrpc": "2.0", "method": "tools/call", "params": { "name": "run_command", "arguments": { "command": "ls" } } });
         assert!(handle_rpc(&sneaky.to_string(), &stub).is_none());
-        assert!(stub.0.lock().unwrap().is_empty());
+        assert!(stub.log.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -796,7 +868,7 @@ mod tests {
         // invalid input never reaches the terminal
         assert_eq!(call("run_command", json!({ "command": "a\rb" }))["error"]["code"], -32602);
         assert_eq!(call("launch_missiles", json!({}))["error"]["code"], -32602);
-        assert_eq!(*stub.0.lock().unwrap(), ["ls", "rm -rf build"]);
+        assert_eq!(*stub.log.lock().unwrap(), ["ls", "rm -rf build"]);
 
         assert_eq!(call("read_journal", json!({ "limit": 3 }))["result"]["content"][0]["text"], "[\"last 3\"]");
         assert_eq!(call("get_context", json!({}))["result"]["isError"], false);
@@ -861,6 +933,35 @@ mod tests {
         assert!(agent_claim(&a).is_ok());
         assert!(!a.abort.load(SeqCst));
         assert!(a.decision.lock().unwrap().is_none());
+
+        // ...and under a real race, not just in sequence. The single `swap` is what makes
+        // this hold; a check-then-claim would let two callers both read `false` and both
+        // win. The start gate is a spin rather than a `Barrier`: a barrier's wakeups land
+        // tens of microseconds apart, and the window a broken claim opens is nanoseconds
+        // wide. Repeated, because a broken claim can still get lucky in one round.
+        for round in 0..16 {
+            let a = Arc::new(AgentState::default());
+            let ready = Arc::new(AtomicUsize::new(0));
+            let go = Arc::new(AtomicBool::new(false));
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (a, ready, go) = (a.clone(), ready.clone(), go.clone());
+                    std::thread::spawn(move || {
+                        ready.fetch_add(1, SeqCst);
+                        while !go.load(SeqCst) {
+                            std::hint::spin_loop();
+                        }
+                        usize::from(agent_claim(&a).is_ok())
+                    })
+                })
+                .collect();
+            while ready.load(SeqCst) < racers.len() {
+                std::thread::yield_now(); // not timing-critical, unlike the racers' wait
+            }
+            go.store(true, SeqCst);
+            let wins: usize = racers.into_iter().map(|t| t.join().expect("racer")).sum();
+            assert_eq!(wins, 1, "round {round}: {wins} drivers claimed the one slot");
+        }
     }
 
     #[test]
@@ -924,7 +1025,7 @@ mod tests {
         let run = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "run_command", "arguments": { "command": "ls" } } });
         assert_eq!(post(&url, None, None, &run).0, 401);
         assert_eq!(post(&url, Some(&auth), Some("https://evil.com"), &run).0, 403);
-        assert!(stub.0.lock().unwrap().is_empty(), "a rejected request reached the terminal");
+        assert!(stub.log.lock().unwrap().is_empty(), "a rejected request reached the terminal");
         // no response, rejected or not, echoes the token or grants CORS
         let (_, body) = post(&url, Some("Bearer wrong"), None, &ping);
         assert!(!body.contains(TOKEN));
@@ -945,7 +1046,7 @@ mod tests {
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["isError"], false);
-        assert_eq!(*stub.0.lock().unwrap(), ["ls"]);
+        assert_eq!(*stub.log.lock().unwrap(), ["ls"]);
 
         // wrong path / method, authenticated
         assert_eq!(post(&format!("http://{addr}/"), Some(&auth), None, &ping).0, 404);
@@ -958,6 +1059,104 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let gone = ureq::post(&url).timeout(std::time::Duration::from_secs(2)).set("Authorization", &auth).send_string(&ping.to_string());
         assert!(matches!(gone, Err(ureq::Error::Transport(_))));
+    }
+
+    // ---- N clients, one terminal ----
+
+    fn listen(stub: Arc<Stub>) -> (Arc<tiny_http::Server>, String) {
+        let server = start(0, TOKEN.into(), stub).unwrap();
+        let url = format!("http://{}/mcp", server.server_addr().to_ip().unwrap());
+        (server, url)
+    }
+
+    fn run_call(id: u64) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "run_command", "arguments": { "command": format!("agent {id}") } } })
+    }
+
+    /// N clients through one real listener, all on the one token (per-agent tokens are a
+    /// later milestone; rerun this with N tokens there). The `Barrier` is what makes it a
+    /// race rather than a queue: no thread posts until every thread is ready. Returns each
+    /// client's JSON-RPC response.
+    fn agents(n: u64, url: &str) -> Vec<Value> {
+        let barrier = Arc::new(std::sync::Barrier::new(n as usize));
+        let threads: Vec<_> = (0..n)
+            .map(|id| {
+                let (barrier, url) = (barrier.clone(), url.to_string());
+                std::thread::spawn(move || {
+                    let body = run_call(id);
+                    barrier.wait();
+                    let (status, text) = post(&url, Some(&format!("Bearer {TOKEN}")), None, &body);
+                    assert_eq!(status, 200, "agent {id}");
+                    serde_json::from_str::<Value>(&text).unwrap()
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().expect("client thread")).collect()
+    }
+
+    /// The point of the single approval slot: N external agents shout at once, one drives
+    /// and the rest are told so. `hold_until` keeps the winner inside until all N have
+    /// arrived, so this fails on a broken gate rather than on a slow machine.
+    #[test]
+    fn eight_simultaneous_run_commands_reach_the_terminal_once() {
+        const N: u64 = 8;
+        let stub = Arc::new(Stub::default());
+        stub.hold_until.store(N as usize, SeqCst);
+        let (server, url) = listen(stub.clone());
+
+        let results = agents(N, &url);
+        server.unblock();
+
+        let busy: Vec<&Value> = results.iter().filter(|v| v["result"]["isError"] == true).collect();
+        assert_eq!(busy.len(), (N - 1) as usize, "{results:#?}");
+        for v in busy {
+            assert_eq!(v["result"]["content"][0]["text"], BUSY);
+        }
+        assert_eq!(stub.attempts.load(SeqCst), N as usize, "a client never reached the backend");
+        assert_eq!(stub.log.lock().unwrap().len(), 1, "more than one agent drove the terminal");
+        assert_eq!(stub.peak.load(SeqCst), 1);
+    }
+
+    /// Handing the slot over eight times in a row: everyone gets a turn, never two at once.
+    #[test]
+    fn eight_sequential_run_commands_never_overlap() {
+        const N: u64 = 8;
+        let stub = Arc::new(Stub::default());
+        let (server, url) = listen(stub.clone());
+        let auth = format!("Bearer {TOKEN}");
+
+        for id in 0..N {
+            let (status, text) = post(&url, Some(&auth), None, &run_call(id));
+            assert_eq!(status, 200);
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["result"]["isError"], false, "agent {id} was refused a free slot");
+        }
+        server.unblock();
+
+        assert_eq!(stub.log.lock().unwrap().len(), N as usize);
+        assert_eq!(stub.peak.load(SeqCst), 1);
+    }
+
+    /// Why `AgentRunGuard` is a Drop and not a trailing statement: a holder that dies must
+    /// not wedge the slot shut for everyone else. The guard releases during the unwind, and
+    /// tiny_http's own `Drop for Request` answers the abandoned request 500.
+    #[test]
+    fn a_panicking_holder_frees_the_slot() {
+        let stub = Arc::new(Stub::default());
+        let (server, url) = listen(stub.clone());
+        let auth = format!("Bearer {TOKEN}");
+
+        let dies = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": { "name": "run_command", "arguments": { "command": "panic" } } });
+        assert_eq!(post(&url, Some(&auth), None, &dies).0, 500);
+
+        let (status, text) = post(&url, Some(&auth), None, &run_call(1));
+        server.unblock();
+        assert_eq!(status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["result"]["isError"], false);
+        assert!(!stub.slot.running.load(SeqCst), "the unwind left the slot claimed");
+        assert!(stub.holder.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     }
 
     /// `get_context` is the unapproved read surface, so the threat model is only worth

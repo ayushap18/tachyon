@@ -726,16 +726,21 @@ fn setup(mut keys_loaded: Signal<bool>) {
         });
     }
 
-    // --- pty-exit listener ---
-    {
+    // --- dead-backend-thread banners ---
+    // Both events fire from a Drop guard on a pty_spawn thread, so they also arrive when that
+    // thread panicked. paint-dead means nothing will repaint over this line ever again.
+    for (event, text) in [
+        ("pty-exit", "[process exited]"),
+        ("paint-dead", "[tachyon] repaint thread died — the screen is frozen; restart tachyon"),
+    ] {
         let term = term.clone();
-        listen("pty-exit", move |_| {
+        listen(event, move |_| {
             let t = term.borrow();
             let row = (t.cursor.line + 1).min(t.rows.saturating_sub(1));
             let (x, y, _, _) = t.cell_px(0, row);
             t.ctx.set_font(&format!("{}px {}", t.font_px, t.font_family));
             t.ctx.set_fill_style_str(crate::theme::tokens(&settings_theme()).err);
-            let _ = t.ctx.fill_text("[process exited]", x, y);
+            let _ = t.ctx.fill_text(text, x, y);
         });
     }
 

@@ -288,6 +288,7 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /mcp list                          servers, transport, full command line, and their tools
 /mcp serve on|off|status           let external agents use this terminal (on <port> to pick one)
 /update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
+/crash                             last panics, from the local crash.log (never uploaded)
 /help                              this list
 ```
 

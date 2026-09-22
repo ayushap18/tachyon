@@ -12,7 +12,7 @@
 
 /// The form column must match SLASH_HELP in src-tauri/src/lib.rs; the test
 /// `surfaces_agree_with_the_backend` parses that file and fails if they drift.
-pub const SLASH_ROWS: [(&str, &str); 20] = [
+pub const SLASH_ROWS: [(&str, &str); 21] = [
     ("/keys", "list providers, active, key source"),
     ("/providers", "same table as /keys"),
     ("/key <id> <apikey>", "set a provider's API key"),
@@ -32,6 +32,7 @@ pub const SLASH_ROWS: [(&str, &str); 20] = [
     ("/mcp list", "list MCP servers and their tools"),
     ("/mcp serve on|off|status", "let external agents use this terminal (on <port> to pick one)"),
     ("/update", "check for a newer Tachyon"),
+    ("/crash", "last panics, from the local crash.log"),
     ("/help", "this list"),
 ];
 
@@ -384,8 +385,8 @@ mod tests {
         assert_eq!(
             verbs,
             [
-                "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models", "/providers",
-                "/remove", "/route", "/update", "/url", "/use"
+                "/crash", "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models",
+                "/providers", "/remove", "/route", "/update", "/url", "/use"
             ]
         );
     }
