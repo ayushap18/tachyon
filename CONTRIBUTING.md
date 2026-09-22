@@ -88,6 +88,29 @@ tool or assistant attribution trailers.
 One logical change per PR. Fill in the PR template; add a line under **Unreleased** in
 [CHANGELOG.md](CHANGELOG.md) for anything a user would notice.
 
+## Cutting a beta
+
+A tag with a hyphen is a prerelease — `v0.3.0-beta.0`. There is no separate workflow or branch:
+the same `.github/workflows/release.yml` builds it, and `npm run test:release` pins the shape.
+
+1. In one commit set the same version string in `package.json`, `src-tauri/tauri.conf.json`,
+   `src-tauri/Cargo.toml`, `ui/Cargo.toml` and the `Tachyon_<version>_*` filenames in README.md.
+   The workflow refuses a tag that disagrees with the first four; `npm run test:release` refuses
+   a README that names a different version.
+2. Tag that commit and push the tag — `tags: ['v*']` starts the build.
+3. The workflow marks any hyphenated tag `--prerelease` and skips `--latest`. That is the whole
+   safeguard: the updater endpoint is `releases/latest/download/latest.json`, and GitHub never
+   resolves `releases/latest` to a prerelease, so installed stable copies are not offered the
+   beta — ⌘U keeps waiting for the next stable release. Never hand-edit a beta on GitHub to
+   "Set as the latest release"; that alone would push it to every user.
+4. Installers carry the suffix verbatim (`Tachyon_0.3.0-beta.0_aarch64.dmg`) because the bundler
+   interpolates `tauri.conf.json`'s version into `<productName>_<version>_<arch>`. The macOS
+   updater tarball `Tachyon.app.tar.gz` is unversioned, so it is the same name on every channel.
+   A name the bundler spells differently fails the publish with `Expected exactly one …` rather
+   than shipping a partial release.
+5. Testers install the beta by hand. To retire it, delete the GitHub release and the tag —
+   nothing else points at either.
+
 ## Security issues
 
 Do not open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md).

@@ -4,15 +4,19 @@
 // confident numbers about code that no longer exists.
 import { readFileSync } from "node:fs";
 
-const FILE = new URL("../src-tauri/src/lib.rs", import.meta.url);
-const SRC = readFileSync(FILE, "utf8");
+// A file list, not one path: the prompts and the danger gate are free to move to a new
+// module, and a lookup that missed one would throw rather than silently drift.
+const FILES = ["lib.rs", "agent.rs"].map((f) => new URL(`../src-tauri/src/${f}`, import.meta.url));
+const SRC = FILES.map((f) => readFileSync(f, "utf8")).join("\n");
 
 // The app substitutes the detected shell/OS for this placeholder at call time;
 // the evals pin it so runs stay comparable across machines.
 const ENV = "zsh on macOS";
 
 const fail = (what) => {
-  throw new Error(`rust-source: cannot extract ${what} from ${FILE.pathname} — update evals/rust-source.mjs`);
+  throw new Error(
+    `rust-source: cannot extract ${what} from ${FILES.map((f) => f.pathname).join(", ")} — update evals/rust-source.mjs`,
+  );
 };
 
 // body of a normal "..." literal → the string rustc would produce

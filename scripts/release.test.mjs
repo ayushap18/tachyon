@@ -9,13 +9,13 @@ import { createHash } from 'node:crypto';
 const names = ['Tachyon_0.2.1_aarch64.dmg', 'Tachyon_0.2.1_amd64.deb', 'Tachyon_0.2.1_amd64.AppImage'];
 // What a signed CI run adds: the macOS updater tarball plus a .sig for each updater download.
 const signedNames = ['Tachyon.app.tar.gz', 'Tachyon.app.tar.gz.sig', 'Tachyon_0.2.1_amd64.AppImage.sig'];
-function fixture(t) {
+function fixture(t, tag = 'v0.2.1') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tachyon-release-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const source = path.join(root, 'installers');
   const output = path.join(root, 'release-assets');
   fs.mkdirSync(source);
-  const run = (signed = false) => spawnSync(process.execPath, [new URL('./release.mjs', import.meta.url).pathname, 'v0.2.1', source, output],
+  const run = (signed = false) => spawnSync(process.execPath, [new URL('./release.mjs', import.meta.url).pathname, tag, source, output],
     { encoding: 'utf8', env: { ...process.env, UPDATER_SIGNED: String(signed) } });
   return { source, output, run };
 }
@@ -53,6 +53,50 @@ test('complete platform set produces verifiable checksums, versioned notes and l
     assert.ok(signature.length > 0);
   }
   assert.equal(latest.platforms['darwin-aarch64'].signature, sigFor('Tachyon.app.tar.gz'));
+});
+
+// The beta channel is a tag shape, not a code path: the bundler interpolates tauri.conf.json's
+// version verbatim into `<productName>_<version>_<arch>`, so the prerelease suffix travels into
+// every installer name, checksum and updater URL. release.mjs's `required` list is written
+// against that template, so it holds for a beta only if nothing here truncates at the hyphen.
+test('a prerelease tag keeps its suffix in every filename and updater url', t => {
+  const version = '0.3.0-beta.0';
+  const beta = names.map(name => name.replace('0.2.1', version));
+  // Tachyon.app.tar.gz carries no version: the macOS updater tarball is the same name on
+  // every channel, and only latest.json's url pins it to the tag.
+  const betaSigned = signedNames.map(name => name.replace('0.2.1', version));
+  const { source, output, run } = fixture(t, `v${version}`);
+  for (const name of [...beta, ...betaSigned]) {
+    fs.writeFileSync(path.join(source, name), name.endsWith('.sig') ? sigFor(name.slice(0, -4), version) : `file ${name}\n`);
+  }
+  const result = run(true);
+  assert.equal(result.status, 0, result.stderr);
+  const checksums = fs.readFileSync(path.join(output, 'SHA256SUMS'), 'utf8').trim().split('\n');
+  assert.deepEqual(checksums.map(line => line.split('  ')[1]).sort(), [...beta, ...betaSigned].sort());
+  const latest = JSON.parse(fs.readFileSync(path.join(output, 'latest.json'), 'utf8'));
+  assert.equal(latest.version, version);
+  assert.equal(latest.platforms['linux-x86_64'].url,
+    `https://github.com/ayushap18/tachyon/releases/download/v${version}/Tachyon_${version}_amd64.AppImage`);
+  assert.equal(latest.platforms['darwin-aarch64'].url,
+    `https://github.com/ayushap18/tachyon/releases/download/v${version}/Tachyon.app.tar.gz`);
+  assert.match(fs.readFileSync(path.join(output, 'RELEASE_NOTES.md'), 'utf8'), /blob\/v0\.3\.0-beta\.0\/CHANGELOG/);
+});
+
+// tauri.conf.json's updater endpoint is releases/latest/download/latest.json, and GitHub never
+// resolves that to a prerelease. So "not --latest" is the whole thing standing between a beta
+// and every installed stable copy, and it is one shell line in release.yml. Pinned here because
+// nothing else fails if that line loses its guard.
+test('release.yml marks a hyphenated tag prerelease and never latest', () => {
+  const root = new URL('../', import.meta.url);
+  const yml = fs.readFileSync(new URL('.github/workflows/release.yml', root), 'utf8');
+  assert.match(yml, /grep -q -- '-'; then\n\s*gh release edit "\$RELEASE_TAG" --prerelease\n/);
+  assert.match(yml, /&& ! echo "\$RELEASE_TAG" \| grep -q -- '-'; then\n\s*gh release edit "\$RELEASE_TAG" --latest\n/);
+  assert.equal(yml.match(/--latest/g).length, 1, '--latest must appear only under the no-hyphen guard');
+  // The tag gate is written twice — release.yml rejects a bad tag before any build, release.mjs
+  // before any asset is copied. Drift is how a shape passes one and fails the other mid-release.
+  const mjs = fs.readFileSync(new URL('scripts/release.mjs', root), 'utf8');
+  const gate = /\/\^v[^\n]*?\/(?=\.test\()/;
+  assert.equal(yml.match(gate)?.[0], mjs.match(gate)?.[0]);
 });
 
 // No signing secrets yet: the release still ships, the updater simply is not offered it.
@@ -117,10 +161,16 @@ test('a signature that does not record the release version blocks publication', 
   assert.match(result.stderr, /does not record version:0\.2\.1/);
 });
 
+// `[0-9.]+` stopped at the hyphen, so on a prerelease version it captured nothing at all and
+// this test failed with an empty list however the README was written — it could not be
+// satisfied by a beta. The suffix is part of the filename, so it is part of the capture.
+const NAMED_IN_README = /Tachyon_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)_/g;
+
 test('README installer names carry the shipped version', () => {
   const root = new URL('../', import.meta.url);
   const { version } = JSON.parse(fs.readFileSync(new URL('src-tauri/tauri.conf.json', root), 'utf8'));
-  const named = fs.readFileSync(new URL('README.md', root), 'utf8').matchAll(/Tachyon_([0-9.]+)_/g);
+  const named = fs.readFileSync(new URL('README.md', root), 'utf8').matchAll(NAMED_IN_README);
   const versions = [...new Set([...named].map(m => m[1]))];
   assert.deepEqual(versions, [version]);
+  assert.deepEqual([...'Tachyon_0.3.0-beta.0_amd64.deb'.matchAll(NAMED_IN_README)].map(m => m[1]), ['0.3.0-beta.0']);
 });
