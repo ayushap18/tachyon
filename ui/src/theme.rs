@@ -154,7 +154,11 @@ mod tests {
         }
         css.push_str(rest);
 
-        for sel in ["#ai-bar", "#status-bar", "#settings", "#palette-input", "#palette-list", "#blocks"] {
+        // #ai-proposal is the command being approved: of everything here it is the one the
+        // user must read exactly, and it sits over the terminal's own text.
+        for sel in
+            ["#ai-bar", "#ai-proposal", "#status-bar", "#settings", "#palette-input", "#palette-list", "#blocks"]
+        {
             let head = format!("\n{sel} {{\n");
             let at = css.find(&head).unwrap_or_else(|| panic!("{sel} is gone from main.css")) + head.len();
             let block = &css[at..][..css[at..].find("\n}").expect("unterminated block")];

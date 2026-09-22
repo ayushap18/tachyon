@@ -66,6 +66,19 @@ struct ProviderList {
     #[serde(default)]
     hidden: Vec<String>,
 }
+/// `hub_state` carries more than this (scopes, has_token, worktree, last_seen, the pending
+/// proposal); naming only `name` is what keeps the rest out of the completer's state. There
+/// is deliberately no field a token could land in — the command does not send one.
+#[derive(Deserialize)]
+struct HubState {
+    #[serde(default)]
+    agents: Vec<HubAgent>,
+}
+#[derive(Deserialize)]
+struct HubAgent {
+    #[serde(default)]
+    name: String,
+}
 #[derive(Deserialize)]
 struct AgentOutput {
     #[serde(default)]
@@ -80,13 +93,48 @@ struct AgentPropose {
     // true when the proposal came in over Tachyon's MCP server, not from the built-in agent
     #[serde(default)]
     external: bool,
+    /// Which registered agent asked, derived server-side from its bearer token alone. Empty
+    /// for the built-in agent — and for an external proposal that is why it is refused.
+    #[serde(default)]
+    agent: String,
+}
+
+/// Mirrors `MAX_COMMAND_CHARS` in src-tauri/src/mcp_server.rs — ui is outside that
+/// workspace, so nothing links the two and a test below compares the source text.
+const MAX_COMMAND_CHARS: usize = 4096;
+
+/// The pending command, for the read-only block above the bar. Verbatim: this is the exact
+/// string the pty will be given (`one_line` has already folded it, `; ` and all), so
+/// re-splitting or prettifying it here would show the approver something else.
+///
+/// Capped because the built-in agent's proposals come from a model and are bounded by
+/// nothing — the MCP path refuses a longer `command` outright. The cut is stated in the
+/// block, since what runs is still the whole thing.
+fn proposal_block(text: &str) -> String {
+    match text.char_indices().nth(MAX_COMMAND_CHARS) {
+        None => text.to_string(),
+        Some((i, _)) => format!("{}\n… cut at {MAX_COMMAND_CHARS} characters — the rest runs unseen", &text[..i]),
+    }
+}
+
+/// May this proposal be approved at all? An external proposal is approved on the strength of
+/// WHO is asking, so one that names nobody cannot be: it is shown for denial only. Fail
+/// closed, the same posture as agent_propose's `rx.await.unwrap_or(false)`.
+fn approvable(external: bool, agent: &str) -> bool {
+    !external || !agent.is_empty()
 }
 
 /// The gate's status line. The approver must be able to tell a command THEY asked the
-/// built-in agent for from one an outside process is asking to run.
-fn gate_status(danger: bool, external: bool, is_mac: bool) -> String {
-    let who = if external { "external agent · " } else { "" };
+/// built-in agent for from one an outside process is asking to run — and, among outside
+/// processes, WHICH one.
+fn gate_status(danger: bool, external: bool, agent: &str, is_mac: bool) -> String {
     let warn = if danger { "⚠ destructive · " } else { "" };
+    if !approvable(external, agent) {
+        // No affordance to approve is offered, because there is none: the key handler
+        // swallows Enter for this proposal however it is chorded.
+        return format!("unidentified agent · {warn}cannot approve · esc deny");
+    }
+    let who = if external { format!("{agent} · ") } else { String::new() };
     // External proposals are UNSOLICITED: the bar takes focus while the user may be typing
     // in their shell, so a plain Enter meant for their own command must never approve one.
     let approve = if !external {
@@ -162,6 +210,9 @@ pub fn AiBar() -> Element {
     // never a separate signal, so no code path can leave an armed gate editable.
     let mut pending_gate = use_signal(|| false);
     let mut gate_external = use_signal(|| false);
+    // Decided when the proposal lands, from the payload that named (or failed to name) the
+    // agent — so the key handler cannot approve one the status line called unidentified.
+    let mut gate_approvable = use_signal(|| false);
     // agent_running is shared state (⌘J abort reads it) — this module owns writes.
     let mut agent_running = state.agent_running;
 
@@ -176,8 +227,9 @@ pub fn AiBar() -> Element {
                 }
                 input.set(p.text);
                 danger.set(p.danger);
-                status.set(gate_status(p.danger, p.external, crate::keymap::is_mac()));
+                status.set(gate_status(p.danger, p.external, &p.agent, crate::keymap::is_mac()));
                 gate_external.set(p.external);
+                gate_approvable.set(approvable(p.external, &p.agent));
                 pending_gate.set(true);
             }
         });
@@ -261,6 +313,14 @@ pub fn AiBar() -> Element {
                                 c.mcp = n;
                             }
                         }
+                        // Names only, for `/mcp agent show|revoke <Tab>`. Same disk read as
+                        // the two above, and the only reason the webview asks for the hub at
+                        // all — there is no command that would hand it a token.
+                        if let Ok(v) = invoke("hub_state", NoArgs {}).await {
+                            if let Ok(h) = serde_wasm_bindgen::from_value::<HubState>(v) {
+                                c.agents = h.agents.into_iter().map(|a| a.name).collect();
+                            }
+                        }
                         ctx.set(c);
                         // the rows under the cursor may have just been replaced by argument
                         // rows: a highlight from before would now point at a different
@@ -293,7 +353,16 @@ pub fn AiBar() -> Element {
     // plain values, not guards: a read()/peek() guard alive across a .set panics, and the
     // key branch below writes input/sel
     let rows = rows(&input.read(), &ctx.read());
-    let open = list_open(*pending_gate.read(), *agent_running.read(), rows.len());
+    let gate = *pending_gate.read();
+    // Under a gate the command belongs to the block above the bar, which shows it whole and
+    // wrapped. The <input> is then a focus holder only: leaving the text in it too would
+    // paint a second copy of the same command clipped to its first line's worth.
+    let (typed, proposal) = if gate {
+        (String::new(), proposal_block(&input.read()))
+    } else {
+        (input.read().clone(), String::new())
+    };
+    let open = list_open(gate, *agent_running.read(), rows.len());
     let sel_eff = (*sel.read()).filter(|i| *i < rows.len());
     let rows_for_key = rows.clone();
     let class = match (agent, *danger.read()) {
@@ -308,9 +377,17 @@ pub fn AiBar() -> Element {
             span { id: "ai-icon", if agent { "⚡" } else { "✦" } }
             input {
                 id: "ai-input",
-                value: "{input}",
+                value: "{typed}",
                 readonly: *pending_gate.read() || *agent_running.read(),
-                placeholder: if agent { "Describe a task…" } else { "Describe a command…" },
+                // no placeholder under a gate: an empty input inviting a description would
+                // be an affordance to type where the only keys that do anything are ⏎/esc.
+                placeholder: if gate {
+                    ""
+                } else if agent {
+                    "Describe a task…"
+                } else {
+                    "Describe a command…"
+                },
                 onmounted: move |e| {
                     spawn(async move {
                         let _ = e.set_focus(true).await;
@@ -334,8 +411,12 @@ pub fn AiBar() -> Element {
                     // ---- approval gate: the ONLY place a proposal resolves ----
                     if *pending_gate.read() {
                         let mods = e.modifiers();
-                        if key == "Enter" && !enter_approves(*gate_external.peek(), mods.meta(), mods.ctrl()) {
-                            // a stray Enter on an external proposal: swallow it, decide nothing
+                        if key == "Enter"
+                            && !(*gate_approvable.peek()
+                                && enter_approves(*gate_external.peek(), mods.meta(), mods.ctrl()))
+                        {
+                            // a stray Enter on an external proposal, or any Enter on one that
+                            // named no agent: swallow it, decide nothing
                             e.prevent_default();
                             e.stop_propagation();
                         } else if key == "Enter" {
@@ -516,6 +597,13 @@ pub fn AiBar() -> Element {
                     }
                 },
             }
+            // The proposal, in full, above the bar. A <pre> with no handlers and no
+            // contenteditable: it is a thing to read, and every key still reaches #ai-input,
+            // which keeps focus. Never shares the space with #ai-list — list_open is false
+            // while a gate is pending.
+            if gate {
+                pre { id: "ai-proposal", "{proposal}" }
+            }
             // keyboard only: no onclick, so the sole way onto a row is an arrow/Tab press
             if open {
                 ul { id: "ai-list",
@@ -536,7 +624,7 @@ pub fn AiBar() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_owns_bar, enter_approves, gate_status};
+    use super::{agent_owns_bar, approvable, enter_approves, gate_status, proposal_block, MAX_COMMAND_CHARS};
 
     #[test]
     fn a_continuation_stands_down_under_a_gate_or_run() {
@@ -548,13 +636,33 @@ mod tests {
 
     #[test]
     fn gate_status_names_an_external_requester() {
-        assert_eq!(gate_status(false, false, true), "run? ⏎ approve · esc deny");
-        assert_eq!(gate_status(true, false, true), "⚠ destructive · run? ⏎ approve · esc deny");
-        assert!(gate_status(false, true, true).starts_with("external agent · run? "));
-        assert!(gate_status(false, true, true).contains("⌘⏎ approve"));
-        assert!(gate_status(false, true, false).contains("Ctrl+⏎ approve"));
-        assert!(!gate_status(false, true, false).contains("run? ⏎ approve"), "external must not advertise a bare Enter");
-        assert!(gate_status(true, true, true).starts_with("external agent · ⚠ destructive"));
+        // the built-in agent (⌘J) is untouched: no name, plain Enter
+        assert_eq!(gate_status(false, false, "", true), "run? ⏎ approve · esc deny");
+        assert_eq!(gate_status(true, false, "", true), "⚠ destructive · run? ⏎ approve · esc deny");
+        assert_eq!(gate_status(false, true, "codex", true), "codex · run? ⌘⏎ approve · esc deny");
+        assert!(gate_status(false, true, "codex", false).contains("Ctrl+⏎ approve"));
+        assert!(
+            !gate_status(false, true, "codex", false).contains("run? ⏎ approve"),
+            "external must not advertise a bare Enter"
+        );
+        assert!(gate_status(true, true, "codex", true).starts_with("codex · ⚠ destructive"));
+    }
+
+    /// Approving an external proposal is a judgement about WHO asked. A payload that names
+    /// nobody (an older backend, a field lost in transit) cannot be judged, so the bar shows
+    /// it for denial only — and says so, rather than offering a chord that decides nothing.
+    #[test]
+    fn an_unidentified_external_proposal_is_not_approvable() {
+        assert!(!approvable(true, ""));
+        assert!(approvable(true, "codex"));
+        assert!(approvable(false, ""), "the built-in agent has no registry name and never did");
+
+        let line = gate_status(false, true, "", true);
+        assert!(line.starts_with("unidentified agent · "), "{line}");
+        // no key is offered that would approve it — not ⏎, not the chord
+        assert!(!line.contains('⏎'), "{line}");
+        assert!(line.contains("cannot approve") && line.ends_with("esc deny"), "{line}");
+        assert!(gate_status(true, true, "", true).contains("⚠ destructive"));
     }
 
     #[test]
@@ -563,5 +671,85 @@ mod tests {
         assert!(!enter_approves(true, false, false)); // external: the stray Enter decides nothing
         assert!(enter_approves(true, true, false)); // ⌘⏎
         assert!(enter_approves(true, false, true)); // Ctrl+⏎
+    }
+
+    /// `enter_approves` is the chord rule itself: M1 puts an agent name in the bar and a
+    /// second condition in front of this call, and neither may quietly relax it. Pinned by
+    /// source text, the way lib.rs pins the approval gate's own lines.
+    #[test]
+    fn the_chord_rule_is_byte_identical() {
+        // The production half only: include_str! reads this test too, and a needle written
+        // whole would match its own source line and pass however the bar actually behaves.
+        let src = include_str!("ai_bar.rs").split("#[cfg(test)]").next().expect("the file is not empty");
+        let needle = concat!(
+            "fn enter_approves(external: bool, meta: bool, ctrl: bool) -> bool {\n",
+            "    !external || meta || ctrl\n",
+            "}",
+        );
+        assert!(src.contains(needle), "enter_approves changed");
+        // ...and the gate branch still asks BOTH questions before deciding anything: the chord,
+        // and whether this proposal named an agent at all. Dropping either half approves a
+        // command the status line is at the same moment calling unapprovable.
+        assert!(
+            src.contains("!(*gate_approvable.peek()\n                                && enter_approves(*gate_external.peek(), mods.meta(), mods.ctrl()))"),
+            "the gate branch no longer requires both the chord and an identified agent"
+        );
+    }
+
+    /// What is shown is what runs. `one_line` has already folded the command, so the block
+    /// must hand the string on untouched — and when it cannot show all of it, say so
+    /// instead of letting the tail run unseen (the whole point of the block).
+    #[test]
+    fn the_proposal_block_shows_the_command_verbatim_or_says_it_cut_it() {
+        assert_eq!(proposal_block("rm -rf /tmp/x; echo done"), "rm -rf /tmp/x; echo done");
+        assert_eq!(proposal_block(""), "");
+        // a line break can only reach here from a future backend, but pre-wrap renders it
+        assert_eq!(proposal_block("a\nb"), "a\nb");
+        assert_eq!(proposal_block(&"x".repeat(MAX_COMMAND_CHARS)), "x".repeat(MAX_COMMAND_CHARS));
+
+        let long = "y".repeat(MAX_COMMAND_CHARS + 1);
+        let cut = proposal_block(&long);
+        let (head, tail) = cut.split_once('\n').expect("a cut block must carry its notice");
+        assert_eq!(head, "y".repeat(MAX_COMMAND_CHARS));
+        assert!(tail.contains("cut at 4096 characters") && tail.contains("runs unseen"), "{tail}");
+
+        // the cap counts characters, and the cut must not land inside one
+        let wide = "é".repeat(MAX_COMMAND_CHARS + 5);
+        assert!(proposal_block(&wide).starts_with(&"é".repeat(MAX_COMMAND_CHARS)));
+        assert_eq!(proposal_block(&wide).chars().filter(|c| *c == 'é').count(), MAX_COMMAND_CHARS);
+    }
+
+    /// The block is a thing to READ: no handler, no contenteditable, nothing that could turn
+    /// the text the user is judging into text they (or a script) edited first. And it must
+    /// not be able to take focus from #ai-input, which is the only element that can deny.
+    #[test]
+    fn the_proposal_block_is_read_only() {
+        let src = include_str!("ai_bar.rs");
+        let at = src.find(r#"pre { id: "ai-proposal""#).expect("the proposal block is gone");
+        let el = &src[at..][..src[at..].find('\n').unwrap()];
+        for forbidden in ["contenteditable", "oninput", "onkeydown", "tabindex", "onclick"] {
+            assert!(!el.contains(forbidden), "{forbidden} on the proposal block: {el}");
+        }
+        // it renders the capped text, never the raw signal — and while it is up, #ai-input
+        // renders nothing, so there is exactly one copy of the command on screen. Needles
+        // are joined from fragments: include_str! reads this test too, and a whole one
+        // would match itself and pass however the bar actually renders.
+        assert!(el.contains("\"{proposal}\""), "{el}");
+        for needle in [["let (", "typed, proposal) = if gate {"].concat(), ["value: \"{", "typed}\""].concat()] {
+            assert!(src.contains(&needle), "the gate no longer owns what #ai-input shows: {needle}");
+        }
+    }
+
+    /// The cap mirrors a const in the other crate (ui is outside that workspace, so nothing
+    /// links them). Same trick as complete.rs's `surfaces_agree_with_the_backend`.
+    #[test]
+    fn the_cap_agrees_with_the_backend() {
+        const MCP: &str = include_str!("../../src-tauri/src/mcp_server.rs");
+        let decl = MCP
+            .split_once("const MAX_COMMAND_CHARS: usize = ")
+            .expect("MAX_COMMAND_CHARS is gone from mcp_server.rs")
+            .1;
+        let n: usize = decl.split(';').next().unwrap().trim().parse().unwrap();
+        assert_eq!(n, MAX_COMMAND_CHARS, "the block's cap and the server's have drifted");
     }
 }

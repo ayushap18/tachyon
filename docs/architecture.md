@@ -197,37 +197,83 @@ returns tools plus per-server errors. `tool_result_text` turns an `isError` resu
 ## Tachyon as an MCP server
 
 `src-tauri/src/mcp_server.rs`. The reverse of the section above: external agents (Claude
-Code, any MCP client) use the live terminal, through the same approval gate as ⌘J. Off by
-default; `/mcp serve on [port] | off | status` is the only switch, and `run_slash` peels it
-off before `run_slash_inner` because starting a listener needs the `AppHandle`. If left on,
+Code, Codex, Cursor, any MCP client) use the live terminal, through the same approval gate as
+⌘J. Off by default; `/mcp serve on [port] | off | status` switches the listener and
+`/mcp agent add|list|show|revoke` owns the roster, and `run_slash` peels `/mcp serve` off
+before `run_slash_inner` because starting a listener needs the `AppHandle`. If left on,
 `autostart` brings it back at launch. Threat model: [danger-gate.md](danger-gate.md#threat-model-tachyon-as-an-mcp-server).
 
 ```
-client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ thread ─▶ handle_rpc ─▶ Backend
-                                              403 / 401, body never read                              │
-        run_command ─▶ parse_run_args ─▶ run_gated: agent_claim ─▶ agent_propose ─▶ ⏎ ─▶ pty_write_internal ─▶ wait_block
-        read_journal, get_context ─▶ read-only, no approval                       esc ─▶ isError "denied"
+client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ Caller {name, scopes} ─▶ handle_rpc ─▶ Backend
+                                              403 / 401, body never read
+  run_command ─▶ parse_run_args ─▶ proposals::budget ─▶ open_gate: agent_claim ─▶ PROPOSALS record ─▶ "proposal_id p_7"
+                                                                                        │             within wait_ms ≤ 25 s
+  worker ◀──────────────────────────────────────────────────────────────────────────────┘
+     └─▶ agent_propose ─▶ ⌘⏎ ─▶ pty_write_internal ─▶ wait_block ─▶ settle(record) ─▶ the slot is released
+                          esc ─▶ settle(denied)
+  await_decision ─▶ the record: pending · the result · isError "denied"   (never the terminal)
+  read_journal (scope `journal`), get_context (scope `read`) ─▶ read-only, no approval
 ```
 
+- **Identity is the bearer token, and nothing else.** Each registered agent has its own
+  64-hex token and its own scopes; `admit` folds over the whole roster and hands down a
+  `Caller {name, scopes}`. No tool takes a `from`/`as`/`agent_id` argument, so a client has
+  nowhere to assert an identity, and the name the token bought is what the approval bar shows.
+  `SCOPES` are `read | journal | propose | message`; a new agent gets `read, propose, message`,
+  so `read_journal` is off unless the user grants `journal`. `TOOL_SCOPES` is the one
+  authorization table, asked by `tools/list` and again by `tools/call` — an out-of-scope tool
+  is answered exactly like one that does not exist.
 - **Transport.** Streamable HTTP with plain JSON responses, no SSE (`GET` is 405), no
   sessions. `tiny_http` — blocking and thread-based, so it needs no runtime and never touches
   the Tauri main thread or the PTY reader: one accept thread (`serve`), one short-lived
-  thread per admitted request, because a `run_command` blocks for as long as the human takes.
+  thread per admitted request, plus one worker per approved proposal, because the run outlives
+  the request that opened it.
 - **`handle_rpc`** is pure: `initialize` (echoes a supported `protocolVersion`, else answers
-  with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, unknown
-  tool or bad arguments → `-32602`, a message without an `id` → `None`, which the HTTP layer
-  answers `202` with no body. The terminal sits behind the `Backend` trait — `Live(AppHandle)`
-  in the app, a stub in the tests — the module's one seam.
-- **`run_gated`** is the only road from a client to the PTY. It refuses if no shell is spawned,
-  takes the single approval slot with `agent_claim` (shared with `agent_start`; busy → fails
-  fast, never queues), holds an `AgentRunGuard`, proposes with `"external": true` (the bar
-  reads `external agent · run? …`), and re-shows any approval that arrives inside `MIN_REVIEW`.
-  After the write it waits in `wait_block` — `agent_loop`'s correlation (match on command
-  text, resync on `Lagged`, `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with
-  `agent-done` so the bar closes.
-- **Config** is `mcp-server.json`: `{enabled, port, token}`, default port 47600. The token is
-  32 bytes from `/dev/urandom`, minted on first enable and kept after that. To rotate it:
-  `/mcp serve off`, delete the file, `/mcp serve on`.
+  with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, a tool this
+  caller cannot name → `-32602`, a bad *argument* → an `isError` result the model can read and
+  correct, a message without an `id` → `None`, which the HTTP layer answers `202` with no body.
+  The terminal sits behind the `Backend` trait — `Live(AppHandle)` in the app, a stub in the
+  tests — the module's one seam.
+- **No client's HTTP call waits on a human.** `run_command` returns within its `wait_ms` with
+  either the finished result or `proposal_id p_…`, and `await_decision` polls that id: the
+  verdict lives in the record, so it is idempotent, collectable long after the call that asked
+  for it returned, and refused for any id that is not this caller's — an id belonging to
+  another agent answers exactly like one that never existed. `PROPOSALS` is a 64-record ring;
+  an evicted id is an unknown id.
+- **`open_gate` + `run_gated`** are the only road from a client to the PTY. `open_gate` runs on
+  the request's own thread — it refuses if no shell is spawned, takes the single approval slot
+  with `agent_claim` (shared with `agent_start`; busy → fails fast, never queues), and hands
+  the `AgentRunGuard` straight to the proposal record, which owns the slot until it settles.
+  `run_gated` then runs on the worker: it proposes with `"external": true` and the agent's
+  name (the bar reads `codex · run? ⌘⏎ approve · esc deny`), waits in `wait_block` after the
+  write — `agent_loop`'s correlation (match on command text, resync on `Lagged`,
+  `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with `agent-done` so the bar
+  closes, then settles the record, which is what releases the slot.
+- **Budgets, before the bar (`proposals::budget`).** Checked in `call_tool`, above the
+  `Backend`, so a refusal never reaches a terminal and never emits `agent-propose`: 30 s of
+  quiet for everyone after any denial (with `retry_after_ms`, and the denied agent told not to
+  re-send), one live proposal per agent, four across the hub.
+- **Client timeouts.** `MAX_WAIT_MS` is **25 s**, clamped server-side — every tool call must
+  come back well inside the tightest client default below. Each of these is
+  **UNVERIFIED**: they come from vendor docs and community reports, not from a measurement
+  against Tachyon, and are replaced when a real client of each is measured.
+  `every_client_handshake_returns_inside_its_own_timeout` replays the handshakes.
+
+  | Client | Tool-call timeout | Where it is set |
+  |---|---|---|
+  | Claude Code | ~5 min idle (HTTP) — UNVERIFIED | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, per-server `timeout` in `.mcp.json` |
+  | Codex CLI | 60 s — UNVERIFIED | `tool_timeout_sec` in `~/.codex/config.toml` |
+  | Cursor | ~60 s, hardcoded — UNVERIFIED | not settable |
+  | Gemini CLI | 600 000 ms — UNVERIFIED | `timeout` in `~/.gemini/settings.json` |
+  | Cline | 60 s — UNVERIFIED | per-server `timeout` (seconds) in the MCP UI |
+
+- **Config** is `mcp-server.json`: `{enabled, port, agents: [{name, token, scopes, worktree}]}`,
+  default port 47600. Each token is 32 bytes from `/dev/urandom`, minted by `/mcp agent add`
+  and kept after that; `/mcp agent show <name>` is the only thing that prints one, and only
+  while the listener is up. To rotate one: `/mcp agent revoke <name>`, then add it again. A
+  0.2.9 file's single `token` is migrated by `migrate` (pure, idempotent, on the read path
+  only) into an agent named `default` with every scope, byte-identical, so the client already
+  configured with it keeps working.
 
 ## Self-update (`update.rs`)
 
@@ -268,7 +314,7 @@ and only when the signing secrets are set. Threat model: [danger-gate.md](danger
 | `providers.json` | provider list, active id, hidden built-ins, per-task `routes`, **plaintext API keys** (env-var keys are never written) | `/key`, `/use`, `/model`, `/local`, `/url`, `/remove`, `/route` |
 | `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
-| `mcp-server.json` | MCP server mode: enabled, port, **plaintext bearer token** | `/mcp serve on`, `/mcp serve off` |
+| `mcp-server.json` | MCP server mode: enabled, port, `agents` — per-agent name, scopes, worktree and **plaintext bearer token** | `/mcp serve on`, `/mcp serve off`, `/mcp agent add`, `/mcp agent revoke` |
 | `settings.json` | `{theme, opacity}` — read only by `run()`, to colour the window before the webview boots | `term_set_theme`, on every settings change |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
