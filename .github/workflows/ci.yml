@@ -13,6 +13,8 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # A hung test (a connection nobody answers) must fail the job, not sit on the 6 h default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

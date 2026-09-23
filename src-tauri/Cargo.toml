@@ -40,3 +40,8 @@ arboard = "3"
 # hyper (already in the tree via reqwest) because that needs the server feature plus
 # hyper-util and an async accept loop; this is 4 tiny transitive crates, no TLS, no runtime.
 tiny_http = "0.12"
+
+# tiny_http's thread pool strands connections under a burst (see vendor/tiny_http/Cargo.toml);
+# the vendored copy is the release plus that one fix.
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }

@@ -237,7 +237,12 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   sessions. `tiny_http` — blocking and thread-based, so it needs no runtime and never touches
   the Tauri main thread or the PTY reader: one accept thread (`serve`), one short-lived
   thread per admitted request, plus one worker per approved proposal, because the run outlives
-  the request that opened it.
+  the request that opened it. The crate is vendored at `src-tauri/vendor/tiny_http` for one
+  fix: upstream's connection pool queues a burst of new connections onto workers that are still
+  waking, and every connection past the first per worker sits unread until some unrelated
+  connection closes (17 opened at once on Linux left as few as 4 visible). Three clients
+  handshaking together is that burst. `a_burst_of_connections_all_reach_the_accept_loop` pins
+  the fix; everything else in the vendored copy is the crates.io release.
 - **`handle_rpc`** is pure: `initialize` (echoes a supported `protocolVersion`, else answers
   with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, a tool this
   caller cannot name → `-32602`, a bad *argument* → an `isError` result the model can read and
