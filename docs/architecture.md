@@ -212,7 +212,10 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
      └─▶ agent_propose ─▶ ⌘⏎ ─▶ pty_write_internal ─▶ wait_block ─▶ settle(record) ─▶ the slot is released
                           esc ─▶ settle(denied)
   await_decision ─▶ the record: pending · the result · isError "denied"   (never the terminal)
-  read_journal (scope `journal`), get_context (scope `read`) ─▶ read-only, no approval
+  read_journal (scope `journal`), get_context (scope `read`) ─▶ read-only, no approval ─▶ redact
+  post_message · read_messages · list_agents (scope `message`) ─▶ BOARD (memory only) · every success carries `unread`
+                     └─▶ redact (on the way out; the BOARD keeps what was posted)
+  create_task · claim_task · update_task · list_tasks (scope `message`) ─▶ tasks.json, written before the reply ─▶ a `system` line on the BOARD
 ```
 
 - **Identity is the bearer token, and nothing else.** Each registered agent has its own
@@ -223,6 +226,13 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   so `read_journal` is off unless the user grants `journal`. `TOOL_SCOPES` is the one
   authorization table, asked by `tools/list` and again by `tools/call` — an out-of-scope tool
   is answered exactly like one that does not exist.
+- **Redaction is on the agent's side only.** `redact` (`lib.rs`) replaces known credential
+  shapes with `[redacted:<kind>]` in what `read_journal`, `get_context`, `run_command`'s
+  result, `read_messages` and the task tools return, and in the task titles `hub_state`
+  carries over IPC; task text may not hold a 64-hex run, a token's shape, at all. `term_write`, the stored `Block`, ⌘B and the approval bar never pass through it, so
+  the human sees their terminal's real bytes; `redact_is_called_only_on_the_agent_read_paths`
+  pins every call site. `evals/redaction-corpus.json` is the spec, run by both the Rust test
+  and `npm run eval:redact` (a JS port, also run in CI), so the two cannot drift.
 - **Transport.** Streamable HTTP with plain JSON responses, no SSE (`GET` is 405), no
   sessions. `tiny_http` — blocking and thread-based, so it needs no runtime and never touches
   the Tauri main thread or the PTY reader: one accept thread (`serve`), one short-lived
@@ -267,6 +277,18 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   | Gemini CLI | 600 000 ms — UNVERIFIED | `timeout` in `~/.gemini/settings.json` |
   | Cline | 60 s — UNVERIFIED | per-server `timeout` (seconds) in the MCP UI |
 
+- **Rate limits** (`rate_check`, memory only, per agent per class, token buckets):
+  `post_message` 60 at once refilled at 1/s (60/min); `create_task`/`claim_task`/`update_task`
+  30 refilled at 1 per 2 s (30/min); `read_messages`/`list_tasks`/`list_agents` share one
+  bucket of 4 refilled at 2/s (20 per 10 s). Checked in `call_tool` after scope, before the
+  arguments; a refusal is an `isError` result carrying `retry_after_ms`, never a protocol
+  error. `run_command` is paced by SEC-7 instead, and the M1 read tools are not metered.
+- **Handler threads.** At most `max(16, 4 × agents)` alive at once (`handler_cap`), and no one
+  agent past its share, `cap / agents`. Past either, the accept loop answers an admitted
+  request `503` without a handler, so a client that opens connections and never finishes a body
+  can pin neither threads without limit nor another agent's share. A refused request whose body
+  tiny_http would drain on drop (over 1024 bytes, or `Expect: 100-continue`) is dropped on a
+  thread of its own (`refuse`), so a half-sent body, even a stranger's, never stalls the loop.
 - **Config** is `mcp-server.json`: `{enabled, port, agents: [{name, token, scopes, worktree}]}`,
   default port 47600. Each token is 32 bytes from `/dev/urandom`, minted by `/mcp agent add`
   and kept after that; `/mcp agent show <name>` is the only thing that prints one, and only
@@ -315,6 +337,7 @@ and only when the signing secrets are set. Threat model: [danger-gate.md](danger
 | `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 | `mcp-server.json` | MCP server mode: enabled, port, `agents` — per-agent name, scopes, worktree and **plaintext bearer token** | `/mcp serve on`, `/mcp serve off`, `/mcp agent add`, `/mcp agent revoke` |
+| `tasks.json` | the task board: `{version: 1, tasks: [{id, title, detail, creator, assignee, state, holder, claims, note, proposals}]}` — no secrets, and messages are never written here | the board tools (`create_task`, `claim_task`, `update_task`), before each ack |
 | `settings.json` | `{theme, opacity}` — read only by `run()`, to colour the window before the webview boots | `term_set_theme`, on every settings change |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
@@ -323,6 +346,12 @@ the next write. All writes go through `write_config`: temp file in the same dire
 `chmod 0600`, then `rename`, so a reader sees the old file or the new one. Appearance and
 font settings live in the webview's `localStorage`, which stays authoritative; only the
 `{theme, opacity}` mirror below is on disk.
+
+`tasks.json` is version 1 and frozen: an unknown `version` is an `Err` like any other
+unreadable config, and on load every `claimed` task is re-opened with its `claims` count
+untouched — the process that held it is gone, but a crash must not burn one of the three
+times a task is handed out. A file that will not load is never replaced: the task tools
+refuse with the reason until it is fixed, and the message board carries on.
 
 Keybindings: the backend's `keybindings` command is `read_config` on `keybindings.json` and
 returns the raw `{id: chord}` map — it validates nothing. `ui/src/keymap.rs` owns both

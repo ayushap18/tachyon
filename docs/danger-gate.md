@@ -200,16 +200,31 @@ refusal never reveals what else is there. A process that holds a token can:
 - call `get_context` with **no approval** (scope `read`, granted by default): the `cwd`, the
   git `branch` and `dirty` count, and the shell's pid (`shell_pid`) and name (`shell`).
 - call `read_journal` with **no approval** *if* the agent was granted the `journal` scope —
-  the last 50 commands and up to 4000 characters of each one's output. It is **not** in the
-  default grant, because it is the feature's largest unguarded surface: if you `cat .env`
-  with the server on, an agent holding `journal` can read it. The `default` agent migrated
-  from a 0.2.9 single token keeps it, because that token already had it.
+  the last 50 commands and up to 4000 characters of each one's output, with known credential
+  shapes replaced by `[redacted:<kind>]`. It is **not** in the default grant, because it is
+  the feature's largest unguarded surface: if you `cat .env` with the server on, an agent
+  holding `journal` reads every line redaction does not recognise (item 8 below says which).
+  The `default` agent migrated from a 0.2.9 single token keeps it, because that token already
+  had it.
 - **propose** commands (scope `propose`, granted by default). It cannot run them.
   `run_command` reaches the PTY only through `open_gate` → `run_gated` → `agent_propose` → a
   human ⌘⏎; there is no allowlist, no trusted-client mode, no auto-approve, and no timeout
   that approves. A process running as you could already run commands as you — what it gains
   here is the chance to do so with your approval, in your live shell, which matters for a
   sandboxed or remote-driven client.
+- use the **message board** (scope `message`, granted by default): `post_message`,
+  `read_messages` and `list_agents`. A message is attributed to the name the token bought —
+  no tool takes a `from`, and one sent anyway is ignored — and every string passes the
+  validator `run_command` uses (`parse_text_arg`: no control or bidi characters, not empty,
+  capped), minus the newline folding only a command gets. `list_agents` returns names, scopes and
+  last-seen, never a token or whether one exists. The task board (`create_task`,
+  `claim_task`, `update_task`, `list_tasks`) is the same scope on the same terms: the creator and
+  holder are token names, `update_task` takes no `assignee`, a task the caller may not touch
+  answers exactly like an unknown id, and every change is announced on the message board as
+  `system`, a reserved name. `run_command`'s optional `task_id` spends one of that task's 20
+  proposals; the 21st, or a task the caller does not hold, is refused in SEC-7's check with the
+  same words, before anything reaches the bar. Board text is one agent's claim landing in
+  another's context; it reaches the shell only through the same human keypress as anything else.
 
 Revoking one agent (`/mcp agent revoke <name>`) takes effect on that agent's next request and
 touches nobody else's. It also drops that name's settled proposals, so re-adding the name
@@ -299,7 +314,15 @@ answers it as they would any other.
 7. Strip escape sequences before `term_write`, and delimit tool output in the transcript as data.
 8. For server mode: ~~scope tokens per client, with a read-only scope; gate `read_journal`~~ —
    done: one token per agent, `TOOL_SCOPES` enforced in Rust, and `journal` off by default.
-   ~~rate-limit proposals after a denial~~ — done: `DENY_COOLDOWN`. The residual is redacting
-   `read_journal`'s output for an agent that does hold the scope.
+   ~~rate-limit proposals after a denial~~ — done: `DENY_COOLDOWN`. ~~Redact `read_journal`'s
+   output for an agent that does hold the scope~~ — done: `redact` (`lib.rs`) on `read_journal`,
+   `get_context`, `run_command`'s result, board messages and task text, and nowhere on the
+   human's side; task text may not hold a 64-hex run (a token's shape) at all. The residual is
+   that it knows shapes, not secrets: a key with no known prefix and no `password=`-style name
+   in front of it (a bare AWS secret key, a `password: x` YAML line, a JSON `"token": "…"`)
+   goes through; so does a key that lost its prefix (folded across lines, cut by the 8 KiB
+   output cap, split by shell quoting), and the base64 lines of a private key whose BEGIN and
+   END lines both fell outside the kept output.
+   An entropy pass over long base64 runs, tuned on the corpus's negatives, is the next step.
 
 Bypass reports are welcome — see [SECURITY.md](../SECURITY.md).

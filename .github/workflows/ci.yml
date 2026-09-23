@@ -69,6 +69,9 @@ jobs:
         run: npm run eval:selftest
       - name: Danger-gate corpus (recall / false-positive rate)
         run: npm run eval:gate
+      # The JS half of the redaction mirror: lib.rs's corpus test is the Rust half.
+      - name: Redaction corpus (JS mirror of redact)
+        run: npm run eval:redact
       - name: Agent-loop eval self-test (scripted mock model)
         run: npm run eval:agent:selftest
       - name: Release artifact validation
