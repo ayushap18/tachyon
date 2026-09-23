@@ -4109,6 +4109,44 @@ mod tests {
         server.unblock();
     }
 
+    /// Pins the one-line fix in vendor/tiny_http/src/util/task_pool.rs. Upstream's pool
+    /// queues a burst of connections onto workers that are still waking, so each worker takes
+    /// one connection for its whole life and the rest never reach `incoming_requests` until
+    /// an unrelated connection closes — on Linux, 17 opened at once left as few as 4 visible.
+    /// A hub with three clients handshaking at once is exactly that burst.
+    /// MUTATION: restoring upstream's `== 0` in `TaskPool::spawn` fails this on Linux in
+    /// most runs (14/20 measured); macOS wakes threads fast enough to hide it, so the Ubuntu
+    /// leg of CI is the one that guards it.
+    #[test]
+    fn a_burst_of_connections_all_reach_the_accept_loop() {
+        for _ in 0..5 {
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+            let addr = server.server_addr().to_ip().unwrap();
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (s, c) = (server.clone(), seen.clone());
+            std::thread::spawn(move || {
+                for rq in s.incoming_requests() {
+                    c.fetch_add(1, SeqCst);
+                    std::mem::forget(rq); // parked, like a body that never arrives
+                }
+            });
+            let held: Vec<std::net::TcpStream> = (0..17)
+                .map(|_| {
+                    let mut s = std::net::TcpStream::connect(addr).unwrap();
+                    write!(s, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 4096\r\n\r\n").unwrap();
+                    s
+                })
+                .collect();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while seen.load(SeqCst) < 17 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(seen.load(SeqCst), 17, "tiny_http stranded connections in its pool");
+            drop(held);
+            server.unblock();
+        }
+    }
+
     /// C9 per agent: the cap is shared, so one bearer parking every thread it can get would
     /// starve the rest. Each agent gets its share (`cap / agents`), and the shares sum to at
     /// most the cap, so the other agent is still served. The refusals themselves must not
