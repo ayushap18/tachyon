@@ -287,10 +287,13 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /mcp remove <name>                 remove an MCP server
 /mcp list                          servers, transport, full command line, and their tools
 /mcp serve on|off|status           let external agents use this terminal (on <port> to pick one)
-/mcp agent add <name> [scopes]     register one agent: its own token and scopes
+/mcp agent add <name> [--scopes a,b] [--worktree /abs/path]  register one agent: its own token, scopes and worktree
 /mcp agent list                    registered agents, their scopes and last seen — never a token
 /mcp agent show <name>             that agent's client config, with its token
 /mcp agent revoke <name>           revoke one agent, from its next request
+/mcp agent worktree <name> <path|off>  run that agent's commands inside <path>, shown in full; off stops
+/mcp turn                          which agent holds the shell: its state, since when, who waits
+/mcp turn release                  end that agent's turn (refused while its command runs)
 /update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
 /crash                             last panics, from the local crash.log (never uploaded)
 /help                              this list
@@ -362,6 +365,7 @@ command, and a call whose name or arguments look destructive is flagged like `rm
 /mcp serve on            # binds 127.0.0.1 only (on <port> to choose)
 /mcp agent add codex     # one agent, one token, its own scopes — prints its client config
 /mcp serve status        # the URL and who may connect; never a token
+/mcp turn                # which agent holds the shell, and who is queued behind it
 /mcp agent revoke codex  # refused from its next request
 /mcp serve off
 ```

@@ -13,7 +13,9 @@ Function names refer to `src-tauri/src/lib.rs` unless noted. The
    and every MCP tool result to the transcript for the next model call. Anything that can put
    text there — a file the agent `cat`s, a page behind `curl`, a hostile MCP server — can
    instruct the model. The journal is forgeable too: OSC 133 marks are read off the raw PTY
-   stream, so a program can print a fake `D;0` and misreport its exit code.
+   stream, so a program can print a fake `D;0` and misreport its exit code. It cannot hand the
+   shell on with one: an external agent's turn ends on its Block only once the shell holds the
+   terminal's foreground again (`wait_end`), so a program still reading stdin keeps it.
 
 So **model output is untrusted input**. A rule written in the prompt ("always ask first") is
 enforced by the component under attack. The rule that matters — nothing reaches the shell
@@ -240,11 +242,9 @@ answers it as they would any other.
   would show one command and run two. The validated string is the one proposed and the one
   written; `is_dangerous` runs on it. Commands over 4096 characters are refused.
 - *One driver at a time.* `agent_claim` (`lib.rs`) is the single way to take
-  `AgentState.running`, used by `agent_start` and `run_gated` alike. While the built-in agent
-  runs or another `run_command` is pending, a new one fails immediately with `isError` — it
-  never queues and never overwrites the parked sender. `AgentRunGuard` is constructed only
-  after the claim is won, so the busy path cannot release someone else's claim, and every
-  exit including a panic frees ⌘J.
+  `AgentState.running`, used by `agent_start` and, through the turn lock below, by `open_gate`.
+  `AgentRunGuard` is constructed only after the claim is won, so the busy path cannot release
+  someone else's claim, and every exit including a panic frees ⌘J.
 - *The requester is named.* The proposal carries `external: true` and the agent name its
   **token** bought — never anything the client said about itself — so the bar reads
   `codex · run? ⌘⏎ approve · esc deny` (`Ctrl+⏎` off macOS). An external proposal that
@@ -273,6 +273,45 @@ answers it as they would any other.
   whole view of the hub — carries no token and no command text. Nothing in the module logs,
   and no response or error echoes request headers.
 
+**Turns: who holds the shell** (`coord::TurnLock`, applied in `mcp_server.rs`):
+
+- *The turn lock is what keeps one approval slot sound.* There is one parked sender
+  (`AgentState.decision`) and one PTY, so two agents proposing at once would overwrite each
+  other's sender or type into each other's command. The lock grants the shell to one agent at
+  a time and queues the rest in order, at most 8; the next is refused `queue_full`. A grant
+  takes the approval slot with `agent_claim`, and its guard is kept in `TURN_GUARD` beside the
+  lock, not in any request's stack frame. `apply` is the one function that takes or drops it,
+  so there is a holder exactly when the slot is claimed. A busy `run_command` waits in the
+  queue for up to its `wait_ms`, then answers with its `position`, the `holder` and the
+  `holder_state`. A refusal never raises a bar.
+- *Attribution is from the token.* The holder, the queue and the name on the bar are the
+  names `admit` resolved from the bearer. No tool takes a `from`, `as`, `agent_id` or
+  `worktree`, and `release_turn` from anyone but the holder answers exactly as it does when
+  nobody holds the turn ("you do not hold the turn"), so it cannot be used to learn who has
+  the shell.
+- *A lease measures silence, not approval.* An `Idle` holder silent for 60 s, or idle for
+  10 min in total, loses the turn to the next waiter. The clock stops while a proposal is on
+  the bar, while its command runs, and in `Unknown`. There is no approval timeout, so a
+  never-answering human holds the shell: waiters see `awaiting_human` for as long as the bar
+  stays up. Esc on the bar, or `/mcp turn release`, ends it as a denial.
+- *`Unknown` never hands the shell on.* When `wait_end` gives up before the command's exit
+  marker, the command may still own the shell's foreground. The turn stays with its holder as
+  `command_still_running`, no lease runs, and the holder's own next `run_command` is refused;
+  a subscriber keeps waiting for the Block with no deadline. Only that Block, the holder's
+  `release_turn` or the human's `/mcp turn release` ends it, and both releases say the last
+  command may still be running: the next holder may type into it. That is a deliberate act,
+  never a timer's. `/mcp turn release` is refused outright while the command is `running`.
+- *⌘J preempts an idle holder only.* The first line of `agent_start` is `preempt_if_idle`: an
+  `Idle` remote holder loses the turn so the built-in agent can claim the slot. In any other
+  state ⌘J fails fast as it always has, so a proposal on the bar or a command in flight is
+  never taken over. The preempted agent's next `request_turn` or `run_command` answers
+  `preempted`, once, so a multi-command sequence learns it was interrupted. Grants that land
+  while ⌘J holds the slot go back to the head of the queue: the order survives ⌘J.
+- *The board is an injection channel; the keypress is the gate.* A message or a task is one
+  agent's text landing in another agent's context, and it can instruct that agent as well as
+  any file the agent reads. Nothing on the board reaches the shell except as a proposal a
+  human approves on the bar, so the board changes what agents propose, never what runs.
+
 **Limitations specific to server mode:**
 
 - **It is still human-in-the-loop, not a sandbox.** Everything under [Limitations](#limitations)
@@ -288,8 +327,20 @@ answers it as they would any other.
   still stays in the bar until you decide. Approve it and the command runs with nobody
   reading the result.
 - **The 20-second wait does not kill the command.** The proposal then settles as
-  `Exit code: unknown` and releases the slot, and the next approved command is written into
-  whatever is still running in the foreground.
+  `Exit code: unknown` and the turn is held `Unknown` until the command's Block arrives. A
+  human who releases it first lets the next approved command be written into whatever is
+  still running in the foreground.
+- **A worktree is a cwd convention, not a jail.** An agent registered with `--worktree <path>`
+  (or given one by `/mcp agent worktree <name> <path|off>`) has every `run_command` rewritten by
+  `wrap_for_worktree` to `( cd <path> && <command> )` BEFORE `parse_run_args`, so the bar shows,
+  `is_dangerous` checks, the PTY runs and `wait_block` matches that one string. The path comes
+  from the registry, never from the call — no tool takes a `worktree`, and one sent is ignored —
+  and `parse_worktree` admits only an absolute path of letters, digits and `/ . _ - + @ % = , :`,
+  so the path cannot carry a second command. The command can: `cd ..`, an absolute path, or a
+  `)` that closes the subshell early all reach outside the worktree, in plain sight on the bar.
+  A trailing `#` comment swallows the closing `)`, so the shell waits at a continuation prompt
+  and the turn is held `Unknown` like any command that outlives its wait. Tachyon never creates
+  the worktree; the human does, with an approved `git worktree add`.
 - **Plain HTTP on loopback.** A process that can sniff `lo0` sees a token; one that can do
   that can usually read the file anyway.
 - **`run_gated` has no behavioural test.** It needs an `AppHandle`. Its parts are tested

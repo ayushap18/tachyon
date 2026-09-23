@@ -34,7 +34,6 @@ const OUTPUT_CHARS: usize = 4000;
 // Everything `2025-11-25` adds is capability-negotiated, so declaring it costs nothing and a
 // client that asks for it no longer gets an older version back with permission to hang up.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const BUSY: &str = "terminal busy: the built-in agent is running or another run_command is awaiting approval \u{2014} retry when it finishes";
 const DENIED: &str = "the user denied this command";
 /// The verdict for a proposal whose worker died before it reached one — `PropGuard`'s Drop.
 const INTERRUPTED: &str = "the command did not finish: the run was interrupted";
@@ -42,6 +41,15 @@ const INTERRUPTED: &str = "the command did not finish: the run was interrupted";
 /// 60 s, Cursor and Cline at about the same: the server answers first — with a proposal id if
 /// the user has not decided — so a slow human never looks like a dead server.
 const MAX_WAIT_MS: u64 = 25_000;
+/// How often a caller queued for the turn looks again. A grant is made by whoever frees the
+/// turn, on their thread, so a waiter only has to notice it.
+// ponytail: a poll, not a Condvar. A wakeup on every lock op would have every waiter re-request
+// at once while ⌘J holds the slot (each grant is taken straight back), which spins; 20 Hz per
+// waiter, bounded by `coord::QUEUE_MAX`, does not.
+const TURN_POLL: Duration = Duration::from_millis(50);
+/// What a queued caller is told to wait before asking again. Well inside `coord::WAITER_SILENCE`,
+/// so a client that follows it never loses its place.
+const RETRY_AFTER_MS: u64 = 1000;
 
 // ---- proposal budgets (SEC-7) ----
 //
@@ -75,11 +83,14 @@ const DEFAULT_SCOPES: [&str; 3] = [SCOPE_READ, SCOPE_PROPOSE, SCOPE_MESSAGE];
 
 /// THE authorization table. A tool absent here is unreachable by anyone, so adding a tool
 /// and forgetting its scope fails closed instead of shipping it world-readable.
-const TOOL_SCOPES: [(&str, &str); 11] = [
+const TOOL_SCOPES: [(&str, &str); 13] = [
     ("run_command", SCOPE_PROPOSE),
     // The other half of one proposal: collecting a verdict is the same authority as asking
     // for one, and an agent that cannot propose has nothing to collect.
     ("await_decision", SCOPE_PROPOSE),
+    // The turn is what run_command takes anyway; holding it across commands is no more.
+    ("request_turn", SCOPE_PROPOSE),
+    ("release_turn", SCOPE_PROPOSE),
     ("read_journal", SCOPE_JOURNAL),
     ("get_context", SCOPE_READ),
     // The board is one capability: an agent that can read what the others wrote can write
@@ -101,6 +112,8 @@ const TOOL_SCOPES: [(&str, &str); 11] = [
 pub(crate) struct Caller {
     pub(crate) name: String,
     scopes: Vec<String>,
+    /// From the registry entry the token bought, like the name: no tool takes a `worktree`.
+    worktree: Option<String>,
 }
 
 impl Caller {
@@ -131,6 +144,7 @@ struct AgentToken {
     /// future version writes must survive a downgrade, and an unrecognised one grants
     /// nothing because it matches no `TOOL_SCOPES` entry.
     scopes: Vec<String>,
+    /// Where this agent's commands run: `parse_worktree`-valid, set only from a slash command.
     worktree: Option<String>,
 }
 
@@ -259,12 +273,275 @@ fn admit<'a>(hosts: &[&str], origins: &[&str], auth: Option<&str>, agents: &'a [
     resolve_bearer(auth, agents).ok_or(401)
 }
 
+// ---- the turn ----
+//
+// One shell, one holder. `coord::TurnLock` decides who holds it; this pair is where that
+// decision becomes the approval slot. The guard lives HERE, beside the lock, and not in the
+// proposal record or any stack frame, so there is one answer to "who holds the shell" and it
+// cannot disagree with `AgentState.running` (R11). SIGN-OFF #1's pattern a second time: a
+// claim owned by a record that outlives the call, not by the frame that won it.
+
+static TURN: std::sync::LazyLock<Mutex<coord::TurnLock>> = std::sync::LazyLock::new(Mutex::default);
+/// The approval slot's guard for the ticket that holds the turn. Erased like the proposal
+/// record's used to be: the real one is an `AgentRunGuard`, which needs an `AppHandle` no unit
+/// test can build, and a guard whose release nothing can observe is a guard nothing tests.
+static TURN_GUARD: Mutex<Option<(coord::Ticket, Box<dyn Send>)>> = Mutex::new(None);
+
+/// How a grant takes the approval slot: `agent_claim`, then the guard that gives it back.
+/// `None` = someone outside the lock holds it — ⌘J.
+type Claim = Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync>;
+
+fn turn() -> std::sync::MutexGuard<'static, coord::TurnLock> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// THE one place the approval slot's guard is taken or dropped. It takes the lock itself,
+/// held, rather than just the events: the operation and its guard change are one critical
+/// section, so a revoke can never be applied ahead of the grant it follows.
+/// Lock order, everywhere: TURN, then the guard's slot, then `AgentState`'s own.
+fn apply(lock: &mut coord::TurnLock, events: Vec<coord::Event>, claim: &Claim) {
+    let mut events = VecDeque::from(events);
+    while let Some(event) = events.pop_front() {
+        match event {
+            coord::Event::Granted { ticket, .. } => {
+                // Dropped BEFORE claiming, never after: a stale guard's Drop clears `running`,
+                // and doing that after the claim would free the slot out from under the grant.
+                drop(TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner()).take());
+                match claim() {
+                    Some(guard) => *TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some((ticket, guard)),
+                    // ⌘J holds the slot. A holder with no guard is the one state R11 forbids,
+                    // so the grant is handed back — to the head of the queue, where it still is
+                    // next once ⌘J lets go (FIFO survives ⌘J).
+                    None => lock.requeue_holder(ticket),
+                }
+            }
+            coord::Event::Revoked { ticket, .. } => {
+                let mut slot = TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(held, _)| *held == ticket) {
+                    drop(slot.take());
+                }
+            }
+            // A waiter holds no guard.
+            coord::Event::Pruned { .. } => {}
+        }
+    }
+}
+
+/// The production claimer: `agent_claim` on the app's one slot, then the guard that gives it
+/// back. The guard is built only AFTER the claim is won — on the busy path there is nothing to
+/// release, and a guard there would clear the flag out from under whoever does hold it.
+fn live_claim(app: &AppHandle) -> Claim {
+    let app = app.clone();
+    Arc::new(move || {
+        agent_claim(&app.state::<AgentState>()).ok()?;
+        Some(Box::new(AgentRunGuard(app.clone())) as Box<dyn Send>)
+    })
+}
+
+/// A turn as a proposal runs under it. `keep`: the turn was asked for with `request_turn`
+/// (`coord::Turn::kept`), so the command ending hands it back `Idle` instead of releasing it.
+/// A turn `run_command` took for itself is released when its command ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Held {
+    ticket: coord::Ticket,
+    keep: bool,
+}
+
+/// A holder's state as it reads on the wire. `Unknown` is named for what it means to a waiter:
+/// the shell's foreground may still belong to the holder's last command.
+fn state_name(state: coord::HolderState) -> &'static str {
+    match state {
+        coord::HolderState::Idle => "idle",
+        coord::HolderState::AwaitingHuman => "awaiting_human",
+        coord::HolderState::Running => "running",
+        coord::HolderState::Unknown => "command_still_running",
+    }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What a caller the lock could not grant is told: where it stands and who is ahead. No holder
+/// at all means ⌘J has the slot, the one claimant outside the lock. `eta_ms` is when an idle
+/// holder's lease runs out; in any other state nobody knows, `command_still_running` above all.
+/// `error`: `busy` (queued), `queue_full` or `preempted` (neither queued).
+fn busy(lock: &coord::TurnLock, agent: &str, now: std::time::Instant, error: &str) -> String {
+    let holder = lock.holder();
+    json!({
+        "error": error,
+        "position": lock.waiters().position(|w| w.agent == agent).map(|i| i + 1),
+        "holder": holder.map(|h| &h.agent),
+        "holder_state": holder.map_or("builtin_agent", |h| state_name(h.state)),
+        "eta_ms": holder.and_then(|h| h.expires_in(now)).map(millis),
+        "retry_after_ms": RETRY_AFTER_MS,
+    })
+    .to_string()
+}
+
+/// Wait up to `wait` for `agent` to hold the turn, queued meanwhile. `Ok` is the turn and the
+/// state it was found in; with `propose`, an `Idle` turn goes to `AwaitingHuman` in the same
+/// critical section, before ⌘J's preempt or a lease can take it back. `Err` is the busy payload,
+/// and the caller STAYS QUEUED: asking again within `coord::WAITER_SILENCE` keeps its place.
+/// Every pass is a lock op, so every pass sweeps.
+fn wait_turn(agent: &str, claim: &Claim, wait: Duration, propose: bool) -> Result<(Held, coord::HolderState), String> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let now = std::time::Instant::now();
+        {
+            let mut lock = turn();
+            // `request_turn` is the one caller that does not propose, and the one asking to keep.
+            let (reply, events) = lock.request(agent, now, !propose);
+            apply(&mut lock, events, claim);
+            // Holding it is the only proof of a grant: one ⌘J beat was handed back.
+            if let Some((ticket, state, keep)) =
+                lock.holder().filter(|h| h.agent == agent).map(|h| (h.ticket, h.state, h.kept))
+            {
+                let held = Held { ticket, keep };
+                if propose && state == coord::HolderState::Idle {
+                    // Frozen before the lock is let go: a bar is about to go up, and an `Idle`
+                    // holder's lease would make the human's reading time an approval timeout.
+                    let events = lock.set_state(ticket, coord::HolderState::AwaitingHuman, now);
+                    apply(&mut lock, events, claim);
+                }
+                return Ok((held, state));
+            }
+            // Refusals, never queued, and never a bar (R14): the caller hears them first.
+            let refused = match reply {
+                coord::Request::QueueFull => Some("queue_full"),
+                coord::Request::Preempted => Some("preempted"),
+                _ => None,
+            };
+            if refused.is_some() || now >= deadline {
+                return Err(busy(&lock, agent, now, refused.unwrap_or("busy")));
+            }
+        }
+        std::thread::sleep(TURN_POLL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// `open_gate`'s claim, through the lock: queue for up to `wait`, then hold the turn with a bar
+/// about to go up. A holder with something already in flight is refused, not given a second
+/// bar: that would overwrite the first one's parked sender, or type a command into the stdin
+/// of one still running.
+fn take_turn(agent: &str, claim: &Claim, wait: Duration) -> Result<Held, String> {
+    let (held, state) = wait_turn(agent, claim, wait, true)?;
+    if state != coord::HolderState::Idle {
+        return Err(format!(
+            "you hold the turn and it is {}: wait for your last command to finish before sending another.",
+            state_name(state)
+        ));
+    }
+    // SEC-7 again, and this is the check that cannot be outrun: the one in `call_tool` may have
+    // been read BEFORE the Esc that freed this very turn. A denial stamps the cooldown before it
+    // ends the turn, so whoever wins the turn sees the stamp. Still above `agent_propose`, so a
+    // badgering re-send inside the cooldown raises no second bar.
+    if let Err(refused) = proposals::budget(agent) {
+        end_turn(held, claim);
+        return Err(refused);
+    }
+    Ok(held)
+}
+
+/// Move the turn `ticket` to `state`. False = it is not that turn any more: released or
+/// revoked under the proposal that asked.
+fn set_turn(ticket: coord::Ticket, state: coord::HolderState, claim: &Claim) -> bool {
+    let mut lock = turn();
+    let events = lock.set_state(ticket, state, std::time::Instant::now());
+    apply(&mut lock, events, claim);
+    lock.holder().is_some_and(|h| h.ticket == ticket && h.state == state)
+}
+
+/// The command run under `held` is over: the holder goes back to `Idle`, and gives the turn up
+/// unless it is kept. Keyed by ticket, so a late settle can never end a later turn of the same
+/// agent. A turn in `Unknown` is left exactly as it is: only its Block or a deliberate release
+/// ends it, because its command may still own the shell's foreground (R21).
+fn end_turn(held: Held, claim: &Claim) {
+    let now = std::time::Instant::now();
+    let mut lock = turn();
+    let Some(h) = lock.holder().filter(|h| h.ticket == held.ticket) else {
+        return;
+    };
+    if h.state == coord::HolderState::Unknown {
+        return;
+    }
+    let agent = h.agent.clone();
+    let mut events = lock.set_state(held.ticket, coord::HolderState::Idle, now);
+    if !held.keep {
+        events.extend(lock.release(&agent, now));
+    }
+    apply(&mut lock, events, claim);
+}
+
+/// Any authenticated message is a sign of life: it keeps a holder's lease and a waiter's place.
+/// And, like every lock op, it sweeps, so a lapsed lease is noticed whoever calls next.
+fn touch(agent: &str, claim: &Claim) {
+    let mut lock = turn();
+    let events = lock.touch(agent, std::time::Instant::now());
+    apply(&mut lock, events, claim);
+}
+
+/// `request_turn`: hold the turn across commands, until release_turn, the lease or a denial
+/// ends it. Idempotent — the holder and a queued caller get their own ticket back — so asking
+/// again is how a queued caller keeps its place.
+fn request_turn(agent: &str, args: &Value, claim: &Claim) -> Result<String, String> {
+    let (held, state) = wait_turn(agent, claim, parse_wait(args)?, false)?;
+    Ok(json!({ "ticket": held.ticket, "holder_state": state_name(state) }).to_string())
+}
+
+/// The answer for every caller that does not hold the turn, whoever else does: release_turn is
+/// not how an agent learns whether the shell is taken (R20).
+const NO_TURN: &str = "you do not hold the turn";
+
+/// `release_turn`: the holder gives the turn up; a queued caller gives up its place and is
+/// answered like any other non-holder. Refused while a proposal is on the bar — withdrawing it
+/// would read as the human's denial and quiet the bar for everyone — or its command is running,
+/// which owns the shell's foreground until its Block arrives.
+fn release_turn(agent: &str, claim: &Claim) -> Result<String, String> {
+    let now = std::time::Instant::now();
+    let mut lock = turn();
+    let state = lock.holder().filter(|h| h.agent == agent).map(|h| h.state);
+    if let Some(s @ (coord::HolderState::AwaitingHuman | coord::HolderState::Running)) = state {
+        return Err(format!("your command is {}: the turn is released when it ends.", state_name(s)));
+    }
+    let events = lock.release(agent, now);
+    apply(&mut lock, events, claim);
+    match state {
+        Some(coord::HolderState::Unknown) => Ok("released \u{2014} your last command may still be running.".into()),
+        Some(_) => Ok("released".into()),
+        None => Err(NO_TURN.into()),
+    }
+}
+
+/// `hub_state`'s view of the turn. Names and a state only: nothing a holder proposed.
+fn turn_json(now: std::time::Instant) -> Value {
+    let lock = turn();
+    let holder = lock.holder();
+    json!({
+        "holder": holder.map(|h| &h.agent),
+        "state": holder.map(|h| state_name(h.state)),
+        "since_ms": holder.map(|h| millis(now.saturating_duration_since(h.since))),
+        "queue": lock.waiters().map(|w| &w.agent).collect::<Vec<_>>(),
+        "expires_in_ms": holder.and_then(|h| h.expires_in(now)).map(millis),
+    })
+}
+
+/// ⌘J's hook, the first line of `agent_start`: an `Idle` remote holder loses the turn and its
+/// guard, so the `agent_claim` after it can win. Any other state is left alone and ⌘J fails
+/// fast exactly as before — a proposal on the bar or a command in flight is never taken over.
+pub(crate) fn preempt_if_idle() {
+    let mut lock = turn();
+    let events = lock.preempt_if_idle(std::time::Instant::now());
+    // The lock grants nothing on a preempt, so there is nothing to claim for.
+    apply(&mut lock, events, &(Arc::new(|| None) as Claim));
+}
+
 // ---- proposals ----
 //
-// One external agent's request to run one command. The record OWNS the `AgentRunGuard`, so
-// the single approval slot is held by the RECORD and not by the stack frame that opened it:
-// the HTTP call that starts a proposal has to be able to return while the human is still
-// reading the bar, and the claim must outlive that frame — and nothing else.
+// One external agent's request to run one command, under the turn it was granted. The proposal
+// holds the TICKET, not the guard: the HTTP call that starts a proposal has to be able to
+// return while the human is still reading the bar, so the turn outlives that frame, and the
+// record going terminal is what ends it — or, for a kept turn, hands it back `Idle`.
 mod proposals {
     use super::*;
 
@@ -310,11 +587,6 @@ mod proposals {
         /// Woken on every transition, so `await_decision` can sleep out its wait window
         /// instead of polling this mutex.
         notify: Arc<tokio::sync::Notify>,
-        /// The claim on the approval slot, taken — and so dropped — the moment the state goes
-        /// terminal. The type is erased because the real guard is an `AgentRunGuard`, which
-        /// needs an `AppHandle` no unit test can build, and a guard whose release nothing can
-        /// observe is a guard nothing tests.
-        _guard: Option<Box<dyn Send>>,
     }
 
     static PROPOSALS: Mutex<VecDeque<Proposal>> = Mutex::new(VecDeque::new());
@@ -424,11 +696,16 @@ mod proposals {
         pub(super) id: String,
         /// The other half of every lookup: the record answers to this agent and no one else.
         pub(super) agent: String,
+        /// The turn this proposal runs under, ended (or handed back `Idle`) as the state goes
+        /// terminal.
+        held: Held,
+        /// Ending the turn may grant it to the next waiter, whose claim this makes.
+        claim: Claim,
     }
 
-    /// Record a shown proposal. `guard` is the claim on the approval slot the caller has just
-    /// won; from here the record owns it.
-    pub(super) fn propose(agent: &str, command: &str, guard: Box<dyn Send>) -> PropGuard {
+    /// Record a shown proposal under the turn `held` the caller has just won; from here the
+    /// record's settling is what ends it.
+    pub(super) fn propose(agent: &str, command: &str, held: Held, claim: Claim) -> PropGuard {
         // Sequential, not secret: what keeps a record private is the ownership check in
         // `peek`/`mark`, not the id's entropy — a guessed id is refused exactly like an
         // invented one. All a counter leaks is how many proposals the hub has seen.
@@ -454,9 +731,8 @@ mod proposals {
             state: State::Shown,
             output: String::new(),
             notify: Arc::new(tokio::sync::Notify::new()),
-            _guard: Some(guard),
         });
-        PropGuard { id, agent: agent.to_string() }
+        PropGuard { id, agent: agent.to_string(), held, claim }
     }
 
     /// What this caller's proposal is doing, what it is owed, and the handle to wait on it.
@@ -519,10 +795,10 @@ mod proposals {
             // client told "done" may propose again the instant it hears, and must find the slot
             // free. Released after the waiters woke, that was a race against this thread's
             // next few instructions, which a busy scheduler let the client win — a spurious
-            // BUSY to the client and a flaky test here. In the gap the record is still live
+            // busy to the client and a flaky test here. In the gap the record is still live
             // with no claim, which only makes `budget` briefly stricter, never laxer.
             if state.terminal() {
-                let released = {
+                {
                     let mut q = store();
                     let Some(p) = q.iter_mut().find(|p| p.id == self.id && p.agent == self.agent) else {
                         return;
@@ -538,12 +814,13 @@ mod proposals {
                         // so reaching for it under the store's cannot cycle.
                         note_denial(&self.agent);
                     }
-                    p._guard.take()
-                };
-                // Dropped with the store's lock released: `AgentRunGuard::drop` takes the
-                // approval slot's own lock, and two locks taken in one order here and the
-                // other order somewhere else is the deadlock a maintainer meets at 3am.
-                drop(released);
+                }
+                // Ended with the store's lock released: ending a turn takes TURN and drops the
+                // guard, which takes the approval slot's own lock, and two locks taken in one
+                // order here and the other order somewhere else is the deadlock a maintainer
+                // meets at 3am. A denial ends even a kept turn: the human said no to this agent.
+                let held = if state == State::Denied { Held { keep: false, ..self.held } } else { self.held };
+                end_turn(held, &self.claim);
             }
             let mut q = store();
             let Some(p) = q.iter_mut().find(|p| p.id == self.id && p.agent == self.agent) else {
@@ -555,6 +832,21 @@ mod proposals {
             p.state = state;
             p.output = output;
             p.notify.notify_waiters();
+        }
+    }
+
+    impl PropGuard {
+        /// Move this proposal's turn to `state`. False = the turn is not this proposal's any more.
+        pub(super) fn turn_to(&self, state: coord::HolderState) -> bool {
+            set_turn(self.held.ticket, state, &self.claim)
+        }
+
+        /// The Block of a command this proposal settled as `Unknown` has arrived: the shell's
+        /// foreground is free, so the turn goes back to `Idle` and ends like any other.
+        pub(super) fn block_arrived(&self) {
+            if self.turn_to(coord::HolderState::Idle) {
+                end_turn(self.held, &self.claim);
+            }
         }
     }
 
@@ -591,7 +883,7 @@ const BOARD_CONTRACT: &str = " You share this terminal with the other agents lis
 
 /// The half of `initialize`'s instructions that only a `propose` caller is told — see the
 /// call site for why. Kept verbatim: it is client-facing text for the callers that do get it.
-const PROPOSE_CONTRACT: &str = " Every run_command is shown to the user in an approval bar and runs only after they approve it by hand; there is no timeout that approves. run_command returns within its wait window \u{2014} either the finished result, or a proposal id once the wait expires. In that case poll await_decision with the proposal id until it reports a decision; `pending` means the user has not answered yet. Do not treat a pending proposal as a failure and do not re-send it.";
+const PROPOSE_CONTRACT: &str = " Every run_command is shown to the user in an approval bar and runs only after they approve it by hand; there is no timeout that approves. run_command returns within its wait window \u{2014} either the finished result, or a proposal id once the wait expires. In that case poll await_decision with the proposal id until it reports a decision; `pending` means the user has not answered yet. Do not treat a pending proposal as a failure and do not re-send it. Only one agent at a time holds this terminal's turn. run_command takes it for you and gives it back when the command ends; request_turn holds it across several commands. Call release_turn as soon as you are done with it. When another agent holds it, run_command and request_turn return an error with your queue position and retry_after_ms: you are queued, not refused, so wait retry_after_ms and then poll request_turn to keep your place until it is granted. `command_still_running` means the holder's last command has not ended, and the terminal is never handed on until it does.";
 
 /// What `run_command` answers when the wait window closed before the human did. The id is the
 /// whole payload: it is what `await_decision` takes.
@@ -657,6 +949,9 @@ pub(crate) trait Backend: Send + Sync {
     /// plain data structure, so the tools operate on it directly and a test can hand out its
     /// own instead of sharing the process-wide one.
     fn board(&self) -> &Mutex<coord::Board>;
+    /// How a grant made during this call takes the approval slot. Whoever's op frees the turn
+    /// claims it for the next waiter, so every call that touches the lock needs one.
+    fn claim(&self) -> Claim;
 }
 
 /// THE board. It lives here and not in `coord.rs`, which owns no state of its own, and the
@@ -679,12 +974,12 @@ fn all_tools() -> Value {
     json!([
         {
             "name": "run_command",
-            "description": "Run one shell command in the user's live Tachyon terminal. The user sees the exact command and must approve it with a keypress; a denial is returned as an error. Returns within wait_ms: either the finished result (exit code and truncated output), or a proposal_id to collect later with await_decision. One command at a time.",
+            "description": "Run one shell command in the user's live Tachyon terminal. The user sees the exact command and must approve it with a keypress; a denial is returned as an error. Returns within wait_ms: either the finished result (exit code and truncated output), or a proposal_id to collect later with await_decision. One command at a time: if another agent holds the terminal's turn, you are queued and get an error with your position and retry_after_ms.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "A single shell command. Line breaks are folded to `; `; control characters are rejected." },
-                    "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "description": "How long to wait for the user's decision before returning a proposal_id instead (default and maximum 25000). The command is not cancelled when this expires." },
+                    "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "description": "How long to wait for the turn and then the user's decision before returning (default and maximum 25000). The command is not cancelled when this expires." },
                     "task_id": { "type": "string", "maxLength": coord::MAX_NAME_CHARS, "description": "Optional: the task you hold that this command is for. Each task allows a limited number of proposals." }
                 },
                 "required": ["command"],
@@ -705,6 +1000,24 @@ fn all_tools() -> Value {
                 "additionalProperties": false
             },
             "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "request_turn",
+            "description": "Hold this terminal's turn so several run_command calls run back to back without another agent's in between. Waits up to wait_ms; returns {ticket, holder_state} once the turn is yours. Otherwise an error with {position, holder, holder_state, eta_ms, retry_after_ms}: you are queued, so call again to keep your place. Release it with release_turn; an idle turn is taken back after 60 s of silence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "description": "How long to wait for the turn (default and maximum 25000)." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
+        },
+        {
+            "name": "release_turn",
+            "description": "Give back the turn you hold, or your place in the queue. Refused while your command is awaiting approval or running.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
             "name": "read_journal",
@@ -835,6 +1148,45 @@ fn parse_run_args(args: &Value) -> Result<String, String> {
     }
     parse_text_arg(&json!({ "command": one_line(raw) }), "command", MAX_COMMAND_CHARS)
         .map_err(|e| format!("run_command: {e}"))
+}
+
+/// A worker's command, run in its worktree. A subshell, so the `cd` never outlives the command
+/// and moves the human's own shell; `&&`, so a worktree that has gone away runs nothing rather
+/// than the command wherever the shell happens to be.
+fn wrap_for_worktree(cmd: &str, wt: &str) -> String {
+    format!("( cd {wt} && {cmd} )")
+}
+
+/// `run_command`'s arguments with the caller's worktree applied to the RAW command, BEFORE
+/// `parse_run_args`: the validator, `is_dangerous`, the bar, the PTY write and `wait_block`'s
+/// matcher then all see the one wrapped string (R3, shown == run). The path comes from the
+/// registry, never from the call, so a `worktree` argument is never read. A blank command is
+/// left alone, so it is still refused as empty rather than wrapped into `( cd … &&  )`.
+fn in_worktree(args: &Value, wt: Option<&str>) -> Result<Value, String> {
+    let mut args = args.clone();
+    let Some(wt) = wt else { return Ok(args) };
+    // Checked again here, not only at registration: mcp-server.json is a file, and this path
+    // is about to be spliced into a shell line.
+    let wt = parse_worktree(wt).map_err(|e| format!("run_command: {e}"))?;
+    if let Some(raw) = args.get("command").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
+        args["command"] = wrap_for_worktree(raw, &wt).into();
+    }
+    Ok(args)
+}
+
+/// A worktree path goes into a shell line UNQUOTED, so it may hold nothing the shell reads as
+/// syntax. An allowlist, because a denylist of shell syntax is never complete: quotes, space,
+/// `\`, `$`, a backtick, `;`, `&`, `|`, `(`, `)`, `<`, `>`, `!`, globs, `#`, `~` and every
+/// control and invisible character are all simply not in it. Absolute, so the line means the
+/// same wherever the shell is — and so it cannot start with `-` and reach `cd` as a flag.
+fn parse_worktree(path: &str) -> Result<String, String> {
+    let allowed = |c: char| (c.is_alphanumeric() && !crate::is_invisible(c)) || "/._-+@%=,:".contains(c);
+    if !path.starts_with('/') || !path.chars().all(allowed) {
+        return Err(format!(
+            "bad worktree path: {path:?} \u{2014} an absolute path of letters, digits and / . _ - + @ % = , :"
+        ));
+    }
+    Ok(path.to_string())
 }
 
 /// THE reader for every string argument of every tool. One place, so a tool added later
@@ -1104,7 +1456,7 @@ fn call_tool(params: &Value, backend: &dyn Backend, caller: &Caller) -> Result<V
     let args = params.get("arguments").unwrap_or(&empty);
     let outcome = match name {
         "run_command" => (|| {
-            let cmd = parse_run_args(args)?;
+            let cmd = parse_run_args(&in_worktree(args, caller.worktree.as_deref())?)?;
             let wait = parse_wait(args)?;
             // SEC-7, and ABOVE THE BACKEND on purpose: a cooldown or a cap is answered here,
             // where there is no terminal to reach and so no `agent_propose` to emit. It sits
@@ -1114,8 +1466,8 @@ fn call_tool(params: &Value, backend: &dyn Backend, caller: &Caller) -> Result<V
             proposals::budget(&caller.name)?;
             // The per-task budget, part of the same check and above the backend for the same
             // reason. Charged only once SEC-7 has passed, so a cooldown does not burn one.
-            // ponytail: a BUSY refusal after this point still spends one of the 20 — refund on
-            // BUSY if agents that share the slot start hitting the cap.
+            // ponytail: a busy refusal after this point still spends one of the 20 — refund on
+            // busy if agents that share the slot start hitting the cap.
             if let Some(id) = task {
                 backend.board().lock().unwrap_or_else(|e| e.into_inner()).charge_proposal(&caller.name, &id)?;
             }
@@ -1127,6 +1479,8 @@ fn call_tool(params: &Value, backend: &dyn Backend, caller: &Caller) -> Result<V
             // argument with which to ask about someone else's proposal.
             poll_decision(caller, id, parse_wait(args)?)
         })(),
+        "request_turn" => request_turn(&caller.name, args, &backend.claim()),
+        "release_turn" => release_turn(&caller.name, &backend.claim()),
         "read_journal" => parse_limit(args).map(|n| backend.read_journal(n)),
         "get_context" => backend.get_context(),
         "post_message" => post_message(backend, caller, args),
@@ -1228,6 +1582,7 @@ fn handle_rpc(body: &str, backend: &dyn Backend, caller: &Caller) -> Option<Valu
     // Stamped for every message, notifications included — "last seen" means last heard from,
     // not last handshake. Only `initialize` carries a clientInfo to record.
     note_seen(caller, (method == "initialize").then(|| client_claims(params)));
+    touch(&caller.name, &backend.claim());
     let id = id?; // no id → notification (notifications/initialized and anything else)
     let result = match method {
         "initialize" => {
@@ -1366,7 +1721,7 @@ fn serve(server: &tiny_http::Server, backend: Arc<dyn Backend>) {
         let (verdict, cap, share) = {
             let agents = AGENTS.lock().unwrap_or_else(|e| e.into_inner());
             let verdict = admit(&all("Host"), &all("Origin"), all("Authorization").first().copied(), &agents)
-                .map(|a| Caller { name: a.name.clone(), scopes: a.scopes.clone() });
+                .map(|a| Caller { name: a.name.clone(), scopes: a.scopes.clone(), worktree: a.worktree.clone() });
             let cap = handler_cap(agents.len());
             (verdict, cap, cap / agents.len().max(1))
         };
@@ -1454,34 +1809,79 @@ struct Live(AppHandle);
 /// Wait for the journal block of the command just written. Same correlation as agent_loop —
 /// match on command text, resync on `Lagged` — plus an abort check, because here Esc must
 /// release the HTTP client as well as the bar. `None` = deadline, abort, or channel closed.
+/// No `timeout` = no deadline: the late-Block wait of a command that outlived its first one.
 // ponytail: second copy of agent_loop's wait (that one has no abort). Fold them together
 // once the parallel branches touching agent_loop have merged.
 async fn wait_block(
     rx: &mut tokio::sync::broadcast::Receiver<Block>,
     want: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     aborted: impl Fn() -> bool,
 ) -> Option<Block> {
     use tokio::sync::broadcast::error::RecvError;
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     loop {
         // ponytail: 100ms abort poll, the same trade ai_call_abortable makes
-        let tick = (tokio::time::Instant::now() + std::time::Duration::from_millis(100)).min(deadline);
+        let tick = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let tick = deadline.map_or(tick, |d| tick.min(d));
         match tokio::time::timeout_at(tick, rx.recv()).await {
             Ok(Ok(b)) if b.command.trim() == want => return Some(b),
             Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
             Ok(Err(RecvError::Closed)) => return None,
-            Err(_) if aborted() || tokio::time::Instant::now() >= deadline => return None,
+            Err(_) if aborted() || deadline.is_some_and(|d| tokio::time::Instant::now() >= d) => return None,
             Err(_) => continue,
         }
     }
+}
+
+/// The end of the command just written, as far as handing the shell on goes: its Block AND the
+/// shell back in the terminal's foreground. The Block alone proves nothing — it is parsed from
+/// the command's own output stream, so a program (or an ssh session's remote shell) that prints
+/// `OSC 133;D` forges one while it still owns stdin, and the next holder's approved command
+/// would be typed into it (R21). A Block seen while something else holds the foreground is
+/// kept in `seen` and the foreground polled; the real D that follows a forged one is swallowed
+/// by the scanner, so the foreground is the only end signal left. `None` = the deadline or an
+/// abort first; call again with the same `seen` to carry on.
+// ponytail: a program that hands the terminal back to the shell while it keeps running
+// (tcsetpgrp) still passes. Upgrade: a per-session nonce on the precmd's D.
+async fn wait_end(
+    rx: &mut tokio::sync::broadcast::Receiver<Block>,
+    want: &str,
+    timeout: Option<Duration>,
+    aborted: impl Fn() -> bool,
+    shell_in_foreground: impl Fn() -> bool,
+    seen: &mut Option<Block>,
+) -> Option<Block> {
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+    if seen.is_none() {
+        *seen = Some(wait_block(rx, want, timeout, &aborted).await?);
+    }
+    loop {
+        if shell_in_foreground() {
+            return seen.take();
+        }
+        if aborted() || deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether the shell itself holds the terminal's foreground, i.e. no job of it is running.
+/// An interactive shell leads its own process group, so the foreground group is its pid.
+/// Unknowable (no PTY yet) reads as no: the turn then waits for a human release, never on.
+fn shell_in_foreground(app: &AppHandle) -> bool {
+    let pty = app.state::<PtyState>();
+    let shell = *pty.shell_pid.lock().unwrap_or_else(|e| e.into_inner());
+    let fg = pty.master.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.process_group_leader());
+    matches!((fg, shell), (Some(fg), Some(shell)) if u32::try_from(fg) == Ok(shell))
 }
 
 /// Everything that has to happen before the client's HTTP call can be answered: the slot is
 /// claimed and the proposal recorded, so what comes back is either a refusal the client can
 /// act on or an id it can poll. Synchronous, on the request's own thread — a refusal must not
 /// arrive as a proposal id that would never settle.
-fn open_gate(app: &AppHandle, agent: &str, cmd: &str) -> Result<proposals::PropGuard, String> {
+fn open_gate(app: &AppHandle, agent: &str, cmd: &str, wait: Duration) -> Result<proposals::PropGuard, String> {
     // No PTY means the webview has not mounted yet (it is what calls pty_spawn), so an
     // `agent-propose` emitted now would reach no listener: the proposal could never be
     // answered and `running` would stay claimed with no bar on screen to release it.
@@ -1492,23 +1892,15 @@ fn open_gate(app: &AppHandle, agent: &str, cmd: &str) -> Result<proposals::PropG
     if matches!(app.state::<PtyState>().writer.try_lock(), Ok(ref w) if w.is_none()) {
         return Err("terminal not ready: no shell has been spawned yet".into());
     }
-    // One approval slot, one PTY: fail fast rather than queue behind, or clobber the parked
-    // sender of, the built-in agent or another run_command.
-    agent_claim(&app.state::<AgentState>()).map_err(|_| BUSY.to_string())?;
-    // Built only AFTER the claim is won: on the busy path above there is nothing to release,
-    // and a guard there would clear the flag out from under whoever does hold it. Built BEFORE
-    // the re-check below so that refusal gives the slot back by dropping it.
-    let guard = AgentRunGuard(app.clone());
-    // SEC-7 again, and this is the check that cannot be outrun: the one in `call_tool` may have
-    // been read BEFORE the Esc that freed this very slot. A denial stamps the cooldown before it
-    // releases the claim, so whoever wins the claim sees the stamp. Still above `agent_propose`,
-    // so a badgering re-send inside the cooldown raises no second bar.
-    proposals::budget(agent)?;
-    // The claim is handed straight to the proposal record, which owns it until the proposal
-    // settles — the client's HTTP call returns while the human is still deciding, so the slot
-    // cannot belong to any one frame. From here every exit, panics included, settles the
-    // record and so releases ⌘J — that is `PropGuard`'s Drop.
-    Ok(proposals::propose(agent, cmd, Box::new(guard)))
+    // One approval slot, one PTY, taken through the turn lock: a grant claims the slot.
+    let claim = live_claim(app);
+    let held = take_turn(agent, &claim, wait)?;
+    // A kept turn outlives the claim that last cleared this: an Esc meant for an earlier
+    // command of this turn must not deny the one about to be shown.
+    app.state::<AgentState>().abort.store(false, SeqCst);
+    // From here every exit, panics included, settles the record and so ends the turn and
+    // releases ⌘J — that is `PropGuard`'s Drop.
+    Ok(proposals::propose(agent, cmd, held, claim))
 }
 
 /// The external agent's only road to the PTY, carried out on a worker thread while the client
@@ -1530,28 +1922,41 @@ async fn run_gated(app: &AppHandle, cmd: &str, proposal: &proposals::PropGuard) 
     // (`approvable` in ui/src/ai_bar.rs).
     let approved = agent_propose(
         app,
-        json!({ "step": 0, "kind": "run", "text": cmd, "args": null, "danger": is_dangerous(cmd), "external": true, "agent": proposal.agent }),
+        json!({ "step": 0, "kind": "run", "text": cmd, "args": null, "danger": is_dangerous(cmd), "external": true, "agent": proposal.agent, "proposal_id": proposal.id }),
     )
     .await;
     if approved {
         proposal.mark(proposals::State::Approved);
     }
 
+    // The subscription a command still running past its wait keeps correlating on, and the
+    // Block it may already have seen (a forged one, or one that beat the shell's `tcsetpgrp`).
+    let mut late = None;
+    let mut seen = None;
+    let fg = || shell_in_foreground(app);
     let result = async {
         // re-check abort between the await and the write, as agent_loop does
         if !approved || aborted() {
             return Err(DENIED.to_string());
+        }
+        // `Running` BEFORE the write: from here a release is refused and the lease is frozen, so
+        // the shell's foreground is never handed on under this command. Not this turn any more
+        // means it was released under the bar, and nothing is written.
+        if !proposal.turn_to(coord::HolderState::Running) {
+            return Err("the command was not run: its turn ended before it could be written".to_string());
         }
         // subscribe BEFORE writing, then drop stragglers — see agent_loop for both reasons
         let mut rx = app.state::<JournalState>().tx.subscribe();
         while rx.try_recv().is_ok() {}
         app.state::<JournalState>().scanner.lock().unwrap_or_else(|e| e.into_inner()).set_typed(cmd.to_string());
         proposal.mark(proposals::State::Running);
-        let _ = app.emit("agent-status", json!({ "step": 0, "status": "running" }));
+        // No `agent-status` here: that event is the built-in agent's step counter and names no
+        // proposal, so it would repaint whatever bar is up. The bar says "running…" itself on
+        // the approving keypress.
         // INVARIANT: the ONLY pty write in the MCP-server path — lexically after the
         // `!approved` return above, reachable only via agent_decide(true).
         pty_write_internal(&app.state::<PtyState>(), &format!("{cmd}\n"))?;
-        Ok(match wait_block(&mut rx, cmd, AGENT_STEP_TIMEOUT, aborted).await {
+        Ok(match wait_end(&mut rx, cmd, Some(AGENT_STEP_TIMEOUT), aborted, fg, &mut seen).await {
             // Redacted, then cut, as `journal_json` does: this is the same Block, and the
             // settled text is what `await_decision` hands back later too.
             Some(b) => format!(
@@ -1560,11 +1965,16 @@ async fn run_gated(app: &AppHandle, cmd: &str, proposal: &proposals::PropGuard) 
                 tail_chars(&redact(&b.output), OUTPUT_CHARS)
             ),
             // Not an error: the command was approved and started. The ceiling stops the wait,
-            // it does not kill the command.
-            None => format!(
-                "Exit code: unknown\nNo exit marker within {}s (or the user stopped waiting). The command may still be running; read_journal will show it once it ends.",
-                AGENT_STEP_TIMEOUT.as_secs()
-            ),
+            // it does not kill the command — which may still own the shell's foreground, so the
+            // turn is KEPT, `command_still_running` to every waiter, until its Block (R21).
+            None => {
+                proposal.turn_to(coord::HolderState::Unknown);
+                late = Some(rx);
+                format!(
+                    "Exit code: unknown\nNo exit marker within {}s (or the user stopped waiting). The command may still be running; read_journal will show it once it ends. The turn stays held until it does.",
+                    AGENT_STEP_TIMEOUT.as_secs()
+                )
+            }
         })
     }
     .await;
@@ -1575,7 +1985,9 @@ async fn run_gated(app: &AppHandle, cmd: &str, proposal: &proposals::PropGuard) 
         Err(_) => "denied".into(),
     };
     let _ = app.emit("agent-output", json!({ "step": 0, "text": format!("external run_command \u{2192} {line}") }));
-    let _ = app.emit("agent-done", json!({ "summary": "external command finished" }));
+    // Per proposal: by the time this lands the turn may have moved on and the bar may be
+    // showing the NEXT agent's proposal, which a done for this one must not clear.
+    let _ = app.emit("agent-done", json!({ "agent": proposal.agent, "proposal_id": proposal.id, "summary": "external command finished" }));
 
     // The verdict, once, and LAST: a command that was written is `Done` whatever its exit
     // code, a refused one is `Denied`, and anything else never reached the shell. This is
@@ -1594,6 +2006,15 @@ async fn run_gated(app: &AppHandle, cmd: &str, proposal: &proposals::PropGuard) 
     proposal.settle(state, match result {
         Ok(text) | Err(text) => text,
     });
+
+    // The same subscription, now with no deadline and no abort: the turn stays `Unknown` until
+    // this command's Block arrives, and a human's release is the only other way out of it.
+    // ponytail: this worker stays parked until then, one per command that outlived its wait.
+    if let Some(mut rx) = late {
+        if wait_end(&mut rx, cmd, None, || false, fg, &mut seen).await.is_some() {
+            proposal.block_arrived();
+        }
+    }
 }
 
 fn journal_json(q: &VecDeque<Block>, limit: usize) -> String {
@@ -1612,8 +2033,12 @@ impl Backend for Live {
     fn run_command(&self, caller: &Caller, command: &str, wait: Duration) -> Result<String, String> {
         // The proposal record is keyed by the agent the TOKEN named, so `await_decision` can
         // refuse a foreign id. REG-7 carries the same name into the approval bar's payload.
-        let proposal = open_gate(&self.0, &caller.name, command)?;
+        let started = std::time::Instant::now();
+        let proposal = open_gate(&self.0, &caller.name, command, wait)?;
         let (app, cmd) = (self.0.clone(), command.to_string());
+        // One wait for both: the queue spent some of it and the human gets the rest, so the
+        // client's call still comes back inside `wait_ms`.
+        let wait = wait.saturating_sub(started.elapsed());
         run_detached(proposal, wait, move |p| tauri::async_runtime::block_on(run_gated(&app, &cmd, p)))
     }
 
@@ -1637,6 +2062,10 @@ impl Backend for Live {
 
     fn board(&self) -> &Mutex<coord::Board> {
         &BOARD
+    }
+
+    fn claim(&self) -> Claim {
+        live_claim(&self.0)
     }
 }
 
@@ -1756,7 +2185,7 @@ fn run_serve(app: &AppHandle, cmd: ServeCmd) -> Result<String, String> {
     }
 }
 
-// ---- /mcp agent add|list|show|revoke ----
+// ---- /mcp agent add|list|show|revoke|worktree ----
 
 /// `serve` so `/mcp agent add serve` cannot make a `/mcp agent list` line read like a
 /// `/mcp serve` one; `default` because `migrate` mints that name itself; the rest because
@@ -1809,10 +2238,32 @@ fn parse_scopes(words: &[&str]) -> Result<Vec<String>, String> {
 
 #[derive(Debug, PartialEq)]
 enum AgentCmd {
-    Add(String, Vec<String>),
+    Add(String, Vec<String>, Option<String>),
     List,
     Show(String),
     Revoke(String),
+    /// `None` = `off`: the agent's commands run wherever the shell is.
+    Worktree(String, Option<String>),
+}
+
+/// `add`'s tail: `[--scopes a,b] [--worktree /abs/path]`, either order. A word under neither
+/// flag is a scope too, so the older `add <name> read,propose` still means what it did.
+fn parse_add(name: String, words: &[&str]) -> Result<AgentCmd, String> {
+    let (mut scopes, mut worktree) = (Vec::new(), None);
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "--scopes" => {}
+            "--worktree" => {
+                let path = words.next().ok_or("--worktree needs an absolute path")?;
+                if worktree.replace(parse_worktree(path)?).is_some() {
+                    return Err("--worktree given twice".into());
+                }
+            }
+            scope => scopes.push(scope),
+        }
+    }
+    Ok(AgentCmd::Add(name, parse_scopes(&scopes)?, worktree))
 }
 
 /// `None` = not a `/mcp agent` command. Unlike `parse_serve` this does NOT lowercase the
@@ -1829,12 +2280,15 @@ fn parse_agent(input: &str) -> Option<Result<AgentCmd, String>> {
         None => (String::new(), &[][..]), // a bare `/mcp agent` lists, as `/mcp serve` reports
     };
     Some(match (verb.as_str(), args) {
-        ("add", [name, scopes @ ..]) => parse_agent_name(name)
-            .and_then(|n| parse_scopes(scopes).map(|s| AgentCmd::Add(n, s))),
+        ("add", [name, rest @ ..]) => parse_agent_name(name).and_then(|n| parse_add(n, rest)),
         ("list", []) | ("", []) => Ok(AgentCmd::List),
         ("show", [name]) => Ok(AgentCmd::Show((*name).to_string())),
         ("revoke", [name]) => Ok(AgentCmd::Revoke((*name).to_string())),
-        _ => Err("usage: /mcp agent add <name> [scopes] | list | show <name> | revoke <name>".into()),
+        ("worktree", [name, path]) => {
+            let path = if path.eq_ignore_ascii_case("off") { Ok(None) } else { parse_worktree(path).map(Some) };
+            path.map(|p| AgentCmd::Worktree((*name).to_string(), p))
+        }
+        _ => Err("usage: /mcp agent add <name> [--scopes a,b] [--worktree /abs/path] | list | show <name> | revoke <name> | worktree <name> <path|off>".into()),
     })
 }
 
@@ -1844,12 +2298,27 @@ fn unknown_agent(name: &str) -> String {
 
 /// The registry rules, kept out of the file IO so they are testable without a config dir.
 /// Minting is the only place a second token is ever created.
-fn add_agent(cfg: &mut ServeConfig, name: String, scopes: Vec<String>) -> Result<(), String> {
+fn add_agent(cfg: &mut ServeConfig, name: String, scopes: Vec<String>, worktree: Option<String>) -> Result<(), String> {
     if cfg.agents.iter().any(|a| a.name == name) {
         return Err(format!("name taken \u{2014} /mcp agent revoke {name} first"));
     }
-    cfg.agents.push(AgentToken { name, token: generate_token()?, scopes, worktree: None });
+    cfg.agents.push(AgentToken { name, token: generate_token()?, scopes, worktree });
     Ok(())
+}
+
+/// Takes effect from the agent's next `run_command`; a proposal already on the bar keeps the
+/// string it is shown with.
+fn set_worktree(cfg: &mut ServeConfig, name: &str, worktree: Option<String>) -> Result<(), String> {
+    cfg.agents.iter_mut().find(|a| a.name == name).ok_or_else(|| unknown_agent(name))?.worktree = worktree;
+    Ok(())
+}
+
+/// Beside `render_agent_config`, never inside it: that is the one token render, and a path
+/// is not a secret. Empty when the agent has no worktree.
+fn render_worktree(a: &AgentToken) -> String {
+    a.worktree.as_deref().map_or(String::new(), |wt| {
+        format!("\x1b[90mworktree:\x1b[0m {wt} \x1b[90m\u{2014} every command is shown and run as ( cd {wt} && \u{2026} )\x1b[0m\r\n")
+    })
 }
 
 fn revoke_agent(cfg: &mut ServeConfig, name: &str) -> Result<(), String> {
@@ -1933,14 +2402,24 @@ fn run_agent(cmd: AgentCmd) -> Result<String, String> {
         AgentCmd::List => Ok(format!("\r\n\x1b[36m[tachyon] mcp agents\x1b[0m\r\n{}", render_agents(&cfg.agents))),
         AgentCmd::Show(name) => {
             let a = cfg.agents.iter().find(|a| a.name == name).ok_or_else(|| unknown_agent(&name))?;
-            Ok(render_agent_config(a, cfg.port, listening))
+            Ok(render_agent_config(a, cfg.port, listening) + &render_worktree(a))
         }
-        AgentCmd::Add(name, scopes) => {
-            add_agent(&mut cfg, name, scopes)?;
+        AgentCmd::Add(name, scopes, worktree) => {
+            add_agent(&mut cfg, name, scopes, worktree)?;
             // File first, then the live roster — `persist` is the one mutator, so a new
             // token is usable from the next request and never before it is on disk.
             persist(&path, &cfg)?;
-            Ok(render_agent_config(cfg.agents.last().expect("just added"), cfg.port, listening))
+            let a = cfg.agents.last().expect("just added");
+            Ok(render_agent_config(a, cfg.port, listening) + &render_worktree(a))
+        }
+        AgentCmd::Worktree(name, worktree) => {
+            set_worktree(&mut cfg, &name, worktree)?;
+            persist(&path, &cfg)?;
+            let a = cfg.agents.iter().find(|a| a.name == name).expect("just set");
+            Ok(match a.worktree {
+                Some(_) => format!("\r\n\x1b[36m[tachyon] {name}\x1b[0m\r\n{}", render_worktree(a)),
+                None => format!("\r\n\x1b[36m[tachyon] {name} \x1b[90m\u{2014} no worktree; its commands run in the shell's own directory\x1b[0m\r\n"),
+            })
         }
         AgentCmd::Revoke(name) => {
             revoke_agent(&mut cfg, &name)?;
@@ -1950,22 +2429,96 @@ fn run_agent(cmd: AgentCmd) -> Result<String, String> {
     }
 }
 
+// ---- /mcp turn [release] ----
+
+/// `None` = not a `/mcp turn` command; `Some(Ok(true))` = release.
+fn parse_turn(input: &str) -> Option<Result<bool, String>> {
+    let lower = input.strip_prefix('/').unwrap_or(input).to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let ["mcp", "turn", rest @ ..] = words.as_slice() else {
+        return None;
+    };
+    Some(match rest {
+        [] => Ok(false),
+        ["release"] => Ok(true),
+        _ => Err("usage: /mcp turn [release]".into()),
+    })
+}
+
+/// `/mcp turn`: who holds the shell, in what state and since when, and who waits. Rendered from
+/// `turn_json`, the view `hub_state` hands the webview, so the two cannot disagree. Sweeps
+/// first, like every lock op, so a lapsed lease is not shown as still held.
+fn turn_status(claim: &Claim) -> String {
+    let now = std::time::Instant::now();
+    {
+        let mut lock = turn();
+        let events = lock.sweep(now);
+        apply(&mut lock, events, claim);
+    }
+    let t = turn_json(now);
+    let queue: Vec<&str> = t["queue"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let queue = if queue.is_empty() { "empty".to_string() } else { queue.join(", ") };
+    let holder = match t["holder"].as_str() {
+        Some(agent) => format!(
+            "{agent} \x1b[90m{} for {}s\x1b[0m",
+            t["state"].as_str().unwrap_or_default(),
+            t["since_ms"].as_u64().unwrap_or_default() / 1000
+        ),
+        // Also what ⌘J running looks like: the built-in agent takes the slot outside the lock.
+        None => "\x1b[90mno agent holds it\x1b[0m".into(),
+    };
+    format!("\r\n\x1b[36m[tachyon] turn:\x1b[0m {holder}\r\n\x1b[90mqueue: {queue}\x1b[0m\r\n")
+}
+
+/// `/mcp turn release`: the human ends whoever holds the turn. Through `apply` like every other
+/// road, so the guard goes with it: a proposal on the bar loses its parked sender and resolves to
+/// a denial, the fail-closed path Esc also takes. Refused while `Running`: that command owns the
+/// shell's foreground, and its Block ends the turn. Allowed from `Unknown`, the one way out
+/// besides the Block, and the reply says what that means: the next holder may type into a
+/// command that is still running.
+fn human_release(claim: &Claim) -> Result<String, String> {
+    let mut lock = turn();
+    let Some((agent, state)) = lock.holder().map(|h| (h.agent.clone(), h.state)) else {
+        return Ok("\r\n\x1b[36m[tachyon] no agent holds the turn\x1b[0m\r\n".into());
+    };
+    if state == coord::HolderState::Running {
+        return Err(format!(
+            "refused: {agent}'s command is running \u{2014} its turn ends when the command does (^C in the terminal stops it)"
+        ));
+    }
+    let events = lock.release(&agent, std::time::Instant::now());
+    apply(&mut lock, events, claim);
+    let note = match state {
+        coord::HolderState::AwaitingHuman => " \u{2014} its proposal is denied",
+        coord::HolderState::Unknown => " \u{2014} the last command may still be running",
+        _ => "",
+    };
+    Ok(format!("\r\n\x1b[36m[tachyon] released {agent}'s turn\x1b[90m{note}\x1b[0m\r\n"))
+}
+
 /// The hub, as the webview is allowed to see it: who may connect, and what is on the bar.
 /// READ-ONLY, and narrow on purpose — no token, and no command text. `has_token` says that a
 /// credential EXISTS; the bytes stay on disk and in `AGENTS`, because there is no honest
 /// reason for webview script to hold one and `render_agent_config` is the only render.
 ///
-/// v1's shape is final: `turn` (M3) and `tasks` (M2) ship null and empty rather than absent,
-/// so the two surfaces that will fill them do not change the shape the UI already parses.
+/// v1's keys are final: `turn` (M3) and `tasks` (M2) fill what shipped as null and empty, so
+/// the UI's parser, which names only what it reads, never saw the shape change under it.
 ///
 /// A disk read per call, like `mcp_names` beside it: the completer asks once on bar open, and
 /// the config file is the registry even when nothing is listening — reading `AGENTS` instead
 /// would show an empty roster with the server off.
 #[tauri::command]
-pub(crate) fn hub_state() -> Result<Value, String> {
+pub(crate) fn hub_state(app: AppHandle) -> Result<Value, String> {
     let cfg = load_serve(&serve_path()?)?;
     // A copy, so the board's lock is released before `hub_json` takes `SEEN` and the store's.
     let board = BOARD.lock().unwrap_or_else(|e| e.into_inner()).tasks().to_vec();
+    // The UI asking is a clock tick too: a lapsed lease is noticed here with every agent silent,
+    // so the turn needs no timer thread of its own.
+    {
+        let mut lock = turn();
+        let events = lock.sweep(std::time::Instant::now());
+        apply(&mut lock, events, &live_claim(&app));
+    }
     Ok(hub_json(&cfg, &board))
 }
 
@@ -1973,6 +2526,8 @@ pub(crate) fn hub_state() -> Result<Value, String> {
 /// `hub_state` is what it does and does not contain, and that must be testable without a
 /// config directory to plant a token in.
 fn hub_json(cfg: &ServeConfig, tasks: &[coord::Task]) -> Value {
+    // First, so TURN is never taken while `SEEN` is held.
+    let turn = turn_json(std::time::Instant::now());
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let agents: Vec<Value> = cfg
         .agents
@@ -1991,7 +2546,7 @@ fn hub_json(cfg: &ServeConfig, tasks: &[coord::Task]) -> Value {
     json!({
         "agents": agents,
         "pending": proposals::pending().map(|(id, agent)| json!({ "id": id, "agent": agent })),
-        "turn": Value::Null,
+        "turn": turn,
         // Who holds what, and nothing an agent wrote beyond the title: `detail` and `note` are
         // for the agents, and the webview does not need them to draw a row.
         "tasks": tasks
@@ -2006,6 +2561,11 @@ fn hub_json(cfg: &ServeConfig, tasks: &[coord::Task]) -> Value {
 pub(crate) fn slash(app: &AppHandle, input: &str) -> Option<Result<String, String>> {
     if let Some(cmd) = parse_serve(input) {
         return Some(cmd.and_then(|c| run_serve(app, c)));
+    }
+    // The AppHandle only for the claim: a release or a sweep may grant the next waiter.
+    if let Some(cmd) = parse_turn(input) {
+        let claim = live_claim(app);
+        return Some(cmd.and_then(|release| if release { human_release(&claim) } else { Ok(turn_status(&claim)) }));
     }
     // No AppHandle: the registry is the config file plus the live roster, and a revoke takes
     // effect through `persist` whether or not a listener is up.
@@ -2046,7 +2606,7 @@ mod tests {
 
     /// The identity `admit` hands down, built here without going through a roster.
     fn caller(name: &str, scopes: &[&str]) -> Caller {
-        Caller { name: name.into(), scopes: scopes.iter().map(|s| (*s).to_string()).collect() }
+        Caller { name: name.into(), scopes: scopes.iter().map(|s| (*s).to_string()).collect(), worktree: None }
     }
 
     /// Every scope: for the tests that are about something other than authorization.
@@ -2076,9 +2636,8 @@ mod tests {
     ///
     /// It also stands in for `run_gated`'s single-driver gate. `run_gated` needs an
     /// `AppHandle`, which a unit test cannot build, so the stub claims the REAL
-    /// `agent_claim` over a plain `AgentState` — what an N-client test then observes over
-    /// the wire is the production claim, not a mock of it. When the turn lock grows a
-    /// registry, these tests exercise the new one.
+    /// `agent_claim` over a plain `AgentState`, through the real turn lock (`take_turn`) — what
+    /// an N-client test then observes over the wire is the production claim, not a mock of it.
     struct Stub {
         /// Commands that actually RAN: pushed after the claim is won, so `len()` is how
         /// many clients reached the terminal.
@@ -2103,7 +2662,10 @@ mod tests {
         holder: Arc<Mutex<Option<u64>>>,
         inside: Arc<AtomicUsize>,
         /// High-water mark of `inside`. Anything above 1 is two drivers on one PTY.
-        peak: AtomicUsize,
+        peak: Arc<AtomicUsize>,
+        /// Claims won: one per grant that took the slot. With `inside` (guards not yet dropped)
+        /// it is the stress test's ledger — every grant ended by exactly one release or revoke.
+        grants: Arc<AtomicUsize>,
         /// Its OWN board, not the process-wide one: these tests run in parallel threads of
         /// one process and each wants a board nobody else is posting to.
         board: Mutex<coord::Board>,
@@ -2119,14 +2681,15 @@ mod tests {
                 hold_until: Arc::new(AtomicUsize::new(1)), // no waiting unless a test asks for it
                 holder: Arc::default(),
                 inside: Arc::default(),
-                peak: AtomicUsize::new(0),
+                peak: Arc::default(),
+                grants: Arc::default(),
                 board: Mutex::default(),
             }
         }
     }
 
-    /// The harness's `AgentRunGuard`: built only after the claim is won, owned by the proposal
-    /// record, and released when that record settles — on every exit including an unwind.
+    /// The harness's `AgentRunGuard`: built only after the claim is won, held for the turn,
+    /// and released when the turn ends — on every exit including an unwind.
     struct Turn {
         slot: Arc<AgentState>,
         holder: Arc<Mutex<Option<u64>>>,
@@ -2138,32 +2701,34 @@ mod tests {
             *self.holder.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.inside.fetch_sub(1, SeqCst);
             self.slot.running.store(false, SeqCst);
+            // `AgentRunGuard`'s other half: a turn ended under the bar drops the parked sender.
+            self.slot.decision.lock().unwrap_or_else(|e| e.into_inner()).take();
         }
     }
 
     impl Backend for Stub {
-        /// `Live::run_command`'s shape, minus the AppHandle: claim, record, hand the rest to a
-        /// worker, answer inside `wait`. The claim and the record are the production ones, so
-        /// what the HTTP tests observe over the wire is the real gate and the real store.
+        /// `Live::run_command`'s shape, minus the AppHandle: take the turn, record, hand the rest
+        /// to a worker, answer inside `wait`. The turn and the record are the production ones,
+        /// so what the HTTP tests observe over the wire is the real gate and the real store.
         fn run_command(&self, caller: &Caller, command: &str, wait: Duration) -> Result<String, String> {
             // Taken from the CALLER, not the command text: the N-client tests now prove the
             // identity that crossed the wire is the one the terminal sees.
             let id: u64 = caller.name.trim_start_matches(char::is_alphabetic).parse().unwrap_or(0);
             self.attempts.fetch_add(1, SeqCst);
-            // Fail fast, never queue: `run_gated`'s claim, minus the AppHandle.
-            agent_claim(&self.slot).map_err(|_| BUSY.to_string())?;
-            let turn = Turn { slot: self.slot.clone(), holder: self.holder.clone(), inside: self.inside.clone() };
-            self.peak.fetch_max(self.inside.fetch_add(1, SeqCst) + 1, SeqCst);
+            // Queued for up to `wait`, and `open_gate`'s budget re-check inside: its claim, minus
+            // the AppHandle. The rest of the wait is the human's, as in `Live`.
+            let started = std::time::Instant::now();
+            let claim = self.claim();
+            let held = take_turn(&caller.name, &claim, wait)?;
+            let wait = wait.saturating_sub(started.elapsed());
             {
                 let mut h = self.holder.lock().unwrap_or_else(|e| e.into_inner());
-                assert!(h.is_none(), "agent {id} entered while agent {h:?} still held the slot");
+                // ...unless it is this agent, back under the turn it kept (`request_turn`)
+                assert!(h.is_none() || *h == Some(id), "agent {id} entered while agent {h:?} still held the slot");
                 *h = Some(id);
             }
-            // `open_gate`'s re-check, in the same place: after the claim, before anything is
-            // recorded or raised. `turn` gives the slot back on the way out.
-            proposals::budget(&caller.name)?;
             self.log.lock().unwrap_or_else(|e| e.into_inner()).push(command.to_string());
-            let proposal = proposals::propose(&caller.name, command, Box::new(turn));
+            let proposal = proposals::propose(&caller.name, command, held, claim);
 
             // Everything the worker needs, owned: it outlives this call by design.
             let human = self.human.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -2178,6 +2743,8 @@ mod tests {
                     }
                 }
                 p.mark(State::Running);
+                // `run_gated`'s transition, so the harness's holder is frozen while it "runs".
+                p.turn_to(coord::HolderState::Running);
                 // Hold the slot until every client has tried. Bounded, so a wrong `hold_until`
                 // fails the test instead of hanging it.
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2202,6 +2769,17 @@ mod tests {
         }
         fn board(&self) -> &Mutex<coord::Board> {
             &self.board
+        }
+        /// `open_gate`'s claimer, over the stub's own slot.
+        fn claim(&self) -> Claim {
+            let (slot, holder, inside, peak) = (self.slot.clone(), self.holder.clone(), self.inside.clone(), self.peak.clone());
+            let grants = self.grants.clone();
+            Arc::new(move || {
+                agent_claim(&slot).ok()?;
+                grants.fetch_add(1, SeqCst);
+                peak.fetch_max(inside.fetch_add(1, SeqCst) + 1, SeqCst);
+                Some(Box::new(Turn { slot: slot.clone(), holder: holder.clone(), inside: inside.clone() }) as Box<dyn Send>)
+            })
         }
     }
 
@@ -2437,6 +3015,18 @@ mod tests {
         assert!(text.contains("await_decision") && text.contains("proposal id"), "{text}");
         assert!(text.contains("no timeout that approves"), "{text}");
         assert!(!text.contains("block until"), "the 0.2.9 blocking promise is still being made: {text}");
+        // TL-2: the turn contract, so a queued error reads as "wait your turn", not as a failure
+        for must in [
+            "Only one agent at a time holds",
+            "release_turn as soon as you are done",
+            "you are queued, not refused",
+            "poll request_turn to keep your place",
+            "retry_after_ms",
+            "`command_still_running`",
+            "never handed on",
+        ] {
+            assert!(text.contains(must), "a propose-scoped agent was not told {must}: {text}");
+        }
 
         // the identity is the token's, never the client's own say-so
         let other = rpc_as(&Stub::default(), &caller("codex", &[SCOPE_READ]), hello.clone());
@@ -2446,7 +3036,7 @@ mod tests {
         // already keep: nothing about a tool it may not use. These instructions become the
         // model's system prompt, so naming run_command here would be the disclosure the
         // refusal path exists to prevent.
-        for leak in ["run_command", "await_decision", "proposal id", "approval bar"] {
+        for leak in ["run_command", "await_decision", "proposal id", "approval bar", "request_turn", "release_turn"] {
             assert!(!ro.contains(leak), "a read-only agent was told about {leak}: {ro}");
         }
         // not vacuous: the empty-scope caller is the weakest one there is
@@ -2530,6 +3120,10 @@ mod tests {
         // a bad argument must not answer differently either — that would be the same oracle
         assert_eq!(call(&reader, "run_command", json!({ "command": "a\rb" }))["error"], refused["error"]);
         assert_eq!(call(&reader, "run_command", json!({}))["error"], refused["error"]);
+        // the turn is the propose scope's too
+        for turn_tool in ["request_turn", "release_turn"] {
+            assert_eq!(call(&reader, turn_tool, json!({}))["error"]["message"], format!("unknown tool: {turn_tool}"));
+        }
         // `journal` is its own scope, so `read` does not carry it
         assert_eq!(call(&reader, "read_journal", json!({}))["error"]["code"], -32602);
         assert_eq!(call(&reader, "get_context", json!({}))["result"]["isError"], false);
@@ -2552,7 +3146,7 @@ mod tests {
         let r = rpc(&Stub::default(), json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["run_command", "await_decision", "read_journal", "get_context", "post_message", "read_messages", "list_agents", "create_task", "claim_task", "update_task", "list_tasks"]);
+        assert_eq!(names, ["run_command", "await_decision", "request_turn", "release_turn", "read_journal", "get_context", "post_message", "read_messages", "list_agents", "create_task", "claim_task", "update_task", "list_tasks"]);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         }
@@ -2730,15 +3324,15 @@ mod tests {
                 assert!(tx.send(block(&format!("old{i}"), 1)).is_ok());
             }
             assert!(tx.send(block(" make test ", 7)).is_ok());
-            assert_eq!(wait_block(&mut rx, "make test", secs(5), || false).await.unwrap().exit_code, 7);
+            assert_eq!(wait_block(&mut rx, "make test", Some(secs(5)), || false).await.unwrap().exit_code, 7);
 
             // nothing matching → None at the deadline, not a hang and not the wrong block
             assert!(tx.send(block("other", 0)).is_ok());
-            assert!(wait_block(&mut rx, "make test", std::time::Duration::from_millis(250), || false).await.is_none());
+            assert!(wait_block(&mut rx, "make test", Some(std::time::Duration::from_millis(250)), || false).await.is_none());
 
             // abort releases the waiter long before the deadline
             let t = std::time::Instant::now();
-            assert!(wait_block(&mut rx, "make test", secs(30), || true).await.is_none());
+            assert!(wait_block(&mut rx, "make test", Some(secs(30)), || true).await.is_none());
             assert!(t.elapsed() < secs(5));
         });
     }
@@ -2909,15 +3503,34 @@ mod tests {
     #[test]
     fn agent_command_parsing() {
         let default: Vec<String> = DEFAULT_SCOPES.iter().map(|s| (*s).to_string()).collect();
-        assert_eq!(parse_agent("/mcp agent add codex"), Some(Ok(AgentCmd::Add("codex".into(), default))));
+        assert_eq!(parse_agent("/mcp agent add codex"), Some(Ok(AgentCmd::Add("codex".into(), default.clone(), None))));
         assert_eq!(
             parse_agent("/MCP Agent ADD codex read,propose"),
-            Some(Ok(AgentCmd::Add("codex".into(), vec!["read".into(), "propose".into()])))
+            Some(Ok(AgentCmd::Add("codex".into(), vec!["read".into(), "propose".into()], None)))
         );
+        // the flag forms, either order; the bare list above is the same command
+        assert_eq!(
+            parse_agent("/mcp agent add codex --worktree /tmp/wt-a --scopes read,propose"),
+            Some(Ok(AgentCmd::Add("codex".into(), vec!["read".into(), "propose".into()], Some("/tmp/wt-a".into()))))
+        );
+        assert_eq!(
+            parse_agent("/mcp agent add codex --worktree /tmp/wt-a"),
+            Some(Ok(AgentCmd::Add("codex".into(), default, Some("/tmp/wt-a".into()))))
+        );
+        assert!(matches!(parse_agent("/mcp agent add codex --worktree"), Some(Err(_))));
+        assert!(matches!(parse_agent("/mcp agent add codex --worktree /a --worktree /b"), Some(Err(_))));
+        assert!(matches!(parse_agent("/mcp agent add codex --worktree wt"), Some(Err(_))));
+        assert_eq!(
+            parse_agent("/mcp agent worktree codex /tmp/wt-a"),
+            Some(Ok(AgentCmd::Worktree("codex".into(), Some("/tmp/wt-a".into()))))
+        );
+        assert_eq!(parse_agent("/mcp agent worktree codex OFF"), Some(Ok(AgentCmd::Worktree("codex".into(), None))));
+        assert!(matches!(parse_agent("/mcp agent worktree codex"), Some(Err(_))));
+        assert!(matches!(parse_agent("/mcp agent worktree codex ../wt"), Some(Err(_))));
         // a space after the comma, and a repeat, both fold into the same list
         assert_eq!(
             parse_agent("/mcp agent add codex read, read, journal"),
-            Some(Ok(AgentCmd::Add("codex".into(), vec!["read".into(), "journal".into()])))
+            Some(Ok(AgentCmd::Add("codex".into(), vec!["read".into(), "journal".into()], None)))
         );
         assert_eq!(parse_agent("/mcp agent list"), Some(Ok(AgentCmd::List)));
         assert_eq!(parse_agent("/mcp agent"), Some(Ok(AgentCmd::List)));
@@ -2947,13 +3560,152 @@ mod tests {
         assert!(lock < read, "the config lock is taken after the read it has to cover");
     }
 
+    /// The path is spliced unquoted into a line the human approves, so no registered path may
+    /// carry shell syntax: each of these, accepted, would make `( cd <wt> && <cmd> )` run
+    /// something other than `cd` and the command, or `cd` somewhere other than it reads.
+    #[test]
+    fn a_worktree_path_cannot_smuggle_a_second_command() {
+        for good in ["/tmp/wt", "/Users/me/src/tachyon-wt_2", "/home/jos\u{e9}/wt", "/a/b.c/d-e+f@g%h=i,j:k", "/"] {
+            assert_eq!(parse_worktree(good).as_deref(), Ok(good), "{good:?}");
+            assert_eq!(parse_agent(&format!("/mcp agent worktree codex {good}")),
+                       Some(Ok(AgentCmd::Worktree("codex".into(), Some(good.into())))));
+        }
+        let bad = [
+            // not absolute: means a different place per shell cwd, and `-P` would be a flag
+            "", "wt", "./wt", "../wt", "~/wt", "-P", "off/wt",
+            // quotes, space, backslash, expansion, separators
+            "/tmp/a'b", "/tmp/a\"b", "/tmp/a b", "/tmp/a\\b", "/tmp/$HOME", "/tmp/${IFS}x", "/tmp/`id`",
+            "/tmp/a;id", "/tmp/a&&id", "/tmp/a&", "/tmp/a|sh", "/tmp/a)", "/tmp/(a", "/tmp/a>f", "/tmp/a<f",
+            // history, globs, braces, a comment that would swallow the rest of the line
+            "/tmp/!!", "/tmp/*", "/tmp/a?", "/tmp/[ab]", "/tmp/{a,b}", "/tmp/#", "/tmp/~",
+            // control and invisible characters, and the line breaks one_line would fold. Mid-path:
+            // the slash tokenizer drops trailing whitespace before a path ever sees it.
+            "/tmp/a\nb", "/tmp/a\rb", "/tmp/a\tb", "/tmp/a\x1b[2J", "/tmp/a\u{7f}", "/tmp/a\u{202e}",
+            "/tmp/a\u{200b}", "/tmp/a\u{feff}", "/tmp/a\u{a0}b", "/tmp/a\u{2028}b", "/tmp/a\u{e0041}",
+        ];
+        for path in bad {
+            assert!(parse_worktree(path).is_err(), "accepted {path:?}");
+            // and on every road in: the add flag, the worktree verb, and a hand-edited file
+            assert!(!matches!(parse_agent(&format!("/mcp agent add codex --worktree {path}")),
+                              Some(Ok(AgentCmd::Add(_, _, Some(_))))), "{path:?}");
+            assert!(!matches!(parse_agent(&format!("/mcp agent worktree codex {path}")),
+                              Some(Ok(AgentCmd::Worktree(_, Some(_))))), "{path:?}");
+            assert!(in_worktree(&json!({ "command": "ls" }), Some(path)).is_err(), "{path:?}");
+        }
+    }
+
+    /// R3: the worktree is applied to the raw command BEFORE `parse_run_args`, so the danger
+    /// check, the proposal (what the bar shows), the PTY write and `wait_block`'s matcher all
+    /// see ONE string. Followed here through the pure helpers, the dispatch and the Stub, and
+    /// into `run_gated` by reading it, since that needs an AppHandle.
+    #[test]
+    fn a_worktree_command_is_one_string_end_to_end() {
+        let _l = props();
+        let wt = "/tmp/wt-codex";
+        assert_eq!(wrap_for_worktree("rm -rf ~", wt), "( cd /tmp/wt-codex && rm -rf ~ )");
+
+        let stub = Stub::default();
+        let worker = Caller { worktree: Some(wt.into()), ..caller("wtworker", &[SCOPE_PROPOSE]) };
+        let run = |cmd: &str| tool(&stub, &worker, "run_command", json!({ "command": cmd }));
+        let r = run("ls -la");
+        assert_eq!(r["isError"], false, "{r}");
+        // the multi-line fold happens INSIDE the subshell, so no line escapes the worktree
+        assert_eq!(run("echo a\necho b")["isError"], false);
+        let shown = "( cd /tmp/wt-codex && ls -la )";
+        assert_eq!(*stub.log.lock().unwrap(), [shown, "( cd /tmp/wt-codex && echo a; echo b )"]);
+        assert_eq!(text_of(&r), format!("Exit code: 0\nOutput:\nran {shown}"), "the record holds another string");
+        // what the bar is told is dangerous is the wrapped string, and it still reads through
+        assert!(is_dangerous(&parse_run_args(&in_worktree(&json!({ "command": "rm -rf ~" }), Some(wt)).unwrap()).unwrap()));
+        // wrapping never launders a refusal: a tab is still refused, a blank is still empty
+        for (raw, why) in [("ls\t", "control"), ("  ", "empty")] {
+            let r = run(raw);
+            assert_eq!(r["isError"], true, "{raw:?}: {r}");
+            assert!(text_of(&r).contains(why), "{raw:?}: {r}");
+        }
+        assert_eq!(stub.log.lock().unwrap().len(), 2, "a refused command reached the terminal");
+
+        // `wait_block` correlates on that same string: the journal records what was typed
+        // (`set_typed(cmd)`), so the wrapped Block matches and the bare command never does.
+        tauri::async_runtime::block_on(async {
+            let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+            let block = |c: &str| Block { command: c.into(), exit_code: 3, output: String::new(), duration_ms: 0 };
+            assert!(tx.send(block(shown)).is_ok());
+            let short = Some(Duration::from_millis(100));
+            assert!(wait_block(&mut rx, "ls -la", short, || false).await.is_none());
+            assert!(tx.send(block(shown)).is_ok());
+            assert_eq!(wait_block(&mut rx, shown, short, || false).await.map(|b| b.exit_code), Some(3));
+        });
+
+        // The rest is `run_gated`, which cannot run here: the string the dispatch validated is
+        // the one every step uses, and nothing in between rebinds it.
+        let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
+        let body_of = |name: &str| {
+            let at = live.find(name).unwrap_or_else(|| panic!("{name} is gone"));
+            &live[at..][..live[at..].find("\n}\n").unwrap()]
+        };
+        let dispatch = body_of("fn call_tool(");
+        assert!(dispatch.contains("let cmd = parse_run_args(&in_worktree(args, caller.worktree.as_deref())?)?;"), "the wrapper moved off the raw command");
+        assert!(dispatch.contains("backend.run_command(caller, &cmd, wait)"));
+        let gated = body_of("async fn run_gated(");
+        for step in ["\"text\": cmd,", "\"danger\": is_dangerous(cmd)", "set_typed(cmd.to_string())",
+                     "pty_write_internal(&app.state::<PtyState>(), &format!(\"{cmd}\\n\"))", "wait_end(&mut rx, cmd, Some("] {
+            assert!(gated.contains(step), "run_gated no longer uses the one string at: {step}");
+        }
+        // Every wait for the command's end goes through the foreground check (R21): a bare
+        // Block can be forged by the command's own output.
+        assert!(!gated.contains("wait_block("), "run_gated trusts a bare Block again");
+        assert!(!gated.contains("let cmd") && !gated.contains("let mut cmd"), "run_gated rebinds the command");
+    }
+
+    /// BAR-1: the bar keys an external proposal by its id, so the propose and the done must both
+    /// carry it, and `run_gated` must not emit the built-in agent's `agent-status` step counter,
+    /// which names no proposal and would render as `thinking… (0/12)` over whatever bar is up.
+    #[test]
+    fn run_gated_speaks_per_proposal() {
+        let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
+        let at = live.find("async fn run_gated(").expect("run_gated is gone");
+        let gated = &live[at..][..live[at..].find("\n}\n").unwrap()];
+        assert!(!gated.contains("\"agent-status\""), "run_gated emits agent-status again");
+        assert_eq!(gated.matches("\"proposal_id\": proposal.id").count(), 2, "propose and done must both name the proposal");
+        let done = gated.find("emit(\"agent-done\"").expect("run_gated no longer ends the bar");
+        assert!(gated[done..].contains("\"agent\": proposal.agent"), "agent-done no longer names the agent");
+    }
+
+    /// There is no tool argument for a worktree: it comes from the registry, like the name. A
+    /// client that sends one anyway is ignored, exactly as a smuggled `from` is.
+    #[test]
+    fn a_smuggled_worktree_argument_is_ignored() {
+        let _l = props();
+        for t in all_tools().as_array().unwrap() {
+            assert!(t["inputSchema"]["properties"].get("worktree").is_none(), "{} takes a worktree", t["name"]);
+        }
+        let stub = Stub::default();
+        let plain = caller("wtplain", &[SCOPE_PROPOSE]);
+        let bound = Caller { worktree: Some("/tmp/wt-bound".into()), ..caller("wtbound", &[SCOPE_PROPOSE]) };
+        for who in [&plain, &bound] {
+            for args in [json!({ "command": "ls" }), json!({ "command": "ls", "worktree": "/; rm -rf ~" })] {
+                let r = tool(&stub, who, "run_command", args);
+                assert_eq!(r["isError"], false, "{r}");
+            }
+        }
+        assert_eq!(*stub.log.lock().unwrap(), ["ls", "ls", "( cd /tmp/wt-bound && ls )", "( cd /tmp/wt-bound && ls )"]);
+    }
+
     #[test]
     fn a_name_is_minted_once_and_a_revoke_removes_exactly_one() {
         let _l = props(); // a revoke also clears that name's proposal records
         let mut cfg = ServeConfig::default();
-        add_agent(&mut cfg, "codex".into(), vec!["read".into()]).unwrap();
-        add_agent(&mut cfg, "cursor".into(), vec!["read".into()]).unwrap();
-        assert!(add_agent(&mut cfg, "codex".into(), vec!["read".into()]).is_err(), "a duplicate name was minted");
+        add_agent(&mut cfg, "codex".into(), vec!["read".into()], None).unwrap();
+        add_agent(&mut cfg, "cursor".into(), vec!["read".into()], Some("/tmp/wt".into())).unwrap();
+        assert!(add_agent(&mut cfg, "codex".into(), vec!["read".into()], None).is_err(), "a duplicate name was minted");
+        assert_eq!(cfg.agents[1].worktree.as_deref(), Some("/tmp/wt"));
+        // a worktree is set and cleared on ONE agent, and an unknown name is refused
+        set_worktree(&mut cfg, "codex", Some("/tmp/wt-codex".into())).unwrap();
+        set_worktree(&mut cfg, "cursor", None).unwrap();
+        assert_eq!(cfg.agents.iter().map(|a| a.worktree.as_deref()).collect::<Vec<_>>(), [Some("/tmp/wt-codex"), None]);
+        assert!(set_worktree(&mut cfg, "nobody", None).is_err());
+        assert!(render_worktree(&cfg.agents[0]).contains("( cd /tmp/wt-codex && "));
+        assert_eq!(render_worktree(&cfg.agents[1]), "");
         assert_eq!(cfg.agents.len(), 2);
         // two agents, two different tokens, each usable
         assert_ne!(cfg.agents[0].token, cfg.agents[1].token);
@@ -3084,9 +3836,10 @@ mod tests {
         threads.into_iter().map(|t| t.join().expect("client thread")).collect()
     }
 
-    /// The point of the single approval slot: N external agents shout at once, one drives
-    /// and the rest are told so. `hold_until` keeps the winner inside until all N have
-    /// arrived, so this fails on a broken gate rather than on a slow machine.
+    /// The point of the turn: N external agents shout at once, and each drives the terminal
+    /// once, one after another, with no retry loop — the rest wait in the queue inside their
+    /// own call. `hold_until` keeps the first holder inside until all N have arrived, so every
+    /// other client provably queued behind a live turn rather than finding the shell free.
     #[test]
     fn eight_simultaneous_run_commands_reach_the_terminal_once() {
         const N: u64 = 8;
@@ -3099,14 +3852,16 @@ mod tests {
         let results = agents(N, &url);
         server.unblock();
 
-        let busy: Vec<&Value> = results.iter().filter(|v| v["result"]["isError"] == true).collect();
-        assert_eq!(busy.len(), (N - 1) as usize, "{results:#?}");
-        for v in busy {
-            assert_eq!(v["result"]["content"][0]["text"], BUSY);
+        for v in &results {
+            assert_eq!(v["result"]["isError"], false, "a queued client was refused: {v}");
         }
         assert_eq!(stub.attempts.load(SeqCst), N as usize, "a client never reached the backend");
-        assert_eq!(stub.log.lock().unwrap().len(), 1, "more than one agent drove the terminal");
-        assert_eq!(stub.peak.load(SeqCst), 1);
+        let mut log = stub.log.lock().unwrap().clone();
+        log.sort();
+        assert_eq!(log, (0..N).map(|id| format!("agent {id}")).collect::<Vec<_>>(), "not one write per agent");
+        assert_eq!(stub.peak.load(SeqCst), 1, "two agents drove the terminal at once");
+        assert_eq!(stub.grants.load(SeqCst), N as usize, "not one grant per client");
+        assert!(turn().holder().is_none(), "a turn run_command took for itself outlived its command");
     }
 
     /// Handing the slot over eight times in a row: everyone gets a turn, never two at once.
@@ -3156,6 +3911,156 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["result"]["isError"], false);
         assert!(!stub.slot.running.load(SeqCst), "the unwind left the slot claimed");
         assert!(stub.holder.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+    }
+
+    // ---- C12a: the turn under load ----
+
+    /// One observation, inside ONE critical section of `TURN` — the lock `apply` holds while it
+    /// takes or drops a guard, so nothing can move between the reads. R11: a holder exactly
+    /// while the slot is claimed, and the guard is that holder's. The ledger: a live guard
+    /// exactly while there is a holder, so no grant is left unended and none is ended twice (a
+    /// second drop would wrap `inside`).
+    fn observe(stub: &Stub) -> Result<(), String> {
+        let lock = turn();
+        let holder = lock.holder().map(|h| h.ticket);
+        let guard = TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(t, _)| *t);
+        let running = stub.slot.running.load(SeqCst);
+        let live = stub.inside.load(SeqCst);
+        if holder.is_some() != running {
+            return Err(format!("R11: holder {holder:?} but running = {running}"));
+        }
+        if holder != guard {
+            return Err(format!("the guard {guard:?} is not the holder {holder:?}'s"));
+        }
+        if live != usize::from(holder.is_some()) {
+            return Err(format!("{live} live guard(s) for holder {holder:?}"));
+        }
+        Ok(())
+    }
+
+    fn tool_call(id: u64, tool: &str, args: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": tool, "arguments": args } })
+    }
+
+    /// C12a, M3's exit gate. Eight agents hammer request_turn / run_command / release_turn
+    /// through `call_tool` for 5 s — the real TURN, TURN_GUARD and proposal store, the Stub's
+    /// slot as `AgentState` — while a ninth thread runs `observe` as fast as it can. Each
+    /// agent's call stream is fixed by its seed (a tiny LCG); the interleaving is the OS's.
+    /// Everything, draining included, inside a 10 s wall clock: past it is a deadlock.
+    /// MUTATIONS: making `apply`'s Revoked arm a no-op, or dropping the guard in its Granted
+    /// arm instead of storing it, turns the observer red; taking TURN_GUARD before TURN in
+    /// `touch` (the lock order inverted) deadlocks, and the 10 s bound turns red.
+    #[test]
+    fn eight_agents_hammering_the_turn_hold_every_invariant() {
+        const N: u64 = 8;
+        let _props = props();
+        let stub = Arc::new(Stub::default());
+        let start = std::time::Instant::now();
+        let (stop, bound) = (start + Duration::from_secs(5), start + Duration::from_secs(10));
+        let quit = Arc::new(AtomicBool::new(false));
+
+        let observer = {
+            let (stub, quit) = (stub.clone(), quit.clone());
+            std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !quit.load(SeqCst) {
+                    observe(&stub).unwrap_or_else(|broken| panic!("observation {seen}: {broken}"));
+                    seen += 1;
+                }
+                seen
+            })
+        };
+        let (done, finished) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..N)
+            .map(|id| {
+                let (stub, done) = (stub.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let me = caller(&format!("agent{id}"), &SCOPES);
+                    let mut x = 0x9E37_79B9_7F4A_7C15 ^ id;
+                    let mut next = move || {
+                        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                        x >> 33
+                    };
+                    let mut ok = [0u64; 3]; // request_turn, run_command, release_turn
+                    let mut n = 0;
+                    while std::time::Instant::now() < stop {
+                        n += 1;
+                        let op = (next() % 3) as usize;
+                        let wait = [0, 10, 50, 200][(next() % 4) as usize];
+                        let call = match op {
+                            0 => tool_call(n, "request_turn", json!({ "wait_ms": wait })),
+                            1 => tool_call(n, "run_command", json!({ "command": format!("echo {id}.{n}"), "wait_ms": wait })),
+                            _ => tool_call(n, "release_turn", json!({})),
+                        };
+                        let v = rpc_as(&stub, &me, call);
+                        assert!(v.get("error").is_none(), "agent {id}: a protocol error: {v}");
+                        ok[op] += u64::from(v["result"]["isError"] == false);
+                    }
+                    let _ = done.send(());
+                    ok
+                })
+            })
+            .collect();
+        drop(done);
+        for _ in 0..N {
+            // A panicking worker drops its sender, so this fails fast for a panic too.
+            let left = bound.saturating_duration_since(std::time::Instant::now());
+            finished.recv_timeout(left).unwrap_or_else(|e| panic!("a worker panicked or deadlocked: {e:?}"));
+        }
+        let ok = workers.into_iter().map(|w| w.join().expect("worker")).fold([0; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+        // A run_command that answered with a proposal id is still being carried out.
+        while proposals::pending().is_some() {
+            assert!(std::time::Instant::now() < bound, "a proposal never settled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        quit.store(true, SeqCst);
+        let observations = observer.join().expect("an invariant broke under load");
+        assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
+
+        // Kept turns (request_turn with no release) end here, and must end like any other.
+        clear_turn();
+        observe(&stub).unwrap();
+        assert!(turn().holder().is_none() && !stub.slot.running.load(SeqCst));
+        assert_eq!(stub.inside.load(SeqCst), 0, "a grant was never matched by a release or revoke");
+        assert_eq!(stub.peak.load(SeqCst), 1, "two guards were live at once");
+        // Not vacuous: every road was driven, and the turn changed hands many times.
+        let grants = stub.grants.load(SeqCst);
+        assert!(ok.iter().all(|&k| k > 0) && grants > 4 * N as usize, "too little happened: ok {ok:?}, {grants} grants");
+        assert!(observations > 1000, "only {observations} observations");
+        println!("C12a: {grants} grants, ok {ok:?} (request, run, release), {observations} observations in {:?}", start.elapsed());
+    }
+
+    /// C12a: a client that dies holding the turn — request_turn, then nothing, ever — does not
+    /// keep the shell. The lease frees it after 60 s of silence, the clock injected rather
+    /// than waited out, and the next agent is granted at once. MUTATIONS: making `sweep`'s
+    /// lease check never fire turns "the lease" red; making `apply`'s Revoked arm a no-op
+    /// leaves the dead holder's guard behind, and the observation after the lease turns red.
+    #[test]
+    fn a_holder_that_dies_without_releasing_loses_the_shell_to_the_lease() {
+        let _props = props();
+        let stub = Arc::new(Stub::default());
+        let ask = tool_call(1, "request_turn", json!({ "wait_ms": 0 }));
+        let (s, a) = (stub.clone(), ask.clone());
+        let v = std::thread::spawn(move || rpc_as(&s, &caller("crashed", &SCOPES), a)).join().unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        // The thread is gone and never released. Its last sign of life is the grant itself.
+        let since = turn().holder().filter(|h| h.agent == "crashed").map(|h| h.since).expect("the dead thread's turn");
+        observe(&stub).unwrap();
+
+        let claim = stub.claim();
+        via_apply(&claim, |l| l.sweep(since + coord::LEASE_IDLE - Duration::from_millis(1)));
+        assert!(turn().holder().is_some(), "revoked before the lease ran out");
+        via_apply(&claim, |l| l.sweep(since + coord::LEASE_IDLE));
+        observe(&stub).unwrap();
+        assert!(turn().holder().is_none(), "the lease did not free a dead holder's shell");
+        assert!(!stub.slot.running.load(SeqCst), "the dead holder's guard still claims the slot");
+
+        let v = rpc_as(&stub, &caller("next", &SCOPES), ask);
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        assert_eq!(turn().holder().map(|h| h.agent.clone()).as_deref(), Some("next"));
+        observe(&stub).unwrap();
+        assert_eq!((stub.grants.load(SeqCst), stub.inside.load(SeqCst)), (2, 1));
+        clear_turn();
     }
 
     /// C9. A token holder that sends headers and never the body parks one handler thread per
@@ -3253,10 +4158,34 @@ mod tests {
     /// this for its duration and starts from an empty store.
     static PROPOSALS_LOCK: Mutex<()> = Mutex::new(());
 
+    /// `TURN` is process-global too, and every test that proposes goes through it, so the
+    /// same guard serialises both and starts both empty.
     fn props() -> std::sync::MutexGuard<'static, ()> {
         let guard = PROPOSALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         proposals::reset();
+        clear_turn();
         guard
+    }
+
+    /// Ends whatever turn a previous test left, through `apply` like every other road.
+    fn clear_turn() {
+        let now = std::time::Instant::now();
+        let mut lock = turn();
+        let waiters: Vec<String> = lock.waiters().map(|w| w.agent.clone()).collect();
+        let mut events = Vec::new();
+        for w in waiters {
+            events.extend(lock.release(&w, now));
+        }
+        if let Some((ticket, agent)) = lock.holder().map(|h| (h.ticket, h.agent.clone())) {
+            events.extend(lock.set_state(ticket, coord::HolderState::Idle, now));
+            events.extend(lock.release(&agent, now));
+        }
+        apply(&mut lock, events, &no_claim());
+    }
+
+    /// For a record that runs under no turn (ticket 0 is never issued) and ends none.
+    fn no_claim() -> Claim {
+        Arc::new(|| None)
     }
 
     /// What `peek` reports to this agent, and nothing else — the tests below never reach past
@@ -3277,12 +4206,21 @@ mod tests {
         }
     }
 
-    /// A claimed slot and a proposal that owns the claim — `run_gated`'s first three lines.
+    /// `open_gate`'s claimer over a plain slot.
+    fn slot_claim(slot: &Arc<AgentState>) -> Claim {
+        let slot = slot.clone();
+        Arc::new(move || {
+            agent_claim(&slot).ok()?;
+            Some(Box::new(SlotGuard(slot.clone())) as Box<dyn Send>)
+        })
+    }
+
+    /// A turn taken on a fresh slot and a proposal run under it — `open_gate`, minus the app.
     fn proposed(agent: &str, command: &str) -> (Arc<AgentState>, PropGuard) {
         let slot = Arc::new(AgentState::default());
-        agent_claim(&slot).expect("a fresh slot is free");
-        let p = proposals::propose(agent, command, Box::new(SlotGuard(slot.clone())));
-        (slot, p)
+        let claim = slot_claim(&slot);
+        let held = take_turn(agent, &claim, Duration::ZERO).expect("the shell is free");
+        (slot, proposals::propose(agent, command, held, claim))
     }
 
     /// Another agent's id and an id that never existed get the SAME answer, so a caller
@@ -3296,7 +4234,7 @@ mod tests {
         assert_eq!(state_of("p_1000000", "cursor"), None);
         // ...and a foreign id cannot MOVE the record either: `mark` matches the agent too.
         // A real guard of cursor's, aimed at codex's record — the strongest form of the ask.
-        let (_theirs, mut foreign) = proposed("cursor", "other");
+        let mut foreign = proposals::propose("cursor", "other", Held::default(), no_claim());
         foreign.id = p.id.clone();
         foreign.mark(State::Done);
         assert_eq!(state_of(&p.id, "codex"), Some(State::Shown));
@@ -3311,7 +4249,7 @@ mod tests {
         // Not `codex`: `SEEN` is process-global and every `rpc()` test runs as `caller_all()`,
         // whose handshake re-inserts `codex` between the revoke and the assert below.
         let mut cfg = ServeConfig::default();
-        add_agent(&mut cfg, "revokee".into(), vec![SCOPE_PROPOSE.into()]).unwrap();
+        add_agent(&mut cfg, "revokee".into(), vec![SCOPE_PROPOSE.into()], None).unwrap();
         let fresh = caller("revokee", &[SCOPE_PROPOSE]);
         note_seen(&fresh, Some("codex-cli/1.0".into()));
         let (_slot, done) = proposed("revokee", "cat /etc/passwd");
@@ -3354,7 +4292,7 @@ mod tests {
     }
 
     /// The ORDER of the release: the slot is free before the verdict is visible, so a client
-    /// told "done" that re-proposes at once never meets a spurious BUSY. Released after, it
+    /// told "done" that re-proposes at once never meets a spurious busy. Released after, it
     /// was a race the client won whenever the scheduler parked the worker between the two —
     /// which is how `eight_sequential_run_commands_never_overlap`, `tools_call_results` and
     /// `a_panicking_holder_frees_the_slot` flaked. The guard itself looks at the record as it
@@ -3371,7 +4309,9 @@ mod tests {
         for end in [State::Done, State::Denied, State::Cancelled] {
             let _l = props();
             let (id, seen) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
-            let p = proposals::propose("codex", "ls", Box::new(Peeker(id.clone(), seen.clone())));
+            let (i, s) = (id.clone(), seen.clone());
+            let claim: Claim = Arc::new(move || Some(Box::new(Peeker(i.clone(), s.clone())) as Box<dyn Send>));
+            let p = proposals::propose("codex", "ls", take_turn("codex", &claim, Duration::ZERO).unwrap(), claim);
             *id.lock().unwrap() = Some(p.id.clone());
             p.settle(end, String::new());
             assert_eq!(*seen.lock().unwrap(), Some(State::Shown), "{end:?} was visible before the slot was free");
@@ -3397,7 +4337,7 @@ mod tests {
         }
         // and once the ring has evicted it, both sides read false together
         for _ in 0..proposals::MAX {
-            proposals::propose("codex", "filler", Box::new(())).mark(State::Done);
+            proposals::propose("codex", "filler", Held::default(), no_claim()).mark(State::Done);
         }
         assert_eq!(state_of(&p.id, "codex"), None);
         agree("evicted");
@@ -3410,12 +4350,13 @@ mod tests {
     fn a_panicking_worker_cancels_its_proposal_and_frees_the_slot() {
         let _l = props();
         let slot = Arc::new(AgentState::default());
-        agent_claim(&slot).unwrap();
+        let claim = slot_claim(&slot);
+        let ticket = take_turn("codex", &claim, Duration::ZERO).unwrap();
         let id = Arc::new(Mutex::new(String::new()));
 
-        let (s, i) = (slot.clone(), id.clone());
+        let i = id.clone();
         let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let p = proposals::propose("codex", "boom", Box::new(SlotGuard(s)));
+            let p = proposals::propose("codex", "boom", ticket, claim);
             *i.lock().unwrap_or_else(|e| e.into_inner()) = p.id.clone();
             p.mark(State::Running);
             panic!("worker died mid-command");
@@ -3425,6 +4366,471 @@ mod tests {
         let id = id.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(state_of(&id, "codex"), Some(State::Cancelled), "the unwind left the record live");
         assert!(!slot.running.load(SeqCst), "the unwind left the approval slot claimed");
+    }
+
+    // ---- the turn (TL-1) ----
+
+    /// R11 over `slot`: the lock has a holder exactly while the approval slot is claimed, and
+    /// the guard slot holds that holder's ticket and no other.
+    fn agree(slot: &AgentState, at: &str) {
+        let holder = turn().holder().map(|h| h.ticket);
+        let guard = TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(t, _)| *t);
+        assert_eq!(holder.is_some(), slot.running.load(SeqCst), "at {at}: a holder and the approval slot disagree");
+        assert_eq!(holder, guard, "at {at}: the guard is not the holder's");
+    }
+
+    fn holder_state() -> Option<coord::HolderState> {
+        turn().holder().map(|h| h.state)
+    }
+
+    /// One lock operation through `apply`. The ops take their instant from the caller, so the
+    /// clock rules are asserted at their boundaries rather than waited out.
+    fn via_apply(claim: &Claim, op: impl FnOnce(&mut coord::TurnLock) -> Vec<coord::Event>) {
+        let mut lock = turn();
+        let events = op(&mut lock);
+        apply(&mut lock, events, claim);
+    }
+
+    /// R11: `TURN.holder.is_some() == AgentState.running`, and the guard is the holder's, after
+    /// every kind of transition — grant, release, a lease revoke that grants the next waiter,
+    /// preempt, a grant ⌘J beat, and an unwind. MUTATIONS: dropping `drop(slot.take())` in
+    /// `apply`'s Revoked arm turns "release" red; replacing its `requeue_holder` fallback
+    /// with `{}` turns "⌘J holds the slot" red; deleting `take_turn`'s AwaitingHuman
+    /// `set_state` turns "no approval timeout" red; deleting `end_turn` from `settle` turns
+    /// "unwind" red.
+    #[test]
+    fn r11_one_holder_one_guard_at_every_transition() {
+        let _l = props();
+        let slot = Arc::new(AgentState::default());
+        let claim = slot_claim(&slot);
+        agree(&slot, "start");
+
+        let a = take_turn("r11a", &claim, Duration::ZERO).unwrap();
+        agree(&slot, "grant");
+        assert_eq!(holder_state(), Some(coord::HolderState::AwaitingHuman));
+        end_turn(a, &claim);
+        agree(&slot, "release");
+        assert!(turn().holder().is_none(), "end_turn left a holder");
+
+        // The lease, with the clock injected: a silent Idle holder is revoked and the next
+        // waiter is granted by the same sweep — the guard moves with it.
+        let t0 = std::time::Instant::now();
+        via_apply(&claim, |l| l.request("r11a", t0, false).1);
+        via_apply(&claim, |l| l.request("r11b", t0, false).1);
+        agree(&slot, "grant at t0, one waiter");
+        let t1 = t0 + coord::LEASE_IDLE;
+        via_apply(&claim, |l| l.touch("r11b", t1));
+        assert_eq!(turn().holder().map(|h| h.agent.clone()).as_deref(), Some("r11b"), "the lease did not hand on");
+        agree(&slot, "lease revoke + grant");
+
+        // ⌘J's hook: an Idle holder is preempted and the slot is free for `agent_claim`.
+        preempt_if_idle();
+        agree(&slot, "preempt");
+        assert!(turn().holder().is_none(), "an Idle holder survived the preempt");
+        assert!(agent_claim(&slot).is_ok(), "the preempt left ⌘J nothing to claim");
+
+        // ⌘J holds the slot: a grant whose claim fails is taken straight back, never left
+        // holding the shell with no guard.
+        // (R11 is about turns: ⌘J's claim is `running` with no holder, by design.)
+        let busy: Value = serde_json::from_str(&take_turn("r11c", &claim, Duration::ZERO).unwrap_err()).unwrap();
+        assert_eq!((busy["holder"].clone(), busy["holder_state"].clone()), (Value::Null, json!("builtin_agent")));
+        assert!(turn().holder().is_none(), "⌘J holds the slot: a grant with no guard was left holding the shell");
+        assert!(TURN_GUARD.lock().unwrap().is_none());
+        assert!(slot.running.load(SeqCst), "the failed grant released ⌘J's claim");
+        slot.running.store(false, SeqCst); // ⌘J's own guard, dropping
+
+        // A proposal on the bar is not preemptible and has no approval timeout.
+        let c = take_turn("r11c", &claim, Duration::ZERO).unwrap();
+        preempt_if_idle();
+        agree(&slot, "preempt refused while AwaitingHuman");
+        let late = std::time::Instant::now() + coord::MAX_TURN + coord::LEASE_IDLE;
+        via_apply(&claim, |l| l.sweep(late));
+        agree(&slot, "no approval timeout");
+        assert_eq!(turn().holder().map(|h| h.ticket), Some(c.ticket), "the human's reading time revoked the turn");
+
+        // An unwind in the worker: `PropGuard`'s Drop settles the record, which ends the turn.
+        let p = claim.clone();
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let prop = proposals::propose("r11c", "boom", c, p);
+            prop.mark(State::Running);
+            panic!("worker died mid-command");
+        }));
+        assert!(died.is_err());
+        agree(&slot, "unwind");
+        assert!(turn().holder().is_none(), "the unwind left the turn held");
+    }
+
+    /// R2 through the turn: a turn cancelled while its proposal is on the bar drops the parked
+    /// sender, so the proposal resolves to a denial and nothing is written. The worker below is
+    /// `run_gated`'s spine — `agent_propose`'s park-and-await, then the write lexically after the
+    /// approval check. MUTATION: dropping `drop(slot.take())` in `apply`'s Revoked arm leaves the
+    /// sender parked, and the worker never answers ("the cancel left the bar up").
+    #[test]
+    fn a_turn_cancelled_while_awaiting_the_human_denies_and_never_writes() {
+        let _l = props();
+        let slot = Arc::new(AgentState::default());
+        let claim = slot_claim(&slot);
+        let ticket = take_turn("r2a", &claim, Duration::ZERO).unwrap();
+        let p = proposals::propose("r2a", "ls", ticket, claim.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        *slot.decision.lock().unwrap() = Some(tx);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let w = writes.clone();
+        std::thread::spawn(move || {
+            let approved = rx.blocking_recv().unwrap_or(false);
+            if approved {
+                w.fetch_add(1, SeqCst);
+            }
+            p.settle(if approved { State::Done } else { State::Denied }, String::new());
+            let _ = done_tx.send(approved);
+        });
+        assert_eq!(holder_state(), Some(coord::HolderState::AwaitingHuman));
+
+        let now = std::time::Instant::now();
+        via_apply(&claim, |l| l.release("r2a", now));
+
+        let approved = done_rx.recv_timeout(Duration::from_secs(5)).expect("the cancel left the bar up");
+        assert!(!approved, "a cancelled proposal was approved");
+        assert_eq!(writes.load(SeqCst), 0, "a cancelled proposal reached the pty");
+        agree(&slot, "cancel");
+    }
+
+    /// SIGN-OFF #1: exactly one function takes or drops the approval slot's guard. MUTATION: a
+    /// `TURN_GUARD.lock()` anywhere outside `apply` turns this red.
+    #[test]
+    fn the_turn_guard_is_written_only_in_apply() {
+        let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
+        let start = live.find("\nfn apply(").expect("apply is gone");
+        let end = start + live[start..].find("\n}\n").expect("unterminated fn");
+        let sites: Vec<usize> = live
+            .match_indices("TURN_GUARD")
+            .map(|(i, _)| i)
+            .filter(|i| !live[..*i].ends_with("static "))
+            .collect();
+        assert!(sites.len() >= 2, "the scan went vacuous");
+        assert!(sites.iter().all(|i| (start..end).contains(i)), "the guard is touched outside apply");
+        // and the proposal record holds a ticket, not a guard
+        assert!(!live.contains("_guard: Option<Box<dyn Send>>"), "the record owns a guard again");
+    }
+
+    /// agent.rs is untouchable but for ONE line: the preempt hook at the top of `agent_start`.
+    /// Pinned whole, so anything else added to `agent_start` fails here. MUTATION: deleting the
+    /// hook, or adding a second call anywhere in agent.rs, turns this red.
+    #[test]
+    fn agent_start_gains_only_the_preempt_hook() {
+        let agent = include_str!("agent.rs");
+        assert!(agent.contains(concat!(
+            "pub(crate) fn agent_start(app: AppHandle, task: String) -> Result<(), String> {\n",
+            "    crate::mcp_server::preempt_if_idle();\n",
+            "    agent_claim(&app.state::<AgentState>())?;\n",
+            "    tauri::async_runtime::spawn(agent_loop(app, task));\n",
+            "    Ok(())\n",
+            "}\n",
+        )), "agent_start changed beyond the preempt hook");
+        assert_eq!(agent.matches("preempt_if_idle").count(), 1);
+    }
+
+    // ---- the turn over the wire (TL-2) ----
+
+    fn holder_of() -> Option<(String, coord::HolderState)> {
+        turn().holder().map(|h| (h.agent.clone(), h.state))
+    }
+
+    /// A turn asked for with `request_turn` is held across commands; one `run_command` took for
+    /// itself is released when its command ends; a denial ends either. A second agent waits its
+    /// window out in the queue and is told where it stands. MUTATIONS: `keep: false` in
+    /// `wait_turn`'s `Held` turns "kept" red; dropping `if !held.keep` in `end_turn` turns
+    /// "released on the block" red; `..self.held` for the denial turns "a denial" red.
+    #[test]
+    fn a_requested_turn_outlives_its_commands_and_queues_the_rest() {
+        let _l = props();
+        let stub = Stub::default();
+        let (a, b) = (caller("tl1", &[SCOPE_PROPOSE]), caller("tl2", &[SCOPE_PROPOSE]));
+        let json_of = |r: &Value| serde_json::from_str::<Value>(text_of(r)).unwrap_or_else(|_| panic!("not JSON: {r}"));
+
+        let got = tool(&stub, &a, "request_turn", json!({ "wait_ms": 0 }));
+        assert_eq!(got["isError"], false, "{got}");
+        assert_eq!(json_of(&got)["holder_state"], "idle");
+        // idempotent: the holder asking again is handed the same ticket
+        assert_eq!(json_of(&tool(&stub, &a, "request_turn", json!({ "wait_ms": 0 })))["ticket"], json_of(&got)["ticket"]);
+
+        let asked = std::time::Instant::now();
+        let busy = tool(&stub, &b, "request_turn", json!({ "wait_ms": 200 }));
+        assert!(asked.elapsed() >= Duration::from_millis(150), "the queued caller did not wait: {:?}", asked.elapsed());
+        assert_eq!(busy["isError"], true);
+        let busy = json_of(&busy);
+        assert!(busy["eta_ms"].as_u64().is_some_and(|ms| ms <= 60_000), "an idle holder's lease has an end: {busy}");
+        assert_eq!(
+            busy,
+            json!({ "error": "busy", "position": 1, "holder": "tl1", "holder_state": "idle", "eta_ms": busy["eta_ms"], "retry_after_ms": RETRY_AFTER_MS })
+        );
+
+        // kept: the command ends and the turn stays with the agent that asked for it, Idle
+        assert_eq!(tool(&stub, &a, "run_command", json!({ "command": "ls" }))["isError"], false);
+        assert_eq!(holder_of(), Some(("tl1".into(), coord::HolderState::Idle)), "a requested turn ended with its command");
+        assert_eq!(text_of(&tool(&stub, &a, "run_command", json!({ "command": "pwd" }))).lines().next(), Some("Exit code: 0"));
+        assert_eq!(text_of(&tool(&stub, &a, "release_turn", json!({}))), "released");
+        // the queued agent was granted by that release, and asking again is how it learns so
+        assert_eq!(json_of(&tool(&stub, &b, "request_turn", json!({ "wait_ms": 0 })))["holder_state"], "idle");
+        assert_eq!(text_of(&tool(&stub, &b, "release_turn", json!({}))), "released");
+
+        // released on the block: a turn run_command took for itself keeps nothing
+        assert_eq!(tool(&stub, &b, "run_command", json!({ "command": "ls" }))["isError"], false);
+        assert_eq!(holder_of(), None, "a turn run_command took outlived its command");
+
+        // a denial ends even a kept turn (and quiets the bar: the last thing this test does)
+        assert_eq!(tool(&stub, &a, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        assert_eq!(text_of(&tool(&stub, &a, "run_command", json!({ "command": "rm -rf build" }))), DENIED);
+        assert_eq!(holder_of(), None, "a denial left the turn held");
+        assert_eq!(*stub.log.lock().unwrap(), ["ls", "pwd", "ls", "rm -rf build"], "a queued call reached the terminal");
+    }
+
+    /// R20: `release_turn` from anyone but the holder answers exactly as it does when nobody
+    /// holds the turn, and changes nothing — the tool is not an oracle for who has the shell.
+    /// A waiter's release gives up its place under the same answer. MUTATION: dropping
+    /// `.filter(|h| h.agent == agent)` in `release_turn` answers a stranger "released", red.
+    #[test]
+    fn release_turn_by_a_non_holder_answers_exactly_like_no_turn() {
+        let _l = props();
+        let stub = Stub::default();
+        let (a, b) = (caller("r20a", &[SCOPE_PROPOSE]), caller("r20b", &[SCOPE_PROPOSE]));
+        let nobody = tool(&stub, &b, "release_turn", json!({}));
+        assert_eq!((nobody["isError"].clone(), text_of(&nobody)), (json!(true), NO_TURN));
+
+        assert_eq!(tool(&stub, &a, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        let foreign = tool(&stub, &b, "release_turn", json!({}));
+        assert_eq!(foreign, nobody, "release_turn told a stranger someone holds the turn");
+        assert_eq!(holder_of(), Some(("r20a".into(), coord::HolderState::Idle)), "a stranger released the turn");
+
+        assert_eq!(tool(&stub, &b, "request_turn", json!({ "wait_ms": 0 }))["isError"], true);
+        assert_eq!(tool(&stub, &b, "release_turn", json!({})), nobody, "a waiter's release answered differently");
+        assert!(turn().waiters().next().is_none(), "the waiter kept its place");
+    }
+
+    /// TL-3: `/mcp turn release` over the Stub. A proposal on the bar loses its turn, and with it
+    /// the parked sender, so it resolves to a denial: the verdict is `DENIED`, never the stub's
+    /// "ran ls", which is its PTY write. The queued agent is granted by the same release.
+    /// MUTATION: dropping `apply(&mut lock, events, claim)` from `human_release` leaves the guard
+    /// and its sender in place, and the proposal stays `pending` ("the release left the bar up").
+    #[test]
+    fn the_humans_release_denies_a_shown_proposal_and_hands_the_turn_on() {
+        let _l = props();
+        let stub = Stub::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        *stub.human.lock().unwrap() = Some(rx);
+        let (a, b) = (caller("hr1", &[SCOPE_PROPOSE]), caller("hr2", &[SCOPE_PROPOSE]));
+
+        let shown = text_of(&tool(&stub, &a, "run_command", json!({ "command": "ls", "wait_ms": 0 }))).to_string();
+        // Parked after the claim, as `agent_propose` parks it (`agent_claim` drops a stale one):
+        // from here the approval slot's guard is what holds it.
+        *stub.slot.decision.lock().unwrap() = Some(tx);
+        let id = shown.split("proposal_id ").nth(1).and_then(|r| r.split('.').next()).unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!(tool(&stub, &b, "request_turn", json!({ "wait_ms": 0 }))["isError"], true, "hr2 is queued");
+        assert_eq!(holder_of(), Some(("hr1".into(), coord::HolderState::AwaitingHuman)));
+
+        let reply = human_release(&stub.claim()).unwrap();
+        assert!(reply.contains("released hr1's turn") && reply.contains("its proposal is denied"), "{reply}");
+        let verdict = tool(&stub, &a, "await_decision", json!({ "proposal_id": id, "wait_ms": 5000 }));
+        assert_eq!(text_of(&verdict), DENIED, "the release left the bar up, or the command ran: {verdict}");
+        assert_eq!(holder_of(), Some(("hr2".into(), coord::HolderState::Idle)), "the release did not hand the turn on");
+        assert!(stub.slot.running.load(SeqCst), "the next holder has no approval slot");
+    }
+
+    /// TL-3's refusals and its one warning. `Running` is refused by name and changes nothing;
+    /// `Unknown` is released, and says the command may still be running. MUTATIONS: deleting the
+    /// `Running` early return answers "released" with the holder still there ("a running command's
+    /// turn was released"); refusing `Unknown` as well turns "Unknown is the way out" red.
+    #[test]
+    fn the_humans_release_is_refused_while_running_and_warns_from_unknown() {
+        let _l = props();
+        let slot = Arc::new(AgentState::default());
+        let claim = slot_claim(&slot);
+        assert_eq!(human_release(&claim).unwrap(), "\r\n\x1b[36m[tachyon] no agent holds the turn\x1b[0m\r\n");
+
+        let held = take_turn("hr3", &claim, Duration::ZERO).unwrap();
+        assert!(set_turn(held.ticket, coord::HolderState::Running, &claim));
+        let refused = human_release(&claim).expect_err("a running command's turn was released");
+        assert!(refused.starts_with("refused: hr3's command is running"), "{refused}");
+        assert_eq!(holder_of(), Some(("hr3".into(), coord::HolderState::Running)));
+        agree(&slot, "refused while Running");
+
+        assert!(set_turn(held.ticket, coord::HolderState::Unknown, &claim));
+        let status = turn_status(&claim);
+        assert!(status.contains("hr3 \x1b[90mcommand_still_running for 0s"), "{status}");
+        let released = human_release(&claim).expect("Unknown is the way out");
+        assert!(released.contains("the last command may still be running"), "{released}");
+        assert!(turn().holder().is_none());
+        agree(&slot, "released from Unknown");
+    }
+
+    /// `/mcp turn` names the holder, its state, how long it has been in it, and the queue in
+    /// order; the parser takes exactly `turn` and `turn release`.
+    #[test]
+    fn mcp_turn_prints_the_holder_and_the_queue() {
+        let _l = props();
+        let slot = Arc::new(AgentState::default());
+        let claim = slot_claim(&slot);
+        assert!(turn_status(&claim).contains("no agent holds it"));
+        assert_eq!(take_turn("ts1", &claim, Duration::ZERO).map(|h| h.keep), Ok(false));
+        for w in ["ts2", "ts3"] {
+            assert!(take_turn(w, &claim, Duration::ZERO).is_err());
+        }
+        let status = turn_status(&claim);
+        assert!(status.contains("ts1 \x1b[90mawaiting_human for 0s"), "{status}");
+        assert!(status.contains("queue: ts2, ts3"), "{status}");
+
+        assert_eq!(parse_turn("/mcp turn"), Some(Ok(false)));
+        assert_eq!(parse_turn("/MCP Turn RELEASE"), Some(Ok(true)));
+        assert_eq!(parse_turn("/mcp turn release now"), Some(Err("usage: /mcp turn [release]".into())));
+        assert_eq!(parse_turn("/mcp serve"), None);
+    }
+
+    /// `coord::QUEUE_MAX` waiters and no more: the next caller is refused, not queued, and told
+    /// which. Never a bar: a refusal is not a proposal (R14).
+    #[test]
+    fn the_ninth_waiter_is_refused_queue_full() {
+        let _l = props();
+        let stub = Stub::default();
+        let ask = |i: usize| tool(&stub, &caller(&format!("qf{i}"), &[SCOPE_PROPOSE]), "request_turn", json!({ "wait_ms": 0 }));
+        assert_eq!(ask(0)["isError"], false);
+        for i in 1..=coord::QUEUE_MAX {
+            assert_eq!(serde_json::from_str::<Value>(text_of(&ask(i))).unwrap()["position"], i, "waiter {i}");
+        }
+        let full: Value = serde_json::from_str(text_of(&ask(coord::QUEUE_MAX + 1))).unwrap();
+        assert_eq!((full["error"].clone(), full["position"].clone()), (json!("queue_full"), Value::Null));
+        let refused = tool(&stub, &caller("qf99", &[SCOPE_PROPOSE]), "run_command", json!({ "command": "ls", "wait_ms": 0 }));
+        assert!(text_of(&refused).contains("queue_full"), "{refused}");
+        assert!(stub.log.lock().unwrap().is_empty() && proposals::pending().is_none(), "a refusal reached the bar");
+    }
+
+    /// ⌘J and the queue. While ⌘J holds the approval slot every grant is handed back, and the
+    /// waiters keep their order; the one ⌘J preempted is told so, once, and never reaches the bar
+    /// (R14). MUTATIONS: `lock.preempt_if_idle(..)` for `requeue_holder` in `apply` empties the
+    /// queue ("⌘J emptied the queue"); dropping the `Preempted` arm in `wait_turn` runs the
+    /// preempted agent's command ("a preempted call reached the bar").
+    #[test]
+    fn cmd_j_keeps_the_queue_in_order_and_tells_the_agent_it_preempted() {
+        let _l = props();
+        let stub = Stub::default();
+        let (p1, w1, w2) = (caller("cj1", &[SCOPE_PROPOSE]), caller("cj2", &[SCOPE_PROPOSE]), caller("cj3", &[SCOPE_PROPOSE]));
+        let json_of = |r: &Value| serde_json::from_str::<Value>(text_of(r)).unwrap_or_else(|_| panic!("not JSON: {r}"));
+        let ask = |who: &Caller| tool(&stub, who, "request_turn", json!({ "wait_ms": 0 }));
+
+        assert_eq!(ask(&p1)["isError"], false);
+        preempt_if_idle();
+        stub.slot.running.store(true, SeqCst); // ⌘J's `agent_claim`
+        let told = tool(&stub, &p1, "run_command", json!({ "command": "ls", "wait_ms": 0 }));
+        assert_eq!((told["isError"].clone(), json_of(&told)["error"].clone()), (json!(true), json!("preempted")), "{told}");
+        assert!(stub.log.lock().unwrap().is_empty() && proposals::pending().is_none(), "a preempted call reached the bar");
+
+        for (who, at) in [(&w1, 1), (&w2, 2), (&w1, 1), (&w2, 2)] {
+            let busy = json_of(&ask(who));
+            assert_eq!((busy["position"].clone(), busy["holder_state"].clone()), (json!(at), json!("builtin_agent")), "⌘J emptied the queue");
+        }
+        stub.slot.running.store(false, SeqCst); // ⌘J done
+        assert_eq!(ask(&w2)["isError"], true, "cj3 jumped the queue");
+        assert_eq!(holder_of(), Some(("cj2".into(), coord::HolderState::Idle)), "the head was not next");
+        assert_eq!(json_of(&ask(&p1))["position"], 2, "told preempted once, then queued like anyone");
+    }
+
+    /// A turn `run_command` queued for, granted between its polls, is still one `run_command`
+    /// took for itself: released when its command ends, not kept. MUTATION: granting every
+    /// turn `kept` (or inferring it from `AlreadyHolder`, as before) leaves it held Idle.
+    #[test]
+    fn a_turn_run_command_queued_for_is_released_when_its_command_ends() {
+        let _l = props();
+        let stub = Stub::default();
+        let (a, b) = (caller("rq1", &[SCOPE_PROPOSE]), caller("rq2", &[SCOPE_PROPOSE]));
+        assert_eq!(tool(&stub, &a, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        assert_eq!(tool(&stub, &b, "run_command", json!({ "command": "ls", "wait_ms": 0 }))["isError"], true);
+        assert_eq!(text_of(&tool(&stub, &a, "release_turn", json!({}))), "released");
+        assert_eq!(holder_of(), Some(("rq2".into(), coord::HolderState::Idle)), "granted between polls");
+        assert_eq!(tool(&stub, &b, "run_command", json!({ "command": "ls" }))["isError"], false);
+        assert_eq!(holder_of(), None, "a turn run_command queued for was kept");
+    }
+
+    /// R21: a command whose Block did not arrive inside the wait keeps its turn — `Unknown`,
+    /// frozen, and never granted away by the clock — and its waiters are told
+    /// `command_still_running` with no eta. The Block arriving is what ends it. This is
+    /// `run_gated`'s sequence, driven by hand. MUTATION: deleting the `Unknown` early return in
+    /// `end_turn` lets the settle release the turn, and "settled" goes red.
+    #[test]
+    fn a_command_with_no_block_keeps_the_shell_until_its_block_arrives() {
+        let _l = props();
+        let (slot, p) = proposed("r21a", "sleep 30");
+        let claim = slot_claim(&slot);
+        p.mark(State::Approved);
+        assert!(p.turn_to(coord::HolderState::Running));
+        p.mark(State::Running);
+        // `wait_block` came back `None`
+        assert!(p.turn_to(coord::HolderState::Unknown));
+        p.settle(State::Done, "Exit code: unknown".into());
+        assert_eq!(holder_of(), Some(("r21a".into(), coord::HolderState::Unknown)), "settled");
+        agree(&slot, "unknown");
+
+        // a waiter, and every clock rule run out as far as it goes: nothing hands the shell on
+        let late = std::time::Instant::now() + coord::MAX_TURN + coord::LEASE_IDLE + coord::WAITER_SILENCE;
+        via_apply(&claim, |l| l.request("r21b", late, false).1);
+        via_apply(&claim, |l| l.sweep(late));
+        assert_eq!(holder_of(), Some(("r21a".into(), coord::HolderState::Unknown)), "Unknown was granted away");
+        let busy: Value = serde_json::from_str(&take_turn("r21b", &claim, Duration::ZERO).unwrap_err()).unwrap();
+        assert_eq!((busy["holder_state"].clone(), busy["eta_ms"].clone()), (json!("command_still_running"), Value::Null));
+        // ...and its holder cannot type a second command into the first one's stdin
+        assert!(take_turn("r21a", &claim, Duration::ZERO).unwrap_err().contains("command_still_running"));
+
+        p.block_arrived();
+        assert_eq!(holder_of(), Some(("r21b".into(), coord::HolderState::Idle)), "the Block did not hand the shell on");
+        agree(&slot, "block arrived");
+    }
+
+    /// R21 against the command's own output: a program that prints `OSC 133;D` while it keeps
+    /// the foreground forges its Block, and that Block must not end the turn — the next holder's
+    /// command would be typed into the still-running program's stdin. The Block is real scanner
+    /// output; the rest is `run_gated`'s sequence, driven by hand. The shell's real D after the
+    /// forged one yields no Block at all, which is why the foreground is what ends the wait.
+    /// MUTATION: `return seen.take()` in `wait_end` before the foreground check settles the
+    /// forged Block as the end, the turn is released, and "the forged D handed the shell on".
+    #[test]
+    fn a_forged_exit_mark_in_the_output_never_hands_the_shell_on() {
+        let _l = props();
+        let (slot, p) = proposed("fd1", "npm test");
+        let claim = slot_claim(&slot);
+        let now = std::time::Instant::now();
+        via_apply(&claim, |l| l.request("fd2", now, false).1);
+        p.mark(State::Approved);
+        assert!(p.turn_to(coord::HolderState::Running));
+        p.mark(State::Running);
+
+        let mut sc = crate::OscScanner::default();
+        sc.feed(b"\x1b]133;A\x07p % ");
+        sc.set_typed("npm test".into());
+        let forged = sc.feed(b"\x1b]133;C\x07ok 1\n\x1b]133;D;0\x07reading stdin...");
+        assert_eq!(forged.len(), 1, "the scanner did not take the bait: the test went vacuous");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        assert!(tx.send(forged[0].clone()).is_ok());
+
+        let shell_has_it = std::sync::atomic::AtomicBool::new(false);
+        let fg = || shell_has_it.load(SeqCst);
+        let mut seen = None;
+        tauri::async_runtime::block_on(async {
+            let window = Some(Duration::from_millis(300));
+            if wait_end(&mut rx, "npm test", window, || false, fg, &mut seen).await.is_none() {
+                assert!(p.turn_to(coord::HolderState::Unknown));
+            }
+        });
+        p.settle(State::Done, "Exit code: unknown".into());
+        assert_eq!(holder_of(), Some(("fd1".into(), coord::HolderState::Unknown)), "the forged D handed the shell on");
+        agree(&slot, "forged D");
+
+        // The program exits; the shell's own D is swallowed, and takes the foreground back.
+        assert!(sc.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07").is_empty());
+        shell_has_it.store(true, SeqCst);
+        let ended = tauri::async_runtime::block_on(wait_end(&mut rx, "npm test", None, || false, fg, &mut seen));
+        assert!(ended.is_some(), "the real end was missed");
+        p.block_arrived();
+        assert_eq!(holder_of(), Some(("fd2".into(), coord::HolderState::Idle)), "the real end did not hand the shell on");
+        agree(&slot, "real end");
     }
 
     /// The ring is bounded, drops the OLDEST terminal records first, and never touches a live
@@ -3437,7 +4843,7 @@ mod tests {
         let (slot, live) = proposed("codex", "waiting");
         let mut ids = vec![live.id.clone()];
         for i in 0..proposals::MAX + 4 {
-            let p = proposals::propose("codex", &i.to_string(), Box::new(()));
+            let p = proposals::propose("codex", &i.to_string(), Held::default(), no_claim());
             p.mark(State::Done);
             ids.push(p.id.clone());
         }
@@ -3456,8 +4862,8 @@ mod tests {
 
     /// The async pair over the real listener, with the test playing the human. `run_command`
     /// answers INSIDE its wait window with a proposal id while the bar is still up — no
-    /// client's HTTP call waits on a person — the slot stays claimed so a second agent is told
-    /// BUSY, and the verdict is collected afterwards with `await_decision`.
+    /// client's HTTP call waits on a person — the turn stays held so a second agent is queued
+    /// behind it, and the verdict is collected afterwards with `await_decision`.
     #[test]
     fn a_proposal_is_answered_before_the_human_and_collected_afterwards() {
         let stub = Arc::new(Stub::default());
@@ -3485,9 +4891,15 @@ mod tests {
         assert!(awaiting.starts_with("awaiting approval \u{2014} proposal_id p_"), "{awaiting}");
         let id = awaiting.split("proposal_id ").nth(1).unwrap().split('.').next().unwrap().to_string();
 
-        // the record still owns the slot, so the second agent is refused rather than queued
-        let busy = result(post(&url, Some(&auth_b), None, &call("run_command", json!({ "command": "agent 2" }))));
-        assert_eq!(text_of(&busy), BUSY, "a proposal awaiting a human let go of the slot");
+        // the record still owns the turn, so the second agent is queued behind it and told so
+        let busy = result(post(&url, Some(&auth_b), None, &call("run_command", json!({ "command": "agent 2", "wait_ms": 0 }))));
+        assert_eq!(busy["isError"], true);
+        let busy: Value = serde_json::from_str(&text_of(&busy)).expect("the busy payload is JSON");
+        assert_eq!(
+            (busy["position"].clone(), busy["holder"].clone(), busy["holder_state"].clone()),
+            (json!(1), json!("codex"), json!("awaiting_human")),
+            "a proposal awaiting a human let go of the turn"
+        );
 
         // OWNERSHIP: cursor polling codex's id gets the answer for an id that never existed
         let foreign = result(post(&url, Some(&auth_b), None, &call("await_decision", json!({ "proposal_id": id, "wait_ms": 0 }))));
@@ -3566,7 +4978,7 @@ mod tests {
 
         // ...until the ring drops the record, after which it is an id like any other
         for _ in 0..proposals::MAX {
-            proposals::propose("codex", "filler", Box::new(())).mark(State::Done);
+            proposals::propose("codex", "filler", Held::default(), no_claim()).mark(State::Done);
         }
         assert_eq!(poll_decision(&codex, &p.id, now).unwrap_err(), format!("unknown proposal_id {}", p.id));
     }
@@ -3628,9 +5040,10 @@ mod tests {
     /// add 75 s to `cargo test`.
     ///
     /// None of these clients is a browser, so none of them sends `Origin`: the no-Origin case
-    /// is every request below, not a fourth client. Each gets its own listener because the
-    /// first client's proposal keeps the approval slot for as long as its human stays away —
-    /// what one slot does to the others is `eight_simultaneous_run_commands_reach_the_terminal_once`.
+    /// is every request below, not a fourth client. Each gets its own listener, and meets the
+    /// previous client's turn first — its proposal keeps the shell for as long as its human
+    /// stays away — so every client after the first is also timed QUEUED, before the turn is
+    /// cleared for its own proposal.
     #[test]
     fn every_client_handshake_returns_inside_its_own_timeout() {
         // client · the protocol version it opens with · the wall clock it is held to
@@ -3691,6 +5104,19 @@ mod tests {
                 v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
             assert!(tools.contains(&"run_command") && tools.contains(&"await_decision"), "{name}: {tools:?}");
 
+            // QUEUED: the previous client's proposal still holds the turn, so this one waits
+            // its window out in the queue and is told where it stands — as an answer, in time.
+            let mut t_queued = Duration::ZERO;
+            if i > 0 {
+                let (v, took) = ok(name, "run_command (queued)", send(json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "run_command", "arguments": { "command": "ls", "wait_ms": 300 } } }), Some(version)));
+                assert_eq!(v["result"]["isError"], true, "{name}: {v}");
+                let busy: Value = serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!((busy["position"].clone(), busy["holder"].clone()), (json!(1), json!(clients[i - 1].0)), "{name}: {busy}");
+                t_queued = took;
+            }
+            // The previous client's bar stays up (its human is still away); only its turn goes.
+            clear_turn();
+
             // THE call 0.2.9 never returned from. Nobody has decided and nobody will.
             let (v, t_run) = ok(name, "run_command", send(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "run_command", "arguments": { "command": "ls", "wait_ms": 300 } } }), Some(version)));
             assert_eq!(v["result"]["isError"], false, "{name}: an undecided proposal came back as a failure: {v}");
@@ -3705,7 +5131,7 @@ mod tests {
             // ...and all of that happened with the bar still up, which is what makes the
             // timings above a claim about this server rather than about a fast decision.
             assert_eq!(state_of(&id, name), Some(State::Shown), "{name}: something decided for the user");
-            for (step, took) in [("initialize", t_init), ("notifications/initialized", t_note), ("tools/list", t_list), ("run_command", t_run), ("await_decision", t_poll)] {
+            for (step, took) in [("initialize", t_init), ("notifications/initialized", t_note), ("tools/list", t_list), ("run_command (queued)", t_queued), ("run_command", t_run), ("await_decision", t_poll)] {
                 assert!(took < *budget, "{name}: {step} took {took:?}, past the {budget:?} its client allows");
             }
             server.unblock();
@@ -3809,14 +5235,23 @@ mod tests {
         assert!(proposals::pending().is_none(), "the refusal left a record holding the approval slot");
 
         // Production claims the slot in `open_gate`, which needs an AppHandle no unit test can
-        // build — so that its order is the same one, by source text.
+        // build — so that its order is the same one, by source text: the claimer, then the turn
+        // (whose re-check follows its grant), then the record.
         let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
-        let at = live.find("fn open_gate(").expect("open_gate is gone");
-        let body = &live[at..][..live[at..].find("\n}").unwrap()];
-        let claim = body.find("agent_claim(").expect("open_gate no longer claims the slot");
-        let recheck = body.find("budget(agent)").expect("open_gate does not re-check the budget");
-        assert!(claim < recheck && recheck < body.find("propose(").expect("open_gate records nothing"),
-                "open_gate's budget re-check is not between the claim and the record: {body}");
+        let fn_body = |name: &str| {
+            let at = live.find(name).unwrap_or_else(|| panic!("{name} is gone"));
+            &live[at..][..live[at..].find("\n}").unwrap()]
+        };
+        let body = fn_body("fn open_gate(");
+        let claim = body.find("live_claim(").expect("open_gate no longer claims the slot");
+        let take = body.find("take_turn(").expect("open_gate no longer takes the turn");
+        assert!(claim < take && take < body.find("propose(").expect("open_gate records nothing"),
+                "open_gate's turn is not between the claim and the record: {body}");
+        assert!(fn_body("fn live_claim(").contains("agent_claim("), "the claimer no longer claims the slot");
+        let take = fn_body("fn take_turn(");
+        let grant = take.find("wait_turn(").expect("take_turn no longer asks the lock");
+        let recheck = take.find("budget(agent)").expect("take_turn does not re-check the budget");
+        assert!(grant < recheck, "take_turn re-checks the budget before the turn is won: {take}");
     }
 
     /// SEC-7's other half. One live proposal per agent and four across the hub, counted from
@@ -3835,7 +5270,7 @@ mod tests {
         // literal ceiling rather than derived from the constant, so moving the constant moves
         // this test rather than being tracked by it.
         let others: Vec<PropGuard> =
-            (1..4).map(|i| proposals::propose(&format!("a{i}"), "x", Box::new(()))).collect();
+            (1..4).map(|i| proposals::propose(&format!("a{i}"), "x", Held::default(), no_claim())).collect();
         let full = proposals::budget("nobody").unwrap_err();
         assert!(full.contains('4'), "{full}");
 
@@ -3848,9 +5283,8 @@ mod tests {
     }
 
     /// C10. `hub_state` is the webview's whole view of the hub, so what it does NOT contain
-    /// is the test: no token, and no command body. v1's shape is final from day one —
-    /// `turn` and `tasks` ship null and empty so M2 and M3 fill them without the UI's parser
-    /// changing under it.
+    /// is the test: no token, and no command body. v1's keys are final from day one — M2
+    /// filled `tasks` and M3 fills `turn` without the UI's parser changing under it.
     #[test]
     fn hub_state_has_the_v1_shape_and_carries_no_token() {
         let _l = props();
@@ -3877,7 +5311,14 @@ mod tests {
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["agents", "pending", "tasks", "turn"]);
-        assert!(v["turn"].is_null());
+        // M3: who holds the shell, in what state, and who waits — names and a state, no command.
+        // The holder is awaiting the human, so its lease is frozen: no expiry to count down.
+        assert!(v["turn"]["since_ms"].is_u64(), "{}", v["turn"]);
+        let mut turn = v["turn"].clone();
+        turn.as_object_mut().unwrap().remove("since_ms");
+        assert_eq!(turn, json!({ "holder": "hubone", "state": "awaiting_human", "queue": [], "expires_in_ms": null }));
+        via_apply(&no_claim(), |l| l.request("hubtwo", std::time::Instant::now(), false).1);
+        assert_eq!(hub_json(&cfg, &[])["turn"]["queue"], json!(["hubtwo"]));
         // M2: who holds what — and no body an agent wrote beyond the one-line title
         assert_eq!(
             v["tasks"],
@@ -3912,9 +5353,13 @@ mod tests {
         // carry it at all
         assert!(!text.contains("Cursor/0.4"), "{text}");
 
-        // the pending slot empties with the proposal, rather than naming a settled one
+        // the pending slot empties with the proposal, rather than naming a settled one — and the
+        // turn run_command took goes with it, to the next in line, whose lease now runs
         p.mark(State::Done);
-        assert!(hub_json(&cfg, &[])["pending"].is_null());
+        let v = hub_json(&cfg, &[]);
+        assert!(v["pending"].is_null());
+        assert_eq!((v["turn"]["holder"].clone(), v["turn"]["state"].clone()), (json!("hubtwo"), json!("idle")));
+        assert!(v["turn"]["expires_in_ms"].as_u64().is_some_and(|ms| ms <= 60_000), "{}", v["turn"]);
     }
 
     /// Any run of 64 hex characters, wherever it sits in the JSON.
@@ -4003,6 +5448,97 @@ mod tests {
         for k in keys {
             assert!(bullet.contains(k), "danger-gate.md does not name {k}");
         }
+    }
+
+    /// danger-gate.md's worktree limitation, pinned to the code: the wrapper it quotes is the
+    /// one `wrap_for_worktree` builds, and the functions it names still exist.
+    #[test]
+    fn the_worktree_limitation_is_documented() {
+        let doc = include_str!("../../docs/danger-gate.md");
+        let at = doc.find("**A worktree is a cwd convention, not a jail.**").expect("the worktree limitation is gone");
+        let bullet = &doc[at..][..doc[at..].find("\n- ").unwrap()];
+        assert!(bullet.contains(&format!("`{}`", wrap_for_worktree("<command>", "<path>"))), "the doc quotes another wrapper");
+        let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
+        for name in ["wrap_for_worktree", "parse_worktree", "parse_run_args", "wait_block"] {
+            assert!(bullet.contains(&format!("`{name}`")) && live.contains(&format!("fn {name}(")), "{name}");
+        }
+        assert!(bullet.contains("/mcp agent worktree <name> <path|off>"));
+    }
+
+    /// C11: danger-gate.md's turn rules, pinned to the code they describe. Each bullet is found
+    /// by its lead, must quote the names and values below, and every name it quotes must still
+    /// exist. MUTATION: renaming `preempt_if_idle`, changing `LEASE_IDLE` or `QUEUE_MAX`, or
+    /// dropping "the last command may still be running" from `human_release` turns this red.
+    #[test]
+    fn the_turn_rules_are_documented() {
+        let doc = include_str!("../../docs/danger-gate.md");
+        let live = include_str!("mcp_server.rs").split("#[cfg(test)]").next().unwrap();
+        let bullet = |lead: &str| -> &str {
+            let at = doc.find(lead).unwrap_or_else(|| panic!("danger-gate.md lost {lead}"));
+            let rest = &doc[at..];
+            &rest[..rest.find("\n- ").into_iter().chain(rest.find("\n\n")).min().unwrap()]
+        };
+        let lease = format!("{} s", coord::LEASE_IDLE.as_secs());
+        let max_turn = format!("{} min", coord::MAX_TURN.as_secs() / 60);
+        let queue = format!("at most {}", coord::QUEUE_MAX);
+        let (awaiting, unknown) = (state_name(coord::HolderState::AwaitingHuman), state_name(coord::HolderState::Unknown));
+        let rules: [(&str, Vec<&str>); 6] = [
+            (
+                "*The turn lock is what keeps one approval slot sound.*",
+                vec!["`agent_claim`", "`TURN_GUARD`", "`apply`", "`queue_full`", "`position`", "`holder_state`", &queue],
+            ),
+            ("*Attribution is from the token.*", vec!["`admit`", "`release_turn`", NO_TURN]),
+            (
+                "*A lease measures silence, not approval.*",
+                vec![&lease, &max_turn, "a never-answering human holds the shell", awaiting, "`/mcp turn release`"],
+            ),
+            (
+                "*`Unknown` never hands the shell on.*",
+                vec![unknown, "`wait_end`", "`/mcp turn release`", "the last command may still be running", "`running`"],
+            ),
+            ("*\u{2318}J preempts an idle holder only.*", vec!["`agent_start`", "`preempt_if_idle`", "`preempted`"]),
+            ("*The board is an injection channel; the keypress is the gate.*", vec!["human approves on the bar"]),
+        ];
+        for (lead, needles) in rules {
+            // unwrapped: the doc is filled at 95 columns, so a phrase may cross a line
+            let text = bullet(lead).split_whitespace().collect::<Vec<_>>().join(" ");
+            for n in needles {
+                assert!(text.contains(n), "{lead} does not say {n:?}");
+            }
+        }
+        for code in ["static TURN_GUARD", "\nfn apply(", "\nasync fn wait_end(", "pub(crate) fn preempt_if_idle(", "\nfn human_release(", "\nfn release_turn("] {
+            assert!(live.contains(code), "the doc names {code}, which is gone");
+        }
+        // what both releases from `Unknown` actually answer
+        assert!(live.contains("the last command may still be running"));
+        assert!(live.contains("your last command may still be running"));
+    }
+
+    /// C11: architecture.md's holder table has one row per state, each naming the wire name
+    /// `state_name` gives it and what the lease clock does there. The match makes a fifth state
+    /// a compile error here, so a new state cannot ship without its row. MUTATION: renaming a
+    /// wire name in `state_name`, or `LEASE_IDLE`, turns this red.
+    #[test]
+    fn the_holder_state_machine_is_documented() {
+        use coord::HolderState::*;
+        let clock = |s: coord::HolderState| match s {
+            Idle => "runs",
+            AwaitingHuman | Running | Unknown => "frozen",
+        };
+        let doc = include_str!("../../docs/architecture.md");
+        let lease = format!("{} s of silence (`LEASE_IDLE`)", coord::LEASE_IDLE.as_secs());
+        let max_turn = format!("{} min of idle in total (`MAX_TURN`)", coord::MAX_TURN.as_secs() / 60);
+        for s in [Idle, AwaitingHuman, Running, Unknown] {
+            let lead = format!("| `{s:?}` | `{}` |", state_name(s));
+            let at = doc.find(&lead).unwrap_or_else(|| panic!("architecture.md has no row {lead}"));
+            let row = doc[at..].lines().next().unwrap();
+            let last = row.trim_end_matches('|').rsplit('|').next().unwrap().trim();
+            assert!(last.starts_with(clock(s)), "{s:?}'s lease clock reads {last:?}");
+            if s == Idle {
+                assert!(row.contains(&lease) && row.contains(&max_turn), "{row}");
+            }
+        }
+        assert!(doc.contains("`Unknown` | `command_still_running`") && doc.contains("the lock never grants it away"));
     }
 
     // ---- the board tools ----

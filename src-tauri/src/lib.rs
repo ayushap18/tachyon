@@ -2312,10 +2312,13 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers (transport, full command line) and their tools\r\n",
     "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (on <port> to pick one)\r\n",
-    "\x1b[36m/mcp agent add <name> [scopes]\x1b[0m  register one agent: its own token and scopes\r\n",
+    "\x1b[36m/mcp agent add <name> [--scopes a,b] [--worktree /abs/path]\x1b[0m  register one agent: its own token, scopes and worktree\r\n",
     "\x1b[36m/mcp agent list\x1b[0m             registered agents, their scopes and last seen \u{2014} never a token\r\n",
     "\x1b[36m/mcp agent show <name>\x1b[0m      that agent's client config, with its token\r\n",
     "\x1b[36m/mcp agent revoke <name>\x1b[0m    revoke one agent, from its next request\r\n",
+    "\x1b[36m/mcp agent worktree <name> <path|off>\x1b[0m  run that agent's commands inside <path>, shown in full; off stops\r\n",
+    "\x1b[36m/mcp turn\x1b[0m                   which agent holds the shell: its state, since when, who waits\r\n",
+    "\x1b[36m/mcp turn release\x1b[0m           end that agent's turn (refused while its command runs)\r\n",
     "\x1b[36m/update\x1b[0m                     check for a newer Tachyon (install: \u{2318}U / Ctrl+U)\r\n",
     "\x1b[36m/crash\x1b[0m                      last panics, from the local crash.log\r\n",
     "\x1b[36m/help\x1b[0m                       this list\r\n",
@@ -2499,9 +2502,9 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                     }
                     Ok(out)
                 }
-                // `serve` and `agent` belong here even though run_slash peels them off: a
+                // `serve`, `agent` and `turn` belong here even though run_slash peels them off: a
                 // bare /mcp and a typo like `/mcp serv` both land in this arm
-                _ => Err("usage: /mcp add|remove|list|serve|agent".into()),
+                _ => Err("usage: /mcp add|remove|list|serve|agent|turn".into()),
             }
         }
         "crash" => render_crash(),
@@ -3121,9 +3124,9 @@ mod tests {
     fn slash_usage_and_unknown_errors() {
         assert_eq!(run_slash_inner("/key groq").unwrap_err(), "usage: /key <id> <apikey>");
         assert_eq!(run_slash_inner("/foo").unwrap_err(), "unknown command: /foo — try /help");
-        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list|serve|agent");
+        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list|serve|agent|turn");
         // a bare /mcp lands in the same arm, so it must name the peeled-off verbs too
-        assert_eq!(run_slash_inner("/mcp").unwrap_err(), "usage: /mcp add|remove|list|serve|agent");
+        assert_eq!(run_slash_inner("/mcp").unwrap_err(), "usage: /mcp add|remove|list|serve|agent|turn");
         assert_eq!(run_slash_inner("/help").unwrap(), SLASH_HELP);
         assert_eq!(run_slash_inner("/").unwrap(), SLASH_HELP);
     }
@@ -3143,10 +3146,11 @@ mod tests {
                 .unwrap()
                 .trim_start_matches('/');
             // run_slash peels these off before run_slash_inner ever runs; their arms are in
-            // update.rs and mcp_server.rs (`parse_serve`, `parse_agent`), which this scan
-            // does not read. `/mcp agent …` is matched by form, because its last literal
-            // word (`add`, `list`) collides with `/mcp add` and `/mcp list`.
-            if ["update", "serve"].contains(&verb) || form.starts_with("/mcp agent") {
+            // update.rs and mcp_server.rs (`parse_serve`, `parse_agent`, `parse_turn`), which
+            // are slice patterns this scan does not read. `/mcp agent …` and `/mcp turn …` are
+            // matched by form: their last literal word collides with a
+            // `/mcp` arm (`add`, `list`) or names none here (`turn`, `release`).
+            if ["update", "serve"].contains(&verb) || form.starts_with("/mcp agent") || form.starts_with("/mcp turn") {
                 continue;
             }
             let arm = format!("\"{verb}\"");

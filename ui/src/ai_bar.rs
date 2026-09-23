@@ -97,6 +97,16 @@ struct AgentPropose {
     /// for the built-in agent — and for an external proposal that is why it is refused.
     #[serde(default)]
     agent: String,
+    /// The record an external proposal lives under. None for the built-in agent, whose
+    /// payload never carried one.
+    #[serde(default)]
+    proposal_id: Option<String>,
+}
+/// `agent-done`. Only the id is read: it is what says WHICH bar this done may clear.
+#[derive(Deserialize)]
+struct AgentDone {
+    #[serde(default)]
+    proposal_id: Option<String>,
 }
 
 /// Mirrors `MAX_COMMAND_CHARS` in src-tauri/src/mcp_server.rs — ui is outside that
@@ -161,6 +171,13 @@ fn agent_owns_bar(pending_gate: bool, agent_running: bool) -> bool {
     pending_gate || agent_running
 }
 
+/// May this `agent-done` clear the bar? Only if it is for the proposal the bar shows. With
+/// turns, one agent's done can land after the next agent's proposal is already up, and must
+/// not wipe it. The built-in agent names no proposal on either event, so None == None.
+fn done_clears(owner: Option<&str>, done: Option<&str>) -> bool {
+    owner == done
+}
+
 #[derive(Deserialize)]
 struct AgentStatus {
     #[serde(default)]
@@ -175,6 +192,7 @@ fn err_str(e: JsValue) -> String {
 }
 
 /// Clear the bar and drop the overlay.
+#[allow(clippy::too_many_arguments)] // one per bar signal: they are cleared together or not at all
 fn reset_and_close(
     state: AppState,
     mut input: Signal<String>,
@@ -183,6 +201,7 @@ fn reset_and_close(
     mut sel: Signal<Option<usize>>,
     mut pending_gate: Signal<bool>,
     mut agent_running: Signal<bool>,
+    mut gate_owner: Signal<Option<String>>,
 ) {
     input.set(String::new());
     status.set(String::new());
@@ -190,6 +209,7 @@ fn reset_and_close(
     sel.set(None);
     pending_gate.set(false);
     agent_running.set(false);
+    gate_owner.set(None);
     state.close();
 }
 
@@ -210,6 +230,8 @@ pub fn AiBar() -> Element {
     // never a separate signal, so no code path can leave an armed gate editable.
     let mut pending_gate = use_signal(|| false);
     let mut gate_external = use_signal(|| false);
+    // The proposal the bar is showing (or running), so only ITS agent-done clears it.
+    let mut gate_owner = use_signal(|| None::<String>);
     // Decided when the proposal lands, from the payload that named (or failed to name) the
     // agent — so the key handler cannot approve one the status line called unidentified.
     let mut gate_approvable = use_signal(|| false);
@@ -229,6 +251,7 @@ pub fn AiBar() -> Element {
                 danger.set(p.danger);
                 status.set(gate_status(p.danger, p.external, &p.agent, crate::keymap::is_mac()));
                 gate_external.set(p.external);
+                gate_owner.set(p.proposal_id);
                 gate_approvable.set(approvable(p.external, &p.agent));
                 pending_gate.set(true);
             }
@@ -253,9 +276,12 @@ pub fn AiBar() -> Element {
                 }
             }
         });
-        // agent-done: finish → clear running flag, close the bar.
-        listen("agent-done", move |_| {
-            reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
+        // agent-done: finish → clear running flag, close the bar — if the done is this bar's.
+        listen("agent-done", move |payload| {
+            let done = serde_wasm_bindgen::from_value::<AgentDone>(payload).map(|d| d.proposal_id).unwrap_or_default();
+            if done_clears(gate_owner.peek().as_deref(), done.as_deref()) {
+                reset_and_close(state, input, status, danger, sel, pending_gate, agent_running, gate_owner);
+            }
         });
     });
 
@@ -424,6 +450,9 @@ pub fn AiBar() -> Element {
                             e.stop_propagation();
                             pending_gate.set(false);
                             danger.set(false);
+                            // the approve line would otherwise stay up while the command runs;
+                            // an external run sends no agent-status to replace it
+                            status.set("running…".to_string());
                             spawn_local(async move {
                                 let _ = invoke("agent_decide", DecideArgs { approved: true }).await;
                             });
@@ -520,7 +549,7 @@ pub fn AiBar() -> Element {
                     if key == "Escape" {
                         e.prevent_default();
                         e.stop_propagation();
-                        reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
+                        reset_and_close(state, input, status, danger, sel, pending_gate, agent_running, gate_owner);
                     } else if key == "Enter" {
                         e.prevent_default();
                         e.stop_propagation();
@@ -537,7 +566,7 @@ pub fn AiBar() -> Element {
                                     }
                                 }
                             });
-                            reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
+                            reset_and_close(state, input, status, danger, sel, pending_gate, agent_running, gate_owner);
                         } else if agent {
                             if !v.is_empty() && !*agent_running.read() {
                                 agent_running.set(true);
@@ -586,7 +615,7 @@ pub fn AiBar() -> Element {
                                                 danger.set(true);
                                                 status.set("⚠ destructive — review carefully".to_string());
                                             } else {
-                                                reset_and_close(state, input, status, danger, sel, pending_gate, agent_running);
+                                                reset_and_close(state, input, status, danger, sel, pending_gate, agent_running, gate_owner);
                                             }
                                         }
                                     }
@@ -624,7 +653,7 @@ pub fn AiBar() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_owns_bar, approvable, enter_approves, gate_status, proposal_block, MAX_COMMAND_CHARS};
+    use super::{agent_owns_bar, approvable, done_clears, enter_approves, gate_status, proposal_block, MAX_COMMAND_CHARS};
 
     #[test]
     fn a_continuation_stands_down_under_a_gate_or_run() {
@@ -632,6 +661,20 @@ mod tests {
         assert!(agent_owns_bar(true, false)); // armed gate
         assert!(agent_owns_bar(false, true)); // ⌘J started, no proposal yet
         assert!(agent_owns_bar(true, true));
+    }
+
+    /// A done clears only the bar of the proposal it is for. With turns, agent A's done can
+    /// land after agent B's proposal is already on screen; clearing it would take down a gate
+    /// the human is reading and hand the input back mid-decision.
+    #[test]
+    fn a_done_clears_only_its_own_proposal() {
+        assert!(done_clears(Some("p_1"), Some("p_1")));
+        assert!(!done_clears(Some("p_2"), Some("p_1")), "a late done for p_1 cleared p_2's bar");
+        // the built-in agent names no proposal on either event
+        assert!(done_clears(None, None));
+        // ...so neither side can clear the other's bar
+        assert!(!done_clears(Some("p_2"), None), "⌘J's done cleared an external proposal");
+        assert!(!done_clears(None, Some("p_1")), "a late external done cleared a ⌘J run");
     }
 
     #[test]

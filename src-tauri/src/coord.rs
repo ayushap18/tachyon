@@ -434,6 +434,287 @@ pub(crate) fn tasks_path() -> Result<PathBuf, String> {
     Ok(crate::config_dir()?.join("tasks.json"))
 }
 
+// ---- the turn lock ----
+//
+// One shell, one holder, everyone else in a FIFO queue. A pure state machine over an injected
+// clock: no guard, no handle, no mutex and no clock read of its own. The server owns all
+// four — it passes `now` in and turns the `Event`s every operation returns into taking and
+// dropping the approval slot's guard — so the lock never has to know a guard exists, and
+// every rule below is asserted at its exact boundary instead of waited out.
+
+pub(crate) use turn::*;
+
+mod turn {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// An `Idle` holder silent this long has gone away: the turn goes to the next waiter.
+    pub(crate) const LEASE_IDLE: Duration = Duration::from_secs(60);
+    /// The most `Idle` time one turn may use, however often its holder checks in: keeping a lease
+    /// alive is not the same as using the shell while others wait.
+    pub(crate) const MAX_TURN: Duration = Duration::from_secs(10 * 60);
+    /// A waiter that has not polled for this long has gone away, and gives up its place.
+    pub(crate) const WAITER_SILENCE: Duration = Duration::from_secs(90);
+    /// Waiters, not counting the holder. A request past this is refused rather than queued.
+    pub(crate) const QUEUE_MAX: usize = 8;
+
+    /// Monotonic and never reused, so a stale ticket can never name a later turn.
+    pub(crate) type Ticket = u64;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum HolderState {
+        /// Holds the shell with nothing in flight. The only state in which the clocks run.
+        Idle,
+        /// A proposal is on the bar. Frozen: the human may take as long as they like, because
+        /// there is no approval timeout, ever.
+        AwaitingHuman,
+        /// Approved and written; its Block has not arrived.
+        Running,
+        /// Written, and the wait for its Block ran out: a foreground command may still own the
+        /// shell. Frozen, and never handed on by the lock — only a deliberate release ends it (R21).
+        Unknown,
+    }
+
+    pub(crate) struct Turn {
+        pub(crate) ticket: Ticket,
+        pub(crate) agent: String,
+        pub(crate) state: HolderState,
+        /// When `state` was entered.
+        pub(crate) since: Instant,
+        /// Asked for with `request_turn`: a command ending hands it back `Idle` instead of
+        /// releasing it. Recorded here, at the request, because the grant may land between the
+        /// caller's polls — the reply that finds it cannot say how it was asked for.
+        pub(crate) kept: bool,
+        /// The holder's last call: the lease measures silence from here.
+        last_seen: Instant,
+        /// `Idle` time used by this turn's earlier `Idle` stretches: `MAX_TURN`'s clock, which
+        /// only runs while `Idle`.
+        idle_spent: Duration,
+    }
+
+    impl Turn {
+        /// `Idle` time this turn has used, the current stretch included. Meaningful only in `Idle`.
+        fn idle_used(&self, now: Instant) -> Duration {
+            self.idle_spent + now.saturating_duration_since(self.since)
+        }
+
+        /// How long until the turn is taken back; `None` = never by the clock, which is every state
+        /// but `Idle`. The one place the lease and `MAX_TURN` are computed, for the sweep and for
+        /// whoever shows the countdown.
+        pub(crate) fn expires_in(&self, now: Instant) -> Option<Duration> {
+            (self.state == HolderState::Idle).then(|| {
+                let lease = LEASE_IDLE.saturating_sub(now.saturating_duration_since(self.last_seen));
+                lease.min(MAX_TURN.saturating_sub(self.idle_used(now)))
+            })
+        }
+    }
+
+    pub(crate) struct Waiter {
+        pub(crate) ticket: Ticket,
+        pub(crate) agent: String,
+        last_seen: Instant,
+        kept: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Request {
+        Granted(Ticket),
+        /// `position` is 1-based: 1 is next.
+        Queued { ticket: Ticket, position: usize },
+        QueueFull,
+        AlreadyHolder(Ticket),
+        /// ⌘J took this agent's `Idle` turn since it last asked. Said once, and nothing queued:
+        /// a caller mid-sequence must learn another command may have run between its own.
+        Preempted,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Revoke {
+        Released,
+        Lease,
+        MaxTurn,
+        Preempted,
+    }
+
+    /// What an operation did to who holds the shell — the server's cue to take or drop the guard.
+    /// In the order it happened: a revoke comes before the grant it made room for.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Granted { ticket: Ticket, agent: String },
+        Revoked { ticket: Ticket, agent: String, reason: Revoke },
+        Pruned { agent: String },
+    }
+
+    #[derive(Default)]
+    pub(crate) struct TurnLock {
+        holder: Option<Turn>,
+        queue: VecDeque<Waiter>,
+        last_ticket: Ticket,
+        /// Agents ⌘J preempted that have not asked since. At most one entry per name: a
+        /// preempted agent holds nothing until its next request, which clears it.
+        preempted: Vec<String>,
+    }
+
+    impl TurnLock {
+        pub(crate) fn holder(&self) -> Option<&Turn> {
+            self.holder.as_ref()
+        }
+
+        pub(crate) fn waiters(&self) -> impl Iterator<Item = &Waiter> {
+            self.queue.iter()
+        }
+
+        /// Idempotent: the holder, or an agent already queued, gets its own ticket back and counts
+        /// as having checked in. A new agent is queued and, if the shell is free, granted at once.
+        /// `keep` = asked with `request_turn`; a later plain request never un-asks it.
+        pub(crate) fn request(&mut self, agent: &str, now: Instant, keep: bool) -> (Request, Vec<Event>) {
+            let mut events = self.sweep(now);
+            if let Some(i) = self.preempted.iter().position(|a| a == agent) {
+                self.preempted.swap_remove(i);
+                return (Request::Preempted, events);
+            }
+            if let Some(t) = self.holder.as_mut().filter(|t| t.agent == agent) {
+                t.last_seen = now;
+                t.kept |= keep;
+                return (Request::AlreadyHolder(t.ticket), events);
+            }
+            if let Some(i) = self.queue.iter().position(|w| w.agent == agent) {
+                self.queue[i].last_seen = now;
+                self.queue[i].kept |= keep;
+                return (Request::Queued { ticket: self.queue[i].ticket, position: i + 1 }, events);
+            }
+            if self.queue.len() >= QUEUE_MAX {
+                return (Request::QueueFull, events);
+            }
+            self.last_ticket += 1;
+            let ticket = self.last_ticket;
+            self.queue.push_back(Waiter { ticket, agent: agent.to_string(), last_seen: now, kept: keep });
+            // Through the queue even when the shell is free, so a grant has exactly one road.
+            self.grant_head(now, &mut events);
+            let reply = if self.holder.as_ref().is_some_and(|t| t.ticket == ticket) {
+                Request::Granted(ticket)
+            } else {
+                Request::Queued { ticket, position: self.queue.len() }
+            };
+            (reply, events)
+        }
+
+        /// The holder gives the turn up and the head is granted; a waiter gives up its place. A
+        /// `Running` holder is refused: its command owns the shell's foreground, and handing that
+        /// on is exactly what the lock exists to prevent. `Unknown` is allowed — it is the one way
+        /// out of it, and a deliberate one.
+        pub(crate) fn release(&mut self, agent: &str, now: Instant) -> Vec<Event> {
+            let mut events = self.sweep(now);
+            match &self.holder {
+                Some(t) if t.agent == agent => {
+                    if t.state != HolderState::Running {
+                        self.revoke(Revoke::Released, &mut events);
+                        self.grant_head(now, &mut events);
+                    }
+                }
+                _ => self.queue.retain(|w| w.agent != agent),
+            }
+            events
+        }
+
+        /// Keyed by TICKET, not by name: a late report from a turn that already ended (a Block
+        /// finally arriving after the human released an `Unknown`) must not move the same agent's
+        /// next turn — marking a live command `Idle` would let the lease hand it on.
+        pub(crate) fn set_state(&mut self, ticket: Ticket, state: HolderState, now: Instant) -> Vec<Event> {
+            let events = self.sweep(now);
+            if let Some(t) = self.holder.as_mut().filter(|t| t.ticket == ticket) {
+                if t.state == HolderState::Idle {
+                    t.idle_spent = t.idle_used(now);
+                }
+                t.state = state;
+                t.since = now;
+                t.last_seen = now;
+            }
+            events
+        }
+
+        /// The caller is alive: resets the holder's lease or the waiter's silence.
+        pub(crate) fn touch(&mut self, agent: &str, now: Instant) -> Vec<Event> {
+            let events = self.sweep(now);
+            if let Some(t) = self.holder.as_mut().filter(|t| t.agent == agent) {
+                t.last_seen = now;
+            } else if let Some(w) = self.queue.iter_mut().find(|w| w.agent == agent) {
+                w.last_seen = now;
+            }
+            events
+        }
+
+        /// ⌘J takes the shell back from an IDLE holder only; in any other state it fails fast as
+        /// it always has. No sweep and no grant: the shell is being freed for the built-in agent,
+        /// and granting the head here would hand it straight to someone else.
+        pub(crate) fn preempt_if_idle(&mut self, _now: Instant) -> Vec<Event> {
+            let mut events = Vec::new();
+            if let Some(t) = self.holder.as_ref().filter(|t| t.state == HolderState::Idle) {
+                self.preempted.push(t.agent.clone());
+                self.revoke(Revoke::Preempted, &mut events);
+            }
+            events
+        }
+
+        /// A grant the server could not honour — ⌘J holds the approval slot, which the lock
+        /// cannot see — goes back to the HEAD of the queue: that waiter is still next. Dropping
+        /// it instead would empty the queue on every lock op while ⌘J runs, and hand the shell
+        /// to whoever polls first afterwards. No event: a turn that never got its guard has none
+        /// to drop.
+        pub(crate) fn requeue_holder(&mut self, ticket: Ticket) {
+            if let Some(t) = self.holder.take_if(|t| t.ticket == ticket) {
+                self.queue.push_front(Waiter { ticket, agent: t.agent, last_seen: t.last_seen, kept: t.kept });
+            }
+        }
+
+        /// Every clock rule, in order: an expired `Idle` holder loses the turn, silent waiters are
+        /// pruned (so a dead one is never granted), then a free shell goes to the head. A holder in
+        /// any other state is untouched here, `Unknown` above all.
+        pub(crate) fn sweep(&mut self, now: Instant) -> Vec<Event> {
+            let mut events = Vec::new();
+            if let Some(t) = &self.holder {
+                if t.expires_in(now) == Some(Duration::ZERO) {
+                    let reason = if t.idle_used(now) >= MAX_TURN { Revoke::MaxTurn } else { Revoke::Lease };
+                    self.revoke(reason, &mut events);
+                }
+            }
+            self.queue.retain(|w| {
+                let alive = now.saturating_duration_since(w.last_seen) < WAITER_SILENCE;
+                if !alive {
+                    events.push(Event::Pruned { agent: w.agent.clone() });
+                }
+                alive
+            });
+            self.grant_head(now, &mut events);
+            events
+        }
+
+        fn revoke(&mut self, reason: Revoke, events: &mut Vec<Event>) {
+            if let Some(t) = self.holder.take() {
+                events.push(Event::Revoked { ticket: t.ticket, agent: t.agent, reason });
+            }
+        }
+
+        fn grant_head(&mut self, now: Instant, events: &mut Vec<Event>) {
+            if self.holder.is_some() {
+                return;
+            }
+            if let Some(w) = self.queue.pop_front() {
+                events.push(Event::Granted { ticket: w.ticket, agent: w.agent.clone() });
+                self.holder = Some(Turn {
+                    ticket: w.ticket,
+                    agent: w.agent,
+                    state: HolderState::Idle,
+                    since: now,
+                    kept: w.kept,
+                    last_seen: now,
+                    idle_spent: Duration::ZERO,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,15 +1123,308 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- the turn lock ----
+
+    use std::time::{Duration, Instant};
+
+    fn secs(t0: Instant, s: u64) -> Instant {
+        t0 + Duration::from_secs(s)
+    }
+
+    fn granted(ticket: Ticket, agent: &str) -> Event {
+        Event::Granted { ticket, agent: agent.into() }
+    }
+
+    fn revoked(ticket: Ticket, agent: &str, reason: Revoke) -> Event {
+        Event::Revoked { ticket, agent: agent.into(), reason }
+    }
+
+    fn holder_of(l: &TurnLock) -> Option<(Ticket, &str, HolderState)> {
+        l.holder().map(|t| (t.ticket, t.agent.as_str(), t.state))
+    }
+
+    /// MUTATION: returning a fresh ticket from the holder or waiter branch of `request` turns
+    /// the `AlreadyHolder(1)` / second `Queued` asserts red.
+    #[test]
+    fn a_free_shell_is_granted_and_a_rerequest_is_idempotent() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        assert_eq!(l.request("a", t0, false), (Request::Granted(1), vec![granted(1, "a")]));
+        assert_eq!(l.request("a", t0, false), (Request::AlreadyHolder(1), vec![]));
+        assert_eq!(l.request("b", t0, false), (Request::Queued { ticket: 2, position: 1 }, vec![]));
+        assert_eq!(l.request("b", t0, false), (Request::Queued { ticket: 2, position: 1 }, vec![]));
+        assert_eq!(l.waiters().count(), 1, "a re-request queued the agent twice");
+    }
+
+    /// MUTATION: dropping the `>= QUEUE_MAX` guard queues the ninth; `push_front` for
+    /// `push_back` breaks the grant order.
+    #[test]
+    fn the_queue_is_fifo_across_eight_and_refuses_the_ninth() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("h", t0, false);
+        for i in 0..QUEUE_MAX {
+            let (reply, _) = l.request(&format!("w{i}"), t0, false);
+            assert_eq!(reply, Request::Queued { ticket: i as u64 + 2, position: i + 1 });
+        }
+        assert_eq!(l.request("late", t0, false).0, Request::QueueFull);
+        assert_eq!(l.release("h", t0), vec![revoked(1, "h", Revoke::Released), granted(2, "w0")]);
+        for i in 1..QUEUE_MAX {
+            let prev = format!("w{}", i - 1);
+            let events = l.release(&prev, t0);
+            assert_eq!(events[1], granted(i as u64 + 2, &format!("w{i}")), "grant out of order");
+        }
+        // The refused request took no ticket, and tickets are never reused: 1..=9 are spent.
+        assert_eq!(l.request("late", t0, false).0, Request::Queued { ticket: 10, position: 1 });
+        l.release("w7", t0);
+        assert_eq!(l.request("h", t0, false).0, Request::Queued { ticket: 11, position: 1 }, "a ticket was reused");
+    }
+
+    /// MUTATION: making `sweep` revoke at `expires_in <= 1 s` revokes at 59 s and turns the
+    /// boundary assert red; dropping the holder's `last_seen = now` in `touch` turns the
+    /// "touch did not reset the lease" assert red.
+    #[test]
+    fn the_lease_revokes_an_idle_holder_at_sixty_seconds_of_silence_and_grants_the_head() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        assert_eq!(l.sweep(t0 + LEASE_IDLE - Duration::from_millis(1)), vec![]);
+        assert_eq!(l.sweep(t0 + LEASE_IDLE), vec![revoked(1, "a", Revoke::Lease), granted(2, "b")]);
+        let b = l.holder().unwrap();
+        assert_eq!((b.state, b.since), (HolderState::Idle, t0 + LEASE_IDLE));
+
+        // Any call from the holder is what keeps the lease.
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.touch("a", secs(t0, 50));
+        assert_eq!(l.holder().unwrap().expires_in(secs(t0, 100)), Some(Duration::from_secs(10)));
+        assert_eq!(l.sweep(secs(t0, 109)), vec![], "touch did not reset the lease");
+        assert_eq!(l.sweep(secs(t0, 110)), vec![revoked(1, "a", Revoke::Lease)]);
+        assert!(l.holder().is_none());
+    }
+
+    /// MUTATION: dropping the `.min(MAX_TURN …)` term in `expires_in` keeps the turn alive for
+    /// ever and turns this red.
+    #[test]
+    fn max_turn_revokes_from_idle_despite_activity() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        for s in (30..MAX_TURN.as_secs()).step_by(30) {
+            assert_eq!(l.touch("a", secs(t0, s)), vec![], "revoked at {s}s");
+        }
+        assert_eq!(l.holder().unwrap().expires_in(secs(t0, 599)), Some(Duration::from_secs(1)));
+        assert_eq!(l.touch("a", t0 + MAX_TURN), vec![revoked(1, "a", Revoke::MaxTurn)]);
+    }
+
+    /// No approval timeout, and no command timeout: outside `Idle` both clocks stand still, and
+    /// `MAX_TURN` counts only the `Idle` time. MUTATION: making `expires_in` run in every state
+    /// turns the 11-minute asserts red; dropping the `idle_spent` carry in `set_state` (resetting
+    /// MAX_TURN on each return to `Idle`) turns the last assert red.
+    #[test]
+    fn the_clocks_are_frozen_while_awaiting_running_or_unknown() {
+        let t0 = Instant::now();
+        for state in [HolderState::AwaitingHuman, HolderState::Running, HolderState::Unknown] {
+            let mut l = TurnLock::default();
+            l.request("a", t0, false);
+            assert_eq!(l.set_state(1, state, t0), vec![]);
+            let later = t0 + Duration::from_secs(11 * 60);
+            assert_eq!(l.sweep(later), vec![], "{state:?} was revoked by the clock");
+            assert_eq!(l.holder().unwrap().expires_in(later), None);
+            // Back to Idle: a fresh lease, and none of the frozen time charged to MAX_TURN.
+            l.set_state(1, HolderState::Idle, later);
+            assert_eq!(l.holder().unwrap().expires_in(later), Some(LEASE_IDLE), "{state:?}");
+        }
+
+        // 9 min Idle, a long Running, then Idle again: one minute of MAX_TURN is left.
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        for s in (30..=540).step_by(30) {
+            l.touch("a", secs(t0, s));
+        }
+        l.set_state(1, HolderState::Running, secs(t0, 540));
+        l.set_state(1, HolderState::Idle, secs(t0, 3600));
+        l.touch("a", secs(t0, 3630));
+        assert_eq!(l.sweep(secs(t0, 3659)), vec![]);
+        assert_eq!(l.sweep(secs(t0, 3660)), vec![revoked(1, "a", Revoke::MaxTurn)]);
+    }
+
+    /// R21. MUTATION: letting `sweep` revoke any holder whose clock would have run out (i.e.
+    /// computing the lease in `Unknown`) turns the hour-long assert red.
+    #[test]
+    fn a_holder_in_unknown_is_never_handed_on_by_the_lock() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        l.set_state(1, HolderState::Unknown, t0);
+        // b keeps polling, so only the rule under test could move the turn.
+        for s in (60..=3600).step_by(60) {
+            assert_eq!(l.touch("b", secs(t0, s)), vec![], "moved at {s}s");
+        }
+        assert_eq!(holder_of(&l), Some((1, "a", HolderState::Unknown)));
+        assert_eq!(l.preempt_if_idle(secs(t0, 3600)), vec![], "⌘J took an Unknown shell");
+        // The deliberate way out.
+        assert_eq!(
+            l.release("a", secs(t0, 3600)),
+            vec![revoked(1, "a", Revoke::Released), granted(2, "b")]
+        );
+    }
+
+    /// MUTATION: making every waiter `alive` in `sweep` leaves b queued and hands it the turn.
+    #[test]
+    fn a_silent_waiter_is_pruned_at_ninety_seconds_and_never_granted() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        l.request("c", t0, false);
+        l.set_state(1, HolderState::Running, t0);
+        l.touch("c", secs(t0, 60));
+        assert_eq!(l.sweep(t0 + WAITER_SILENCE - Duration::from_millis(1)), vec![]);
+        assert_eq!(l.sweep(t0 + WAITER_SILENCE), vec![Event::Pruned { agent: "b".into() }]);
+        assert_eq!(l.request("c", secs(t0, 100), false).0, Request::Queued { ticket: 3, position: 1 });
+        l.set_state(1, HolderState::Idle, secs(t0, 100));
+        assert_eq!(l.release("a", secs(t0, 100)), vec![revoked(1, "a", Revoke::Released), granted(3, "c")]);
+
+        // A dead waiter at the head when the lease runs out: pruned first, never granted.
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        l.set_state(1, HolderState::Running, t0);
+        l.set_state(1, HolderState::Idle, secs(t0, 60));
+        assert_eq!(
+            l.sweep(secs(t0, 120)),
+            vec![revoked(1, "a", Revoke::Lease), Event::Pruned { agent: "b".into() }]
+        );
+        assert!(l.holder().is_none());
+    }
+
+    /// ⌘J outranks an IDLE holder only, and frees the shell for itself rather than for the
+    /// queue. MUTATION: dropping the `== Idle` filter in `preempt_if_idle` turns the loop red;
+    /// adding a `grant_head` there turns the `holder().is_none()` assert red.
+    #[test]
+    fn preempt_acts_only_from_idle_and_grants_nobody() {
+        let t0 = Instant::now();
+        for state in [HolderState::AwaitingHuman, HolderState::Running, HolderState::Unknown] {
+            let mut l = TurnLock::default();
+            l.request("a", t0, false);
+            l.set_state(1, state, t0);
+            assert_eq!(l.preempt_if_idle(t0), vec![], "{state:?} was preempted");
+            assert_eq!(holder_of(&l), Some((1, "a", state)));
+        }
+        let mut l = TurnLock::default();
+        assert_eq!(l.preempt_if_idle(t0), vec![]);
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        assert_eq!(l.preempt_if_idle(t0), vec![revoked(1, "a", Revoke::Preempted)]);
+        assert!(l.holder().is_none(), "preempt handed the shell to the queue");
+        assert_eq!(l.waiters().next().unwrap().agent, "b", "the waiter lost its place");
+    }
+
+    /// ⌘J holds the approval slot, so the server hands every grant straight back: the waiter
+    /// keeps its place at the head, and the order survives however many ops run meanwhile.
+    /// MUTATION: `push_back` for `push_front` in `requeue_holder` grants b first.
+    #[test]
+    fn a_grant_handed_back_keeps_its_place_at_the_head() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        assert_eq!(l.request("a", t0, false).1, vec![granted(1, "a")]);
+        l.requeue_holder(1);
+        assert_eq!(l.request("b", t0, false).1, vec![granted(1, "a")], "a lost the head");
+        l.requeue_holder(1);
+        assert!(l.holder().is_none());
+        assert_eq!(l.waiters().map(|w| w.agent.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        l.requeue_holder(7); // not the holder's ticket: nothing moves
+        assert_eq!(l.sweep(t0), vec![granted(1, "a")], "the slot freed: the head, in order");
+    }
+
+    /// Kept is how the turn was ASKED for, not how the reply that found it reads. MUTATION:
+    /// dropping `kept |= keep` for a queued agent turns the first assert red; granting with
+    /// `kept: true` (or `false`) turns one of the other two red.
+    #[test]
+    fn kept_is_recorded_at_the_request() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        l.request("b", t0, true); // queued, then asked with request_turn
+        l.request("c", t0, false);
+        l.release("a", t0);
+        assert!(l.holder().unwrap().kept, "request_turn while queued was forgotten");
+        l.release("b", t0);
+        assert!(!l.holder().unwrap().kept, "a run_command grant came back kept");
+        l.request("c", t0, true);
+        assert!(l.holder().unwrap().kept, "the holder asking to keep was ignored");
+    }
+
+    /// ⌘J's preempt is told to the agent it hit, once, on its next request — and only a real
+    /// preempt counts. MUTATION: dropping the `preempted.push` turns the first assert red;
+    /// dropping the `swap_remove` answers `Preempted` for ever.
+    #[test]
+    fn a_preempted_agent_is_told_once() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, true);
+        l.preempt_if_idle(t0);
+        assert_eq!(l.request("a", t0, true), (Request::Preempted, vec![]));
+        assert!(l.holder().is_none() && l.waiters().next().is_none(), "a refusal queued the agent");
+        assert_eq!(l.request("a", t0, true).0, Request::Granted(2));
+        l.release("a", t0);
+        assert_eq!(l.request("a", t0, false).0, Request::Granted(3), "a release read as a preempt");
+    }
+
+    /// R20 at the lock: a release by anyone but the holder moves nothing. And R21: a
+    /// `Running` holder cannot let go. MUTATION: dropping the `!= Running` check in `release`
+    /// turns the Running assert red; matching on anything but the holder's name there turns
+    /// the stranger assert red.
+    #[test]
+    fn only_the_holder_releases_and_never_while_running() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.request("b", t0, false);
+        l.request("c", t0, false);
+        assert_eq!(l.release("mallory", t0), vec![]);
+        assert_eq!(l.release("c", t0), vec![], "a waiter's release moved the turn");
+        assert_eq!(holder_of(&l), Some((1, "a", HolderState::Idle)));
+        assert_eq!(l.waiters().map(|w| w.agent.as_str()).collect::<Vec<_>>(), ["b"], "c kept its place");
+
+        l.set_state(1, HolderState::Running, t0);
+        assert_eq!(l.release("a", t0), vec![], "a Running shell was handed on");
+        assert_eq!(holder_of(&l), Some((1, "a", HolderState::Running)));
+        l.set_state(1, HolderState::AwaitingHuman, t0);
+        assert_eq!(l.release("a", t0), vec![revoked(1, "a", Revoke::Released), granted(2, "b")]);
+    }
+
+    /// A late report from an ended turn must not move the same agent's next one. MUTATION:
+    /// matching `set_state` on the agent's name instead of the ticket turns this red.
+    #[test]
+    fn set_state_is_keyed_by_ticket() {
+        let t0 = Instant::now();
+        let mut l = TurnLock::default();
+        l.request("a", t0, false);
+        l.set_state(1, HolderState::Unknown, t0);
+        l.release("a", t0);
+        assert_eq!(l.request("a", t0, false).0, Request::Granted(2));
+        l.set_state(2, HolderState::Running, t0);
+        // ticket 1's command finally prints its Block
+        l.set_state(1, HolderState::Idle, secs(t0, 5));
+        assert_eq!(holder_of(&l), Some((2, "a", HolderState::Running)));
+    }
+
     /// The module map's rule, enforced rather than remembered: this file stays free of the
     /// app handle, of Tauri types and of the runtime, so the board can be reasoned about (and
-    /// tested) without either.
+    /// tested) without either. The turn lock adds two: no clock of its own (so every lease rule
+    /// is tested at its boundary) and no mutex (R12 — the server's lock is statement-scoped,
+    /// and a second one in here is a lock order waiting to invert).
     #[test]
     fn coord_stays_a_plain_module() {
         let live = include_str!("coord.rs").split("#[cfg(test)]").next().unwrap();
-        for needle in ["AppHandle", "tauri::", "async fn", ".await", "\nstatic "] {
+        for needle in ["AppHandle", "tauri::", "async fn", ".await", "\nstatic ", "Instant::now", "lock("] {
             assert!(!live.contains(needle), "coord.rs contains {needle}");
         }
-        assert!(live.contains("fn post"), "the scan went vacuous");
+        assert!(live.contains("fn post") && live.contains("fn sweep"), "the scan went vacuous");
     }
 }

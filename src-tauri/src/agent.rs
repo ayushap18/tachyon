@@ -189,6 +189,7 @@ pub(crate) fn agent_claim(a: &AgentState) -> Result<(), String> {
 
 #[tauri::command]
 pub(crate) fn agent_start(app: AppHandle, task: String) -> Result<(), String> {
+    crate::mcp_server::preempt_if_idle();
     agent_claim(&app.state::<AgentState>())?;
     tauri::async_runtime::spawn(agent_loop(app, task));
     Ok(())

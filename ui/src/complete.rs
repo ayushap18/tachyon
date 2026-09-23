@@ -12,7 +12,7 @@
 
 /// The form column must match SLASH_HELP in src-tauri/src/lib.rs; the test
 /// `surfaces_agree_with_the_backend` parses that file and fails if they drift.
-pub const SLASH_ROWS: [(&str, &str); 25] = [
+pub const SLASH_ROWS: [(&str, &str); 28] = [
     ("/keys", "list providers, active, key source"),
     ("/providers", "same table as /keys"),
     ("/key <id> <apikey>", "set a provider's API key"),
@@ -31,10 +31,13 @@ pub const SLASH_ROWS: [(&str, &str); 25] = [
     ("/mcp remove <name>", "remove an MCP server"),
     ("/mcp list", "list MCP servers and their tools"),
     ("/mcp serve on|off|status", "let external agents use this terminal (on <port> to pick one)"),
-    ("/mcp agent add <name> [scopes]", "register one agent: its own token and scopes"),
+    ("/mcp agent add <name> [--scopes a,b] [--worktree /abs/path]", "register one agent: its own token, scopes and worktree"),
     ("/mcp agent list", "registered agents, their scopes and last seen — never a token"),
     ("/mcp agent show <name>", "that agent's client config, with its token"),
     ("/mcp agent revoke <name>", "revoke one agent, from its next request"),
+    ("/mcp agent worktree <name> <path|off>", "run that agent's commands inside <path>, shown in full; off stops"),
+    ("/mcp turn", "which agent holds the shell: its state, since when, who waits"),
+    ("/mcp turn release", "end that agent's turn (refused while its command runs)"),
     ("/update", "check for a newer Tachyon"),
     ("/crash", "last panics, from the local crash.log"),
     ("/help", "this list"),
@@ -150,7 +153,7 @@ pub const TASK_IDS: [&str; 3] = ["command", "explain", "agent"];
 const SERVE_WORDS: [&str; 3] = ["on", "off", "status"];
 
 /// The verbs `parse_agent` (mcp_server.rs) accepts, in the order SLASH_ROWS lists them.
-const AGENT_WORDS: [&str; 4] = ["add", "list", "show", "revoke"];
+const AGENT_WORDS: [&str; 5] = ["add", "list", "show", "revoke", "worktree"];
 
 /// What may be suggested for the token under the cursor.
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +247,7 @@ pub fn spot(input: &str) -> Spot {
         ("mcp", 2) if args[0].eq_ignore_ascii_case("agent") => {
             match args[1].to_lowercase().as_str() {
                 "show" | "revoke" => at(Slot::AgentName, ""),
+                "worktree" => at(Slot::AgentName, " <path|off>"),
                 _ => nothing,
             }
         }
@@ -395,10 +399,11 @@ mod tests {
             [
                 "/mcp add <name> <url>",
                 "/mcp add <name> -- <cmd> [args]",
-                "/mcp agent add <name> [scopes]",
+                "/mcp agent add <name> [--scopes a,b] [--worktree /abs/path]",
                 "/mcp agent list",
                 "/mcp agent show <name>",
                 "/mcp agent revoke <name>",
+                "/mcp agent worktree <name> <path|off>",
             ]
         );
         assert_eq!(
@@ -574,6 +579,9 @@ mod tests {
             ("/mcp agent ", Slot::AgentVerb, ""),
             ("/mcp agent show ", Slot::AgentName, ""),
             ("/mcp agent revoke ", Slot::AgentName, ""),
+            ("/mcp agent worktree ", Slot::AgentName, " <path|off>"),
+            // a path is typed, never suggested
+            ("/mcp agent worktree codex ", Slot::Nothing, ""),
             ("/mcp agent list ", Slot::Nothing, ""),
             // a NEW name, and then its scopes: neither is ever suggested
             ("/mcp agent add ", Slot::Nothing, ""),
@@ -816,7 +824,7 @@ mod tests {
         let readme_pairs =
             between(RM, "```\n/keys", "```").lines().filter_map(|l| l.split_once("  ")).collect();
         let want = agent_rows(SLASH_ROWS.to_vec());
-        assert_eq!(want.len(), 4, "the /mcp agent rows are gone, so this compares nothing");
+        assert_eq!(want.len(), 5, "the /mcp agent rows are gone, so this compares nothing");
         assert_eq!(agent_rows(help_pairs), want, "SLASH_HELP describes /mcp agent differently");
         assert_eq!(agent_rows(readme_pairs), want, "README.md describes /mcp agent differently");
 
@@ -852,7 +860,7 @@ mod tests {
         let cx = cx();
         assert_eq!(
             arg_rows("/mcp agent ", &cx).iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
-            ["/mcp agent add", "/mcp agent list", "/mcp agent show", "/mcp agent revoke"]
+            ["/mcp agent add", "/mcp agent list", "/mcp agent show", "/mcp agent revoke", "/mcp agent worktree"]
         );
         for input in ["/mcp agent show ", "/mcp agent revoke ", "/mcp agent REVOKE "] {
             let rows: Vec<String> = arg_rows(input, &cx).into_iter().map(|(l, _)| l).collect();

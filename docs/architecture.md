@@ -206,10 +206,10 @@ before `run_slash_inner` because starting a listener needs the `AppHandle`. If l
 ```
 client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ Caller {name, scopes} ─▶ handle_rpc ─▶ Backend
                                               403 / 401, body never read
-  run_command ─▶ parse_run_args ─▶ proposals::budget ─▶ open_gate: agent_claim ─▶ PROPOSALS record ─▶ "proposal_id p_7"
+  run_command ─▶ parse_run_args ─▶ proposals::budget ─▶ open_gate: take_turn  ─▶ PROPOSALS record ─▶ "proposal_id p_7"
                                                                                         │             within wait_ms ≤ 25 s
   worker ◀──────────────────────────────────────────────────────────────────────────────┘
-     └─▶ agent_propose ─▶ ⌘⏎ ─▶ pty_write_internal ─▶ wait_block ─▶ settle(record) ─▶ the slot is released
+     └─▶ agent_propose ─▶ ⌘⏎ ─▶ pty_write_internal ─▶ wait_block ─▶ settle(record) ─▶ the turn ends
                           esc ─▶ settle(denied)
   await_decision ─▶ the record: pending · the result · isError "denied"   (never the terminal)
   read_journal (scope `journal`), get_context (scope `read`) ─▶ read-only, no approval ─▶ redact
@@ -251,14 +251,33 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   another agent answers exactly like one that never existed. `PROPOSALS` is a 64-record ring;
   an evicted id is an unknown id.
 - **`open_gate` + `run_gated`** are the only road from a client to the PTY. `open_gate` runs on
-  the request's own thread — it refuses if no shell is spawned, takes the single approval slot
-  with `agent_claim` (shared with `agent_start`; busy → fails fast, never queues), and hands
-  the `AgentRunGuard` straight to the proposal record, which owns the slot until it settles.
+  the request's own thread — it refuses if no shell is spawned, takes the turn with
+  `take_turn` (queued for up to `wait_ms`; the grant claims the approval slot with
+  `agent_claim`, shared with `agent_start`), and records the proposal under that turn's ticket.
+  The record going terminal is what ends the turn.
   `run_gated` then runs on the worker: it proposes with `"external": true` and the agent's
   name (the bar reads `codex · run? ⌘⏎ approve · esc deny`), waits in `wait_block` after the
   write — `agent_loop`'s correlation (match on command text, resync on `Lagged`,
   `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with `agent-done` so the bar
   closes, then settles the record, which is what releases the slot.
+- **The turn.** One agent holds the shell at a time. `coord::TurnLock` is a pure state
+  machine over an injected clock: it holds no guard, no handle and no mutex. Every operation
+  returns `Event`s, and `apply` in `mcp_server.rs` turns them into taking and dropping the
+  approval slot's guard in `TURN_GUARD`, so a holder exists exactly when `AgentState.running`
+  is claimed. Waiters queue first in, first out, 8 at most (`QUEUE_MAX`). A waiter that has not
+  asked again for 90 s (`WAITER_SILENCE`) loses its place. `request_turn` holds the turn across
+  commands until `release_turn`. `run_command` takes it for one command when the caller does
+  not already hold it. `/mcp turn` shows the holder, and `/mcp turn release` is the human's way
+  to end a turn. The holder moves through these states (the wire name is what `hub_state`,
+  `/mcp turn` and a busy payload's `holder_state` say):
+
+  | Holder state | Wire name | Entered when | Left when | Lease clock |
+  |---|---|---|---|---|
+  | `Idle` | `idle` | granted; or its command's Block arrived | a proposal goes up → `AwaitingHuman`; `release_turn`, `/mcp turn release`, ⌘J's `preempt_if_idle` or the lease → the turn ends and the next waiter is granted | runs: 60 s of silence (`LEASE_IDLE`) or 10 min of idle in total (`MAX_TURN`) ends the turn |
+  | `AwaitingHuman` | `awaiting_human` | `open_gate` shows a proposal on the bar | ⌘⏎ → `Running`; Esc or `/mcp turn release` → denied, and the turn ends | frozen: there is no approval timeout |
+  | `Running` | `running` | approved, just before the PTY write | its Block, with the shell back in the foreground (`wait_end`) → `Idle`, and a turn `run_command` took for itself ends; no Block inside `AGENT_STEP_TIMEOUT` → `Unknown` | frozen; every release is refused |
+  | `Unknown` | `command_still_running` | `wait_end` gave up before the exit marker, or the Block came while another process held the foreground | its Block and the foreground → `Idle`; `release_turn` or `/mcp turn release` → the turn ends while the command may still be running | frozen; the lock never grants it away |
+
 - **Budgets, before the bar (`proposals::budget`).** Checked in `call_tool`, above the
   `Backend`, so a refusal never reaches a terminal and never emits `agent-propose`: 30 s of
   quiet for everyone after any denial (with `retry_after_ms`, and the denied agent told not to
