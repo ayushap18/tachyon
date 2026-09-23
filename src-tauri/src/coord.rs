@@ -621,6 +621,12 @@ mod turn {
         /// finally arriving after the human released an `Unknown`) must not move the same agent's
         /// next turn — marking a live command `Idle` would let the lease hand it on.
         pub(crate) fn set_state(&mut self, ticket: Ticket, state: HolderState, now: Instant) -> Vec<Event> {
+            // A ticket that is not the holder's is a turn already over — a command's late
+            // settle, a Block for a released turn. It is not a lock op: it must not sweep, or
+            // a worker that finished long ago would be the one granting the head of the queue.
+            if self.holder.as_ref().is_none_or(|t| t.ticket != ticket) {
+                return Vec::new();
+            }
             let events = self.sweep(now);
             if let Some(t) = self.holder.as_mut().filter(|t| t.ticket == ticket) {
                 if t.state == HolderState::Idle {
@@ -635,6 +641,14 @@ mod turn {
 
         /// The caller is alive: resets the holder's lease or the waiter's silence.
         pub(crate) fn touch(&mut self, agent: &str, now: Instant) -> Vec<Event> {
+            // A caller with no turn and no place in line has nothing to keep alive, so its
+            // message is not a lock op: it must not sweep, or any agent reading the board would
+            // be the one granting the head of the queue. Waiters re-ask every retry_after_ms
+            // and every hub_state read sweeps, so a lapsed lease is still noticed in time.
+            let mine = self.holder.as_ref().is_some_and(|t| t.agent == agent) || self.queue.iter().any(|w| w.agent == agent);
+            if !mine {
+                return Vec::new();
+            }
             let events = self.sweep(now);
             if let Some(t) = self.holder.as_mut().filter(|t| t.agent == agent) {
                 t.last_seen = now;
@@ -1417,6 +1431,19 @@ mod tests {
         // ticket 1's command finally prints its Block
         l.set_state(1, HolderState::Idle, secs(t0, 5));
         assert_eq!(holder_of(&l), Some((2, "a", HolderState::Running)));
+        // ...and a stale ticket is not a lock op: with the shell free and "b" queued, it
+        // grants nobody and changes nothing, however late the clock it carries.
+        l.set_state(2, HolderState::Idle, secs(t0, 6));
+        l.release("a", secs(t0, 6));
+        assert_eq!(l.request("c", secs(t0, 7), false).0, Request::Granted(3)); // the shell is free
+        l.requeue_holder(3); // parked at the head, the way ⌘J's failed claim leaves it
+        assert_eq!(holder_of(&l), None);
+        assert!(l.set_state(1, HolderState::Idle, secs(t0, 1000)).is_empty(), "a stale settle swept the lock");
+        assert_eq!(holder_of(&l), None, "a stale settle granted the head");
+        // Nor is a stranger's message: an agent that never asked for the shell grants nobody.
+        assert!(l.touch("stranger", secs(t0, 1000)).is_empty(), "a stranger's touch swept the lock");
+        assert_eq!(holder_of(&l), None, "a stranger's touch granted the head");
+        assert_eq!(l.waiters().map(|w| w.agent.as_str()).collect::<Vec<_>>(), ["c"]);
     }
 
     /// The module map's rule, enforced rather than remembered: this file stays free of the

@@ -4411,10 +4411,12 @@ mod tests {
     /// R11 over `slot`: the lock has a holder exactly while the approval slot is claimed, and
     /// the guard slot holds that holder's ticket and no other.
     fn agree(slot: &AgentState, at: &str) {
-        let holder = turn().holder().map(|h| h.ticket);
+        let who = turn().holder().map(|h| (h.ticket, h.agent.clone(), h.state));
+        let holder = who.as_ref().map(|h| h.0);
         let guard = TURN_GUARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(t, _)| *t);
-        assert_eq!(holder.is_some(), slot.running.load(SeqCst), "at {at}: a holder and the approval slot disagree");
-        assert_eq!(holder, guard, "at {at}: the guard is not the holder's");
+        // Named, because the one way this fails is a turn this test never took.
+        assert_eq!(holder.is_some(), slot.running.load(SeqCst), "at {at}: a holder and the approval slot disagree (holder {who:?}, guard {guard:?})");
+        assert_eq!(holder, guard, "at {at}: the guard is not the holder's (holder {who:?})");
     }
 
     fn holder_state() -> Option<coord::HolderState> {
