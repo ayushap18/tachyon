@@ -134,9 +134,9 @@ pub(crate) struct Task {
     pub(crate) detail: Option<String>,
     /// Who created it. Keeps the right to cancel even after someone else claims it.
     pub(crate) creator: String,
-    /// Advisory, and settable ONLY by the creator at creation: a worker cannot hand its work
-    /// to another agent. Claiming is not restricted to the assignee — the board suggests who
-    /// should take a task, it does not bind anyone to it.
+    /// Settable ONLY by the creator at creation: a worker cannot hand its work to another
+    /// agent. Advisory on an agent's task — the board suggests who should take it, it does not
+    /// bind anyone to it — and binding on the manager's (see `claim`).
     pub(crate) assignee: Option<String>,
     pub(crate) state: TaskState,
     pub(crate) holder: Option<String>,
@@ -322,6 +322,13 @@ impl Board {
                 "task {id} is {} \u{2014} only an open task can be claimed",
                 task.state.as_str()
             ));
+        }
+        // The manager's tasks are its plan, and it reads a holder's `failed` or `done` as the
+        // assignee's: a stranger's claim could fail a task out of the plan, spend its
+        // reassignments or queue its check. `manager` is a reserved name, so no token creates
+        // as it. Not an oracle either: the assignee is on every task listing.
+        if task.creator == "manager" && task.assignee.as_deref() != Some(actor) {
+            return Err(format!("task {id} is the manager's, for its assignee only \u{2014} only they can claim it"));
         }
         if task.claims >= MAX_CLAIMS {
             return Err(format!(
@@ -870,6 +877,21 @@ mod tests {
             b.reopen_claimed(); // as a restart would, after the holder died
         }
         assert!(b.claim_task("codex", "t_1").is_err(), "claim {} went through", MAX_CLAIMS + 1);
+    }
+
+    /// A stranger cannot take up the manager's task, so it cannot fail it out of the plan,
+    /// burn its reassignments or report it done to queue its check; an agent's task is still
+    /// anyone's to claim. MUTATION: dropping the `creator == "manager"` guard in `claim` lets
+    /// mallory claim t_1 and turns the first assert red.
+    #[test]
+    fn only_the_assignee_claims_a_task_of_the_managers() {
+        let mut b = Board::default();
+        b.create_task("manager", "planned", None, Some("codex")).unwrap();
+        assert!(b.claim_task("mallory", "t_1").unwrap_err().contains("only they can claim it"));
+        assert_eq!((b.tasks()[0].state, b.tasks()[0].claims), (TaskState::Open, 0), "a refused claim changed the task");
+        assert!(b.claim_task("codex", "t_1").is_ok());
+        b.create_task("claude", "anyone's", None, Some("codex")).unwrap();
+        assert!(b.claim_task("mallory", "t_2").is_ok());
     }
 
     #[test]

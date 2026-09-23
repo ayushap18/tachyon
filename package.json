@@ -13,6 +13,7 @@
     "eval:redact": "node evals/redact.mjs",
     "eval:agent": "node evals/agent.mjs",
     "eval:agent:selftest": "node evals/agent.mjs --mock --selftest",
+    "eval:manager:selftest": "node evals/manager.mjs --mock --selftest",
     "test:evals": "node --test evals/lib.test.mjs",
     "test:release": "node --test scripts/release.test.mjs",
     "test:browser": "node scripts/terminal-browser.mjs"

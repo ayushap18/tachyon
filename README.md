@@ -114,7 +114,7 @@ uninvited and take focus, so a stray Enter must not approve one. The built-in ag
 ⌘U / Ctrl+U (install an update) is a native menu item, not a keymap entry, and is present only
 when this copy can update in place — see [Updating](#updating).
 
-Slash commands (`/keys`, `/model`, `/models`, `/local`, `/route`, `/update`, `/mcp …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
+Slash commands (`/keys`, `/model`, `/models`, `/local`, `/route`, `/update`, `/mcp …`, `/manager …`) work from the ⌘K bar — see [Providers & slash commands](#providers--slash-commands).
 
 ## Features
 
@@ -123,6 +123,7 @@ A desktop terminal where AI is a first-class citizen, not a bolted-on chatbot:
 - **Real terminal first** — a native app (Tauri + Rust) driving a real shell through a PTY, with a Rust-side `vt100` engine that owns the screen grid and paints it to a canvas
 - **Natural language → commands** — type *"undo my last commit but keep the changes"* and get the right `git` incantation, aware of your cwd, git state, and recent history
 - **Agent mode** — describe a multi-step task, the agent plans the commands, shows them, and executes step-by-step with explicit approve/deny gates
+- **Main agent** — `/manager <goal>` has a model of your choice plan the goal into tasks for the agents registered with `/mcp agent add`, assign them, and check each result with a command you approved in the plan; it runs nothing itself — you approve the plan once and every shell write at the bar ([docs/danger-gate.md](docs/danger-gate.md#the-main-agent))
 - **Error autopsy** — when a command fails, one keystroke explains the actual stderr and suggests a fix
 - **Safety rails** — nothing a model proposes reaches the shell without a keypress, enforced in Rust rather than in the prompt; `rm -rf`-class commands are additionally flagged by a (deliberately simple, warn-only) lexical gate whose recall is measured, not assumed — see [docs/danger-gate.md](docs/danger-gate.md)
 - **Evals, not vibes** — a benchmark suite measuring command-generation accuracy and safety-block rate across prompt/model versions
@@ -280,7 +281,7 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /local <id> <url> <model> [key]    add any OpenAI-compatible endpoint by hand
 /url <id> <base_url>               point a provider at a proxy or gateway
 /remove <id>                       remove a provider (/use <id> restores a built-in)
-/route                             which provider+model each task uses (command explain agent)
+/route                             which provider+model each task uses (command explain agent manager)
 /route <task> <id> [model]         route one task; /route <task> off resets it
 /mcp add <name> <url>              add a remote MCP server (see MCP, below)
 /mcp add <name> -- <cmd> [args]    add a local stdio MCP server — Tachyon runs <cmd>
@@ -294,6 +295,10 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /mcp agent worktree <name> <path|off>  run that agent's commands inside <path>, shown in full; off stops
 /mcp turn                          which agent holds the shell: its state, since when, who waits
 /mcp turn release                  end that agent's turn (refused while its command runs)
+/manager <goal>                    plan <goal> into board tasks for the registered agents; runs nothing itself
+/manager approve                   put the plan on the board; every command still waits for ⌘⏎
+/manager reject                    drop the plan; nothing goes on the board
+/manager stop                      end the run: a waiting plan is denied, unfinished tasks come off the board
 /update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
 /crash                             last panics, from the local crash.log (never uploaded)
 /help                              this list
@@ -302,13 +307,13 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 Built-in ids: `claude openai groq gemini kimi deepseek mistral`. Everything non-Anthropic is called
 through the OpenAI-compatible `/chat/completions` shape, so local runtimes work unchanged.
 
-**Routing tasks to models.** Three tasks call a model: `command` (⌘K), `explain` (⌘E and the
-⌘B summaries) and `agent` (⌘J). By default all three use the active provider (`/use`).
+**Routing tasks to models.** Four tasks call a model: `command` (⌘K), `explain` (⌘E and the
+⌘B summaries), `agent` (⌘J) and `manager` (`/manager`). By default all four use the active provider (`/use`).
 `/route agent groq qwen/qwen3.8-27b` sends only the agent to that provider and model; `/route`
 alone prints the table, and `/route agent off` hands the task back to the active provider. A
 route naming a provider you have since removed falls back to the active one — never to a
 provider you did not choose. Each task also has its own time limit (⌘K 20 s, explain 45 s,
-agent 120 s), so a stalled provider fails a ⌘K quickly instead of hanging it.
+agent and manager 120 s), so a stalled provider fails a ⌘K quickly instead of hanging it.
 
 **Local and open models.** `/local` with no arguments probes the usual ports concurrently and reports
 what is actually running:
@@ -455,6 +460,7 @@ cargo check --locked --manifest-path ui/Cargo.toml --target wasm32-unknown-unkno
 npm run eval:selftest               # gate extraction + matcher vs lib.rs's test vectors
 npm run eval:gate                   # gate recall / false-positive rate on the corpus
 npm run eval:agent:selftest         # agent-loop eval against a scripted mock model
+npm run eval:manager:selftest       # the manager's Supervisor over scripted runs (evals/manager-runs.json)
 npm run test:release                # rejects missing/empty/duplicate installers or .sigs; checks latest.json
 ```
 

@@ -193,6 +193,12 @@ fn load_serve(path: &std::path::Path) -> Result<ServeConfig, String> {
     Ok(migrate(read_config::<ServeConfig>(path)?.unwrap_or_default()))
 }
 
+/// Who the manager may plan for: each registered name and its worktree, never a token. The
+/// config file, as `hub_state` reads it, so a plan can be made before the server is switched on.
+pub(crate) fn roster() -> Result<Vec<(String, Option<String>)>, String> {
+    Ok(load_serve(&serve_path()?)?.agents.into_iter().map(|a| (a.name, a.worktree)).collect())
+}
+
 // ponytail: /dev/urandom — Tachyon ships for macOS and Linux only (see the CI matrix). A
 // Windows port needs the `getrandom` crate here. Failing is deliberate: no weak fallback.
 fn generate_token() -> Result<String, String> {
@@ -511,6 +517,12 @@ fn release_turn(agent: &str, claim: &Claim) -> Result<String, String> {
         Some(_) => Ok("released".into()),
         None => Err(NO_TURN.into()),
     }
+}
+
+/// Who holds the turn, by name. The manager reads a worker's report only once this is no
+/// longer the worker (manager.rs, `Supervisor::step`): its check would queue behind that turn.
+pub(crate) fn turn_holder() -> Option<String> {
+    turn().holder().map(|h| h.agent.clone())
 }
 
 /// `hub_state`'s view of the turn. Names and a state only: nothing a holder proposed.
@@ -961,7 +973,7 @@ pub(crate) trait Backend: Send + Sync {
 // tools a human's attention already paces.
 // Loaded on first use, not at launch: the server may never be switched on, and `hub_state`
 // is the first thing that asks.
-static BOARD: std::sync::LazyLock<Mutex<coord::Board>> = std::sync::LazyLock::new(|| Mutex::new(coord::Board::load()));
+pub(crate) static BOARD: std::sync::LazyLock<Mutex<coord::Board>> = std::sync::LazyLock::new(|| Mutex::new(coord::Board::load()));
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
@@ -1135,7 +1147,7 @@ fn tool_list(caller: &Caller) -> Value {
 /// `\n`; it does not fold a bare `\r`, which an <input> strips from display but a PTY treats
 /// as Enter — so any control character left after folding is refused, as are the bidi
 /// overrides that reorder what the approver reads.
-fn parse_run_args(args: &Value) -> Result<String, String> {
+pub(crate) fn parse_run_args(args: &Value) -> Result<String, String> {
     let raw = args.get("command").and_then(Value::as_str).ok_or("run_command: `command` (string) is required")?;
     // Checked on the RAW input, before one_line: one_line sanitizes control characters out of
     // a model's reply (a model cannot be refused), but an external client that sends a bare
@@ -1314,7 +1326,7 @@ fn list_agents() -> String {
 
 /// The author of every task mirror line. `parse_agent_name` reserves it, so no token can buy
 /// the name and no agent can post a line that reads as the board's own.
-const SYSTEM_AUTHOR: &str = "system";
+pub(crate) const SYSTEM_AUTHOR: &str = "system";
 
 /// A task change and its announcement, under ONE hold of the board lock: `Board`'s task verbs
 /// have already written `tasks.json` when they return, and the mirror line lands with the
@@ -1326,17 +1338,23 @@ fn task_verb(
 ) -> Result<String, String> {
     let mut board = backend.board().lock().unwrap_or_else(|e| e.into_inner());
     let task = change(&mut board)?;
-    let line = format!("task {} \u{b7} {} \u{2192} {}", task.id, caller.name, task.state.as_str());
+    mirror_task(&mut board, &caller.name, &task);
+    serde_json::to_string(&task_out(&task)).map_err(|e| e.to_string())
+}
+
+/// A task change's announcement, posted by `SYSTEM_AUTHOR`. The manager's plan (manager.rs)
+/// announces its tasks through this too, so a worker reads one line format whoever acted.
+pub(crate) fn mirror_task(board: &mut coord::Board, actor: &str, task: &coord::Task) {
+    let line = format!("task {} \u{b7} {} \u{2192} {}", task.id, actor, task.state.as_str());
     // Every part of `line` was validated on the way in, so this cannot be refused — and the
     // change is already on disk, so it is not a failure to hand back to the caller either.
     let _ = board.post(SYSTEM_AUTHOR, &line, None);
-    serde_json::to_string(&task_out(&task)).map_err(|e| e.to_string())
 }
 
 /// A task as an agent reads it: its free text redacted on the way out, as `read_messages`
 /// does, so a key one agent writes into a task is not handed to every agent that lists it.
 /// The board, and `tasks.json`, keep what was written.
-fn task_out(task: &coord::Task) -> coord::Task {
+pub(crate) fn task_out(task: &coord::Task) -> coord::Task {
     let mut t = task.clone();
     t.title = redact(&t.title);
     t.detail = t.detail.as_deref().map(redact);
@@ -2018,9 +2036,13 @@ async fn run_gated(app: &AppHandle, cmd: &str, proposal: &proposals::PropGuard) 
 }
 
 fn journal_json(q: &VecDeque<Block>, limit: usize) -> String {
-    let recent: Vec<Value> = q
+    // Never the manager's checks (`checked`'s mark): a worker that could read its check could
+    // write to it rather than to the task. A worker's own line holding the mark is hidden too,
+    // which only keeps it from the other workers; the webview journal shows everything.
+    let shown: Vec<&Block> = q.iter().filter(|b| !b.command.contains(CHECK_MARK)).collect();
+    let recent: Vec<Value> = shown
         .iter()
-        .skip(q.len().saturating_sub(limit))
+        .skip(shown.len().saturating_sub(limit))
         // Redacted whole, THEN cut: a key straddling the cut would otherwise lose the prefix
         // that makes it recognisable and go out as a bare tail.
         .map(|b| json!({ "command": redact(&b.command), "exit_code": b.exit_code, "output": tail_chars(&redact(&b.output), OUTPUT_CHARS), "duration_ms": b.duration_ms }))
@@ -2066,6 +2088,102 @@ impl Backend for Live {
 
     fn claim(&self) -> Claim {
         live_claim(&self.0)
+    }
+}
+
+// ---- verification (M4) ----
+
+/// The name the manager's checks are proposed under. `parse_agent_name` reserves it, so no
+/// token can buy it: a `verify` bar is always a human-approved plan's check, never a worker's.
+const VERIFY: &str = "verify";
+
+/// THE one gate the manager may call (R10): task `task_id`'s frozen verify command, proposed as
+/// agent `verify` down exactly the road an external `run_command` takes — `call_tool`'s scope
+/// check, the assignee's worktree wrap, the validator and SEC-7, then `open_gate`/`run_gated` —
+/// so the bar reads `verify · run? ⌘⏎ approve · esc deny` and the write is the one PTY write
+/// that path already has. `Ok` = it ran, with its exit code; `Err` = it did not run to an end.
+/// Blocks until the human decides or `stopped` names a reason to give up (the run's stop or
+/// wall clock), so the caller runs it off the async runtime.
+pub(crate) fn verify_gate(app: &AppHandle, task_id: &str, cmd: &crate::manager::Verify, stopped: &dyn Fn() -> Option<String>) -> Result<i32, String> {
+    verify_via(&Live(app.clone()), task_id, cmd, Duration::from_millis(MAX_WAIT_MS), stopped)
+}
+
+/// Starts the line a check's own shell prints after it: `<mark><nonce>=<exit code>`.
+const CHECK_MARK: &str = "tachyon-check-";
+
+/// The line a check is typed as. Its exit code is NOT the Block's: a Block ends on any
+/// `OSC 133;D` in the output, and the output is the worker's code under test, which can print
+/// a `D;0` and exit 1 (the real D is then swallowed, see `wait_end`). So the shell echoes the
+/// code after a mark with a fresh nonce, and only that echo, last in the Block, is believed —
+/// after a forged D the echo lands outside the Block. Its own subshell, so an `exit` in the
+/// check cannot skip the echo. POSIX `$?`: fish has no `( … )` subshell for the worktree wrap
+/// either, and there no mark comes back, which fails the check rather than passing it.
+// ponytail: the nonce is typed, so a shell that appends history as it goes (zsh
+// INC_APPEND_HISTORY/SHARE_HISTORY) lets code under test read it mid-run. Upgrade: a nonce on
+// the precmd's own D that never crosses the PTY input.
+fn checked(cmd: &str, nonce: &str) -> String {
+    format!("( {cmd} ); echo {CHECK_MARK}{nonce}=$?")
+}
+
+/// The code `checked`'s echo printed, if the output ENDS in it: nothing after it, not even
+/// the shell's own ` )`.
+fn check_code(output: &str, nonce: &str) -> Option<i32> {
+    output.trim_end().rsplit_once(&format!("{CHECK_MARK}{nonce}="))?.1.parse().ok()
+}
+
+/// `verify_gate` over any backend, so the Stub can stand in for the terminal. `wait` is the
+/// window of each call, as for a client; the verdict is collected across as many as it takes,
+/// because no window closing is a decision — but `stopped` is asked before every retry, so a
+/// queue behind someone's endless command or a bar nobody answers cannot outlive the run.
+fn verify_via(
+    backend: &dyn Backend,
+    task_id: &str,
+    cmd: &crate::manager::Verify,
+    wait: Duration,
+    stopped: &dyn Fn() -> Option<String>,
+) -> Result<i32, String> {
+    let unfinished = |why: &str| format!("verification did not finish: {why}");
+    let go_on = || stopped().map_or(Ok(()), |why| Err(unfinished(&why)));
+    let assignee = backend.board().lock().unwrap_or_else(|e| e.into_inner()).tasks().iter()
+        .find(|t| t.id == task_id)
+        .and_then(|t| t.assignee.clone())
+        .ok_or_else(|| unfinished(&format!("task {task_id} has no assignee")))?;
+    // The live registry, as `admit` reads it: the worktree the assignee's own commands run in.
+    // A revoked assignee has none to check, and the shared shell's directory is not its work.
+    let worktree = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .find(|a| a.name == assignee)
+        .map(|a| a.worktree.clone())
+        .ok_or_else(|| unfinished(&format!("{assignee} is no longer registered")))?;
+    // Built here and nowhere else, with the one scope a check needs: the board is not its to read.
+    let caller = Caller { name: VERIFY.into(), scopes: vec![SCOPE_PROPOSE.into()], worktree };
+    let ask = |tool: &str, args: Value| {
+        let r = call_tool(&json!({ "name": tool, "arguments": args }), backend, &caller).map_err(|e| unfinished(&e))?;
+        Ok::<_, String>((r["content"][0]["text"].as_str().unwrap_or_default().to_string(), r["isError"] == true))
+    };
+    // 64 bits, fresh per check: code under test cannot print a mark it cannot know
+    let nonce = generate_token().map_err(|e| unfinished(&e))?[..16].to_string();
+    let line = checked(cmd.as_str(), &nonce);
+    let run = || ask("run_command", json!({ "command": line, "wait_ms": millis(wait) }));
+    let mut reply = run()?;
+    loop {
+        reply = match reply {
+            (text, true) if text == DENIED => return Err("verification denied".into()),
+            // Queued, not refused: asking again keeps its place, as every client is told to.
+            (text, true) if serde_json::from_str::<Value>(&text).is_ok_and(|v| v["error"] == "busy") => {
+                go_on()?;
+                run()?
+            }
+            (text, true) => return Err(unfinished(&text)),
+            // `unknown`, or a Block with no mark at its end (a forged D): nothing to trust
+            (text, false) if text.starts_with("Exit code: ") => return check_code(&text, &nonce).ok_or_else(|| unfinished("no exit code")),
+            // `awaiting …`/`pending …`: the human has not decided yet
+            (text, false) => {
+                go_on()?;
+                let id = text.split("proposal_id ").nth(1).and_then(|s| s.split_whitespace().next()).map(|s| s.trim_end_matches('.'));
+                let id = id.ok_or_else(|| unfinished(&text))?.to_string();
+                ask("await_decision", json!({ "proposal_id": id, "wait_ms": millis(wait) }))?
+            }
+        };
     }
 }
 
@@ -2199,7 +2317,7 @@ const RESERVED_NAMES: [&str; 9] =
 /// second way to write `codex`. Everything a bar line could be forged with — a bidi
 /// override, a `\u{b7}`, a space, a control char, anything non-ASCII — is outside the class
 /// and so refused rather than stripped: a mangled name is a wrong name.
-fn parse_agent_name(name: &str) -> Result<String, String> {
+pub(crate) fn parse_agent_name(name: &str) -> Result<String, String> {
     let body = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-';
     let head = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let ok = (1..=32).contains(&name.len())
@@ -2757,7 +2875,15 @@ mod tests {
                 if cmd.starts_with("rm") {
                     p.settle(State::Denied, DENIED.into());
                 } else {
-                    p.settle(State::Done, format!("Exit code: 0\nOutput:\nran {cmd}"));
+                    // markers for the verify tests: a failing check, one whose Block never came, and
+                    // one whose code under test printed a D;0 and so ended the Block before the
+                    // shell echoed `checked`'s mark. Echoed, the Block's code is the echo's own 0.
+                    let code = if cmd.contains("EXIT-3") { "3" } else if cmd.contains("NO-END") { "unknown" } else { "0" };
+                    let mark = cmd.split_once("; echo ").and_then(|(_, e)| e.split_once("=$?")).map(|(mark, _)| mark);
+                    p.settle(State::Done, match mark {
+                        Some(mark) if code != "unknown" && !cmd.contains("FORGED-D") => format!("Exit code: 0\nOutput:\nran {cmd}\n{mark}={code}"),
+                        _ => format!("Exit code: {code}\nOutput:\nran {cmd}"),
+                    });
                 }
             })
         }
@@ -5842,11 +5968,285 @@ mod tests {
         serde_json::from_str(text_of(r)).unwrap()
     }
 
+    /// MGR-3: a plan's verify commands stay in the manager. The approved tasks are on the
+    /// board, and every view of it — an agent's `list_tasks` and `read_messages`, the
+    /// webview's `hub_state` — shows them with no verify text in it.
+    /// MUTATION: creating each task in `place_plan` with its verify in the title, or as its
+    /// `detail`, turns this red.
+    #[test]
+    fn a_plans_verify_commands_reach_no_agent_and_no_webview() {
+        let _l = props();
+        let stub = Stub::default();
+        let reply = "TASK: bdvfa | Add --json | cargo test VERIFY-ONE\nTASK: bdvfb | Document it | grep -q VERIFY-TWO README.md";
+        let plan = crate::manager::parse_plan(reply, &["bdvfa", "bdvfb"], 8).unwrap();
+        let kept = crate::manager::place_plan(&mut stub.board.lock().unwrap(), plan).unwrap();
+        assert_eq!(kept[1].1.as_str(), "grep -q VERIFY-TWO README.md");
+        let who = caller("bdvfa", &[SCOPE_MESSAGE]);
+        let listed = text_of(&tool(&stub, &who, "list_tasks", json!({}))).to_string();
+        let read = text_of(&tool(&stub, &who, "read_messages", json!({}))).to_string();
+        let hub = hub_json(&ServeConfig::default(), stub.board.lock().unwrap().tasks()).to_string();
+        for (view, out) in [("list_tasks", listed), ("read_messages", read), ("hub_state", hub)] {
+            assert!(out.contains("t_2"), "{view} shows no task, so this proves nothing: {out}");
+            assert!(!out.contains("VERIFY-"), "{view} leaks a verify command: {out}");
+        }
+    }
+
+    // ---- verify_gate (MGR-4) ----
+
+    /// Task `t_1` on the stub's board, planned for `assignee`, and the check the human approved.
+    fn planned(stub: &Stub, assignee: &str, check: &str) -> crate::manager::Verify {
+        let plan = crate::manager::parse_plan(&format!("TASK: {assignee} | Add --json | {check}"), &[assignee], 8).unwrap();
+        crate::manager::place_plan(&mut stub.board.lock().unwrap(), plan).unwrap().remove(0).1
+    }
+
+    /// Plays the human on the stub's parked sender: waits for the bar, reads whose it is, decides.
+    /// Bounded, so a bar that never goes up fails the test (a dropped sender is a deny) instead
+    /// of hanging it.
+    fn human(stub: &Stub, approve: bool, after: Duration) -> std::thread::JoinHandle<Option<(String, String)>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *stub.human.lock().unwrap() = Some(rx);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let bar = loop {
+                match proposals::pending() {
+                    Some(bar) => break Some(bar),
+                    None if std::time::Instant::now() > deadline => return None,
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+            };
+            std::thread::sleep(after);
+            let _ = tx.send(approve);
+            bar
+        })
+    }
+
+    /// MGR-4: the manager's check reaches the terminal down run_command's own road, as agent
+    /// `verify` — a name no token can buy — wrapped in the ASSIGNEE's registry worktree; and no
+    /// view a worker has (the board, the tasks, the check's own proposal id) ever carries it.
+    /// MUTATIONS: `worktree: None` in `verify_via`'s Caller runs the check outside the worktree
+    /// (the log assert); naming the Caller after the assignee puts the check on the bar as the
+    /// worker's and hands it the verdict text (the bar and await_decision asserts); posting the
+    /// command on the board from `verify_via` turns the read_messages view red.
+    #[test]
+    fn a_verify_runs_as_verify_in_the_assignees_worktree_and_no_worker_sees_it() {
+        let _agents = seed(&[AgentToken { worktree: Some("/tmp/wt-bdvg".into()), ..agent("bdvg", TOKEN) }]);
+        let _l = props();
+        assert!(matches!(parse_agent("/mcp agent add verify"), Some(Err(_))), "a token could be registered as `verify`");
+        let stub = Stub::default();
+        let check = planned(&stub, "bdvg", "cargo test VERIFY-SECRET");
+        let human = human(&stub, true, Duration::ZERO);
+        assert_eq!(verify_via(&stub, "t_1", &check, Duration::from_secs(5), &|| None), Ok(0));
+        let (id, whose) = human.join().unwrap().expect("no bar went up");
+        assert_eq!(whose, "verify", "the check was put on the bar under another name");
+        let line = stub.log.lock().unwrap()[0].clone();
+        assert!(line.starts_with("( cd /tmp/wt-bdvg && ( cargo test VERIFY-SECRET ); echo tachyon-check-") && line.ends_with("=$? )"), "{line}");
+
+        let worker = Caller { worktree: Some("/tmp/wt-bdvg".into()), ..caller("bdvg", &SCOPES) };
+        let views = [
+            ("list_tasks", tool(&stub, &worker, "list_tasks", json!({}))),
+            ("read_messages", tool(&stub, &worker, "read_messages", json!({ "after_seq": 0 }))),
+            ("await_decision", tool(&stub, &worker, "await_decision", json!({ "proposal_id": id, "wait_ms": 0 }))),
+        ];
+        for (view, r) in views {
+            let out = r.to_string();
+            assert!(out.contains("t_1") || out.contains(&id), "{view} shows nothing, so this proves nothing: {out}");
+            assert!(!out.contains("VERIFY-SECRET"), "{view} hands a worker the check: {out}");
+        }
+        let hub = hub_json(&ServeConfig::default(), stub.board.lock().unwrap().tasks()).to_string();
+        assert!(!hub.contains("VERIFY-SECRET"), "{hub}");
+    }
+
+    /// Every way a check can end: an exit code for one that ran, a named failure for one that
+    /// did not. A denial is the human's and so starts SEC-7's cooldown — which then holds for
+    /// `verify` like anyone, with no bar raised. And the verdict is collected across as many
+    /// wait windows as the human takes, and across a turn somebody else holds.
+    /// MUTATIONS: dropping the `DENIED` arm reports a denial as "did not finish"; dropping the
+    /// busy arm fails the check held behind another agent's turn; `return code.ok_or(..)` →
+    /// `return Ok(0)` verifies the check whose Block never came.
+    #[test]
+    fn a_verify_ends_in_an_exit_code_or_a_named_failure() {
+        let _agents = seed(&[agent("bdvh", TOKEN)]);
+        let _l = props();
+        let stub = Stub::default();
+        // a fresh board each time, so the check is always `t_1`
+        let run = |check: &str, wait: Duration| {
+            *stub.board.lock().unwrap() = coord::Board::default();
+            verify_via(&stub, "t_1", &planned(&stub, "bdvh", check), wait, &|| None)
+        };
+        let long = Duration::from_secs(5);
+        assert_eq!(run("cargo test EXIT-3", long), Ok(3));
+        assert_eq!(run("cargo test NO-END", long), Err("verification did not finish: no exit code".into()));
+        // the Block said 0, but the code under test said it: no mark after it, no verdict
+        assert_eq!(run("cargo test FORGED-D", long), Err("verification did not finish: no exit code".into()));
+
+        // many windows: the human decides long after the first one closed
+        let late = human(&stub, true, Duration::from_millis(300));
+        assert_eq!(run("cargo test", Duration::from_millis(50)), Ok(0));
+        assert!(late.join().unwrap().is_some());
+
+        // queued behind a turn another agent keeps, and through once it lets go
+        let holder = caller("bdvhold", &[SCOPE_PROPOSE]);
+        assert_eq!(tool(&stub, &holder, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(tool(&stub, &holder, "release_turn", json!({}))["isError"], false);
+            });
+            assert_eq!(run("cargo test", Duration::from_millis(50)), Ok(0));
+        });
+
+        let no = human(&stub, false, Duration::ZERO);
+        assert_eq!(run("cargo test", long), Err("verification denied".into()));
+        assert!(no.join().unwrap().is_some());
+        let ran = stub.log.lock().unwrap().len();
+        let cooled = run("cargo test", long).unwrap_err();
+        assert!(cooled.starts_with("verification did not finish: ") && cooled.contains("retry_after_ms"), "{cooled}");
+        assert_eq!(stub.log.lock().unwrap().len(), ran, "a check reached the bar inside the cooldown");
+
+        // nothing to check, or nobody's worktree to check it in: refused before any bar
+        *stub.board.lock().unwrap() = coord::Board::default();
+        let orphan = planned(&stub, "bdvgone", "cargo test");
+        assert_eq!(verify_via(&stub, "t_1", &orphan, long, &|| None), Err("verification did not finish: bdvgone is no longer registered".into()));
+        assert_eq!(verify_via(&stub, "t_9", &orphan, long, &|| None), Err("verification did not finish: task t_9 has no assignee".into()));
+        assert_eq!(stub.log.lock().unwrap().len(), ran);
+    }
+
+    /// A check's exit code is the one its shell echoed after the mark with this check's nonce,
+    /// last in the output — never the Block's, which the code under test can forge with a D.
+    /// MUTATION: `check_code` returning the Block's own `Exit code:` (or dropping the nonce
+    /// from the mark) passes the forged and the stale lines below.
+    #[test]
+    fn a_checks_exit_code_is_the_shells_echo_after_its_nonce() {
+        let line = checked("cargo test", "00ff00ff00ff00ff");
+        assert_eq!(line, "( cargo test ); echo tachyon-check-00ff00ff00ff00ff=$?");
+        let n = "00ff00ff00ff00ff";
+        for (out, want) in [
+            ("Exit code: 0\nOutput:\nok\ntachyon-check-00ff00ff00ff00ff=0", Some(0)),
+            ("Exit code: 0\nOutput:\ntest failed\ntachyon-check-00ff00ff00ff00ff=101\n", Some(101)),
+            // the forged D: the Block ended before the echo
+            ("Exit code: 0\nOutput:\nrunning 1 test", None),
+            // an earlier check's nonce, printed by code that read it somewhere
+            ("Exit code: 0\nOutput:\ntachyon-check-1111111111111111=0", None),
+            // the typed line's echo, or anything after the mark
+            ("Exit code: 0\nOutput:\n( cargo test ); echo tachyon-check-00ff00ff00ff00ff=$? )", None),
+            ("Exit code: 0\nOutput:\ntachyon-check-00ff00ff00ff00ff=0\nmore", None),
+        ] {
+            assert_eq!(check_code(out, n), want, "{out}");
+        }
+        // what goes out to the verifier is redacted first: the mark must survive it
+        assert_eq!(redact("tachyon-check-00ff00ff00ff00ff=0"), "tachyon-check-00ff00ff00ff00ff=0");
+    }
+
+    /// A check queued behind a turn nobody gives back, or at a bar nobody answers, ends when the
+    /// run says stop, so the run's wall clock and `/manager stop` still end the run.
+    /// MUTATION: dropping `go_on()?` from the busy arm keeps this check queued for as long as
+    /// the holder holds: the recv below times out.
+    #[test]
+    fn a_check_behind_an_endless_turn_ends_when_the_run_stops() {
+        let _agents = seed(&[agent("bdvs", TOKEN)]);
+        let _l = props();
+        let stub = Stub::default();
+        let check = planned(&stub, "bdvs", "cargo test");
+        let holder = caller("bdvsnever", &[SCOPE_PROPOSE]);
+        assert_eq!(tool(&stub, &holder, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let until = std::time::Instant::now() + Duration::from_millis(300);
+                let stopped = || (std::time::Instant::now() >= until).then(|| "/manager stop".to_string());
+                let _ = tx.send(verify_via(&stub, "t_1", &check, Duration::from_millis(50), &stopped));
+            });
+            let got = rx.recv_timeout(Duration::from_secs(5));
+            // let the queued check out either way, so a red run fails instead of hanging
+            assert_eq!(tool(&stub, &holder, "release_turn", json!({}))["isError"], false);
+            assert_eq!(got, Ok(Err("verification did not finish: /manager stop".into())));
+        });
+        assert!(stub.log.lock().unwrap().is_empty(), "the check ran after the stop");
+    }
+
+    /// `read_journal` never shows a worker a check: the Block the check's run leaves in the
+    /// shared journal carries the whole approved line. MUTATION: dropping the `CHECK_MARK`
+    /// filter from `journal_json` hands the check back.
+    #[test]
+    fn read_journal_shows_no_worker_a_check() {
+        let line = wrap_for_worktree(&checked("cargo test VERIFY-SECRET", "0123456789abcdef"), "/tmp/wt");
+        let block = |command: &str| Block { command: command.into(), exit_code: 1, output: "failed".into(), duration_ms: 1 };
+        let q = VecDeque::from([block("ls"), block(&line), block("git status")]);
+        let out = journal_json(&q, 10);
+        assert!(!out.contains("VERIFY-SECRET"), "{out}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.as_array().unwrap().iter().map(|b| b["command"].as_str().unwrap()).collect::<Vec<_>>(), ["ls", "git status"]);
+        // and `limit` counts what a worker is shown
+        assert_eq!(serde_json::from_str::<Value>(&journal_json(&q, 1)).unwrap()[0]["command"], "git status");
+    }
+
+    /// MGR-5 × TL-2: the manager reads a worker's report only once the worker's turn is over,
+    /// so its check is never queued behind the worker's own turn or run under a command of the
+    /// worker's still going. Observed with the real TURN on both roads a worker's turn ends: a
+    /// kept turn given back with release_turn, and a command's own turn, reported done while
+    /// that command was still on the bar and ended by the command.
+    /// MUTATION: `let holds_shell = false` in `Supervisor::step` reads each report while the
+    /// worker still holds the turn — (Some("bdord"), Verifying) in the sequence.
+    #[test]
+    fn the_manager_reads_a_report_only_after_the_workers_turn_is_over() {
+        use crate::manager::{Attempt, OnBoard, Supervisor};
+        let _agents = seed(&[agent("bdord", TOKEN)]);
+        let _l = props();
+        let stub = Stub::default();
+        let m = crate::manager::ManagerState::default();
+        let plan = crate::manager::parse_plan("TASK: bdord | kept | cargo test\nTASK: bdord | on the bar | cargo test", &["bdord"], 8);
+        m.verify.lock().unwrap().extend(crate::manager::place_plan(&mut stub.board.lock().unwrap(), plan.unwrap()).unwrap());
+        let now = std::time::Instant::now();
+        let mut sup = Supervisor::new(vec!["t_1".into(), "t_2".into()], 2, now, crate::manager::Budgets::default(), vec![]);
+        let mut view = OnBoard { board: &stub.board, verify: &m.verify };
+        let mut seen = Vec::new();
+        let mut look = |id: &str| {
+            let due = sup.step(&mut view, now).verify;
+            seen.push((turn_holder(), sup.attempt(id).unwrap(), due));
+        };
+        let worker = caller("bdord", &SCOPES);
+        let done = |id: &str| task_of(&tool(&stub, &worker, "update_task", json!({ "id": id, "state": "done" })))["state"] == "done";
+
+        // a kept turn: the command ends, the turn stays the worker's, the task is reported
+        task_of(&tool(&stub, &worker, "claim_task", json!({ "id": "t_1" })));
+        assert_eq!(tool(&stub, &worker, "request_turn", json!({ "wait_ms": 0 }))["isError"], false);
+        let ran = tool(&stub, &worker, "run_command", json!({ "command": "cargo build", "wait_ms": 5000 }));
+        assert!(text_of(&ran).starts_with("Exit code: 0"), "{ran}");
+        assert!(done("t_1"));
+        look("t_1");
+        assert_eq!(tool(&stub, &worker, "release_turn", json!({}))["isError"], false);
+        look("t_1");
+
+        // a command's own turn, reported done while its bar is still up
+        task_of(&tool(&stub, &worker, "claim_task", json!({ "id": "t_2" })));
+        let (human, rx) = tokio::sync::oneshot::channel();
+        *stub.human.lock().unwrap() = Some(rx);
+        let shown = tool(&stub, &worker, "run_command", json!({ "command": "cargo build", "wait_ms": 0 }));
+        let pid = text_of(&shown).split("proposal_id ").nth(1).and_then(|r| r.split('.').next()).unwrap_or_else(|| panic!("{shown}")).to_string();
+        assert!(done("t_2"));
+        look("t_2");
+        human.send(true).unwrap();
+        let ended = tool(&stub, &worker, "await_decision", json!({ "proposal_id": pid, "wait_ms": 5000 }));
+        assert!(text_of(&ended).starts_with("Exit code: 0"), "{ended}");
+        look("t_2");
+
+        let (w, none) = (Some("bdord".to_string()), Vec::<String>::new());
+        assert_eq!(
+            seen,
+            [
+                (w.clone(), Attempt::Claimed, none.clone()),
+                (None, Attempt::Verifying, vec!["t_1".to_string()]),
+                (w, Attempt::Claimed, none),
+                (None, Attempt::Verifying, vec!["t_2".to_string()]),
+            ]
+        );
+    }
+
     /// The acknowledgement comes AFTER the write: a crash the instant an agent hears
     /// "claimed" must not lose the claim. And each status change is announced on the message
     /// board, as `system`, a name no token can buy.
     /// MUTATION: `path: None` in `Board::open` (nothing written) turns the first file assert
-    /// red; dropping the `board.post` in `task_verb` turns the mirror assert red.
+    /// red; dropping the `board.post` in `mirror_task` turns the mirror assert red.
     #[test]
     fn a_task_change_is_on_disk_before_the_reply_and_announced_once() {
         let dir = std::env::temp_dir().join(format!("tachyon-mcp-tasks-{}-persist", std::process::id()));

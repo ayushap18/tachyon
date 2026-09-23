@@ -105,12 +105,12 @@ in `hidden`, and moves `active` if it pointed there; `/use <id>` un-hides. The l
 cannot be removed.
 
 `ai_call(task, system, user)` is the only function that talks to a model. Each call site
-names its `Task` in Rust — `Command` (⌘K), `Explain` (⌘E, ⌘B, `ai_complete`), `Agent` (⌘J) —
-and no IPC command takes one. `ProviderState::provider_for(task)` picks the provider from
+names its `Task` in Rust — `Command` (⌘K), `Explain` (⌘E, ⌘B, `ai_complete`), `Agent` (⌘J),
+`Manager` (`/manager`) — and no IPC command takes one. `ProviderState::provider_for(task)` picks the provider from
 `routes` (set by `/route <task> <id> [model]`, stored in `providers.json`, empty by default);
 a missing route, or one naming a removed provider, resolves to the active provider and never
-to a second one. `Task::deadline` caps one call at 20 s / 45 s / 120 s, below the client's
-own 120 s timeout. Both request shapes send `AI_MAX_TOKENS` (4096). `kind == "anthropic"`
+to a second one. `Task::deadline` caps one call at 20 s / 45 s / 120 s (the manager's is the
+agent's 120 s), below the client's own 120 s timeout. Both request shapes send `AI_MAX_TOKENS` (4096). `kind == "anthropic"`
 posts to `/v1/messages` (on `base_url` when set — a proxy or gateway, `/url <id> <base_url>` —
 else `api.anthropic.com`; see `anthropic_url`); everything else posts the OpenAI shape to
 `{base_url}/chat/completions`, with no auth header when there is no key, which is what makes
@@ -321,6 +321,87 @@ client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · 
   only) into an agent named `default` with every scope, byte-identical, so the client already
   configured with it keeps working.
 
+## Main agent (`manager.rs`)
+
+`/manager <goal>` makes the model routed to `manager` (`/route manager <id> [model]`, else the
+active provider) the lead of the registered agents: it plans the goal into board tasks,
+assigns them, watches the board and has each result checked. It runs nothing itself. The
+human approves the plan once, and every shell write at the bar as always. Threat model:
+[danger-gate.md](danger-gate.md#the-main-agent).
+
+```
+plan ──▶ approve ──▶ assign ──▶ claim ──▶ report ──▶ verify ──▶ finish
+ │         │            ▲          │         │          │
+ │         └ reject ─▶ end         │         │          └ exit ≠ 0 ─▶ assign again (max_reassignments)
+ │                      ▲          └ not claimed in claim_timeout_secs ─▶ assign again
+ └ refused twice ─▶ end │
+                        └ REPLAN ─▶ plan ─▶ approve (a new plan, a new approval, max_plans)
+```
+
+- **plan.** `make_plan`: one `ai_call` with `MANAGER_PLAN`, the goal and the roster (from
+  `mcp_server::roster`, so only registered agents). `parse_plan` reads only
+  `TASK: <agent> | <title> | <verify command>` lines and refuses an unknown or reserved agent,
+  a duplicate title, an empty or trivial verify (`true`, `:`, `exit 0`, `echo …`) and anything
+  `parse_run_args` refuses a command for. One retry with the refusal fed back, then the run
+  stops.
+- **approve.** `plan_approved` parks a fresh oneshot in `ManagerState.decision`, prints the
+  plan with every verify command through `term_write`, emits `manager-plan` (agents and
+  titles only) and waits; `/manager approve|reject` calls `manager_decide(bool)`. Reject, a
+  stop, or a dropped sender puts nothing on the board.
+- **assign.** `place_plan` creates one task per line with `creator = "manager"` and the planned
+  assignee, each with its mirror line. The verify command is a `Verify`, built only in
+  `parse_plan` and with no mutator, kept in `ManagerState.verify` by task id: never on the
+  board, in `list_tasks` or in what the model is shown.
+- **claim, report.** The workers' own `claim_task` and `update_task`. `Supervisor::step` reads
+  the board once a second (`BOARD_POLL`) and the model only when something changed (a message
+  `seq` cursor and each task's state), so a board that sits still costs no call, and messages
+  alone cost at most one per `CHATTER_GAP`. Only a task's assignee can claim a task the
+  manager placed. A report is
+  read once its worker's turn is over, and a report is a claim: `Reported` is not `Verified`.
+- **verify.** `verify_task` hands the frozen string to `mcp_server::verify_gate`, the
+  manager's one gate call, off the async runtime.
+- **finish.** Every task verified or dropped, the model's `DONE`, a tripped budget or
+  `/manager stop` ends the run. What is still out comes off the board, and the report is
+  counted from the run — `finished: 3 verified, 1 unverified, 1 dropped; 12 model calls;
+  14m05s elapsed; stopped by: completed` — then printed and posted to the board as `manager`.
+
+After the plan, a model reply is read only for the verbs `ASSIGN <task> <agent>`,
+`DROP <task>`, `NOTE <task> <text>`, `REPLAN`, `DONE` and `WAIT` (`parse_verbs`); there is no
+verb that runs a command or adds a task, and other lines are ignored. What the model reads of
+the board is `render_board`: this run's tasks and the messages since it began, each field
+capped, 6000 bytes in all, fenced as DATA. A prompt identical to the last is not sent, and a
+reply identical to the last is a `WAIT`.
+
+**The check is held as agent `verify`.** `verify_gate` builds a `Caller { name: "verify",
+scopes: [propose] }` in Rust — the name is reserved by `parse_agent_name`, so no token buys
+it — with the assignee's worktree, and goes through `call_tool`: the same scope check,
+`wrap_for_worktree`, `parse_run_args`, SEC-7 budget, `take_turn` and `open_gate` as any
+client's `run_command`. So while a check waits or runs, the turn's holder is `verify` and it
+moves through the holder states above like any agent: `awaiting_human` on the bar
+(`verify · run? ⌘⏎ approve · esc deny`), `running`, then its Block. The line is `checked`:
+the check in its own subshell, then an echo of its exit code after a mark with a fresh nonce,
+and that echo — last in the output — is the exit code, never the Block's, which code under
+test can forge with an `OSC 133;D`. Exit 0 is `Verified`; another exit code, a denial or no
+mark at all is `FailedVerify`. `read_journal` never shows a worker a check's Block, and a
+check still queued or on the bar gives up at `/manager stop` or the run's wall clock.
+
+**Budgets** are read once per run from `manager.json` (see Config files); a file that does
+not parse refuses the run, and no budget is reset mid-run. Each trips with a reason naming
+its key.
+
+| Budget | Default | When it trips |
+|---|---|---|
+| `max_tasks` | 8 | a plan holds more tasks (refused, one retry), or a REPLAN has no room left: the run stops |
+| `max_model_calls` | 40 | the calls made, the plan's included, reach it: the run stops |
+| `max_reassignments` | 2 | a task times out, is reported failed or fails its check with none left: that task is dropped (and `ASSIGN` is refused) |
+| `wall_clock_secs` | 1800 | the run is that old at its next pass: the run stops |
+| `max_plans` | 3 | a REPLAN past it, rejected plans included: the run stops |
+| `claim_timeout_secs` | 300 | a task is not claimed in time: it is assigned again, or dropped |
+
+The run is `ManagerState.running`, claimed with one `swap` (a second `/manager <goal>` fails
+fast) and cleared by `ManagerRunGuard` on every exit, panic included. It is separate from
+`AgentState.running`: the manager never holds the shell.
+
 ## Self-update (`update.rs`)
 
 `tauri-plugin-updater` with the endpoint and minisign pubkey compiled in from `tauri.conf.json`.
@@ -362,6 +443,7 @@ and only when the signing secrets are set. Threat model: [danger-gate.md](danger
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
 | `mcp-server.json` | MCP server mode: enabled, port, `agents` — per-agent name, scopes, worktree and **plaintext bearer token** | `/mcp serve on`, `/mcp serve off`, `/mcp agent add`, `/mcp agent revoke` |
 | `tasks.json` | the task board: `{version: 1, tasks: [{id, title, detail, creator, assignee, state, holder, claims, note, proposals}]}` — no secrets, and messages are never written here | the board tools (`create_task`, `claim_task`, `update_task`), before each ack |
+| `manager.json` | the manager's budgets (`max_tasks`, `max_model_calls`, …); a key left out keeps its default, and a misspelt one makes the file unreadable | nothing — hand-edited |
 | `settings.json` | `{theme, opacity}` — read only by `run()`, to colour the window before the webview boots | `term_set_theme`, on every settings change |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
@@ -400,6 +482,7 @@ status bar · `settings.rs`, `theme.rs` appearance · `bridge.rs` IPC.
 | `src-tauri/src/local_models.rs` `mod tests` | discovery and model listing against an in-test `TcpListener` stub, env-key precedence, error hints, key never in an error | same |
 | `src-tauri/src/update.rs` `mod tests` | `install_target` over macOS / AppImage / `.deb` / other, the notice wording, `/update` parsing; static tests in `lib.rs` pin the https endpoints, the capability file, and that no install command is registered. `run_install` needs a real update and is not covered | same |
 | `src-tauri/src/mcp_server.rs` `mod tests` | admission (Host, Origin, bearer, constant-time compare), JSON-RPC dispatch, tool input validation, token/config round-trip, `wait_block`, `agent_claim`, and the real HTTP server on an ephemeral port with a stub `Backend` (401, 403, initialize → tools/list → tools/call). `run_gated` itself needs an `AppHandle` and is not covered | same |
+| `src-tauri/src/manager.rs` `mod tests` | the plan grammar and its refusals, the plan gate's fail-closed cases, the verb table, `render_board`'s bounds, the supervise state machine over a stub board and a counting model, each budget, and the scripted runs in `evals/manager-runs.json`; grep tests that it cannot execute | same |
 | `ui/src/*.rs` | key encoding, selection, vim motions, keymap parsing/matching — pure logic, runs on the host | `cd ui && cargo test` |
 | `evals/` | model-facing behaviour; the keyless checks run in CI | see README → Evaluation |
 

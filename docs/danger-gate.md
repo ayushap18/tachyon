@@ -35,7 +35,8 @@ lexically inside the `AgentAction::Run` arm, after `if !approved { …; continue
 `if !approved || aborted() { return Err(…) }`, and `approved` comes from the same
 `agent_propose`. It was two callers until server mode existed; the third is a second
 *proposer* behind the same gate, not a second route around it. One grep still confirms there
-is no other route from a model reply, or an HTTP request, to the PTY. (`pty_spawn` also writes
+is no other route from a model reply, or an HTTP request, to the PTY; `manager.rs` is in that
+grep with none ([the main agent](#the-main-agent)). (`pty_spawn` also writes
 the static shell-integration script straight to the writer at startup; it contains no model-
 or user-controlled data.)
 
@@ -49,6 +50,16 @@ Every way of not answering is a denial:
   flag between the await and the write.
 - `agent_start` drops any stale sender; `AgentRunGuard` drops it on return or panic.
 - There is no approval timeout. Auto-approve is unsafe; auto-deny races the person reading.
+
+**The manager's plan is a second instance of the same oneshot**, not a second pattern.
+`manager.rs` parks its own sender in `ManagerState.decision`, prints the plan — every verify
+command in full — through `term_write`, emits `manager-plan` (agents and titles, never a
+verify command) and awaits `rx.await.unwrap_or(false)`. `manager_decide`, behind
+`/manager approve|reject`, is the only writer and `take()`s the sender, so a double decide is
+refused; `manager_stop`, `ManagerRunGuard` and a new `/manager` drop it; `decision_stands`
+applies the same `MIN_REVIEW`. A rejected plan puts nothing on the board. An approved one
+puts tasks on it and runs nothing: the verify commands stay in the manager's memory, off the
+board, and every command a task leads to still needs its own approval at the bar.
 
 **The UI resolves a proposal from one place.** In `ui/src/ai_bar.rs`, `agent_decide` is
 invoked only from the `#ai-input` key handler while `pending_gate` is set: Enter approves,
@@ -158,6 +169,10 @@ The evals extract `DANGER_PATTERNS` from `lib.rs` at run time, so they measure t
   the active provider — `run_slash` is ungated IPC like `pty_write`. Not a regression, and not
   claimed away. What routing never does is fall back: a missing or dangling route resolves to
   the active provider, never to a second one the user did not name.
+- **`/manager approve` is webview-reachable.** `run_slash("/manager approve")` approves a
+  pending plan with no keypress, exactly as `agent_decide` can be invoked from webview script
+  — `run_slash` is ungated IPC like `pty_write`. What it buys is tasks on the board, not a
+  command: each shell write still waits at the bar.
 - **A compromised CI can sign an update every installed Tachyon will accept.** The minisign key
   lives in GitHub Actions secrets; signature checking proves that key signed the build and
   nothing more. Holding the key behind a reviewed GitHub Environment, or signing offline, is
@@ -348,6 +363,58 @@ answers it as they would any other.
   against a stub); that the PTY write still sits after the `!approved` return, and that
   `agent_propose`, `MIN_REVIEW`, `decision_stands` and `agent_decide(bool)` are unchanged, is
   asserted by grep in `the_approval_gate_is_unchanged`.
+
+## The main agent
+
+`/manager <goal>` (`src-tauri/src/manager.rs`, map in
+[architecture.md](architecture.md#main-agent-managerrs)) lets a model plan work for the
+registered agents and supervise it. It adds no route to the shell:
+
+- *It cannot execute.* `manager.rs` contains no `pty_write_internal`, `agent_claim`,
+  `run_command` or `McpPool::call`, and sits in the PTY-write grep with none;
+  `the_manager_cannot_execute` holds that, and that it calls exactly one gate. After the plan,
+  the model's reply is read only for `ASSIGN`, `DROP`, `NOTE`, `REPLAN`, `DONE` and `WAIT`:
+  there is no verb that runs a command, and none that adds a task — `REPLAN` is a new plan
+  that needs a new approval.
+- *The plan's approval is the fail-closed oneshot again*, as [above](#what-is-enforced-and-where):
+  `rx.await.unwrap_or(false)`, `manager_decide` the only writer, `decision_stands` and
+  `MIN_REVIEW` reused from the agent, and a stop, a dropped sender or a second decide a deny.
+  `/manager approve` is webview-reachable exactly as `agent_decide` is
+  ([Limitations](#limitations)).
+- *Verification goes through the gate, as `verify`.* The verify commands the human read in the
+  plan are frozen there (a `Verify` built only by `parse_plan`, with no mutator) and kept in
+  the manager's memory, never on the board. A worker's `done` is only a report. Its check is
+  proposed by `verify_gate` under the reserved name `verify` — no token can buy it — through
+  `call_tool`, `wrap_for_worktree` (the assignee's worktree) and `open_gate`, so the bar reads
+  `verify · run? ⌘⏎ approve · esc deny` and it is written to the PTY by `run_gated` like any
+  agent's command, or not at all. Only its exit 0 makes a task verified — the code its own
+  shell echoes after a mark with a fresh nonce (`checked`), last in the output, not the
+  Block's: a Block ends on any `OSC 133;D`, and the code under test can print one and then
+  exit 1. No mark, no verdict: the check fails. There is no other way a check runs, and its
+  line never reaches a worker: not on the board, not in `list_tasks`, and not in
+  `read_journal`, which skips it. A check waiting on a turn or on the bar gives up at
+  `/manager stop` or the run's `wall_clock_secs`.
+- *A worker cannot steer the run from the board.* Only a task's assignee can claim a task the
+  manager placed, so no other agent can fail it out of the plan or spend its reassignments.
+  Messages alone buy the manager's model one call per `CHATTER_GAP` (120 s); held-back
+  messages ride with the next call. Board chatter still spends `max_model_calls` at that rate.
+- *What the shared shell still gives away.* A check is typed into the same interactive shell
+  the workers' commands run in. Its line lands in the shell's history, so a worker's approved
+  `history` or `fc -l` shows it, and a shell that appends history as it goes (zsh
+  `INC_APPEND_HISTORY`/`SHARE_HISTORY`) lets code under test read the nonce mid-run and print
+  the mark itself. Its `( … )` subshell also inherits every alias and function an earlier
+  approved command defined, so a `cargo(){ return 0; }` makes a check pass. Accepted: each
+  needs a command the human approved, and the fix — a nonce on the precmd's own D, and
+  checks in a fresh shell — is future work.
+- *Worker text in the prompt is an injection surface; the keypress is what holds.* Task
+  titles, notes and messages are written by agents, and `render_board` puts them in front of
+  the manager's model. It caps each field (a title at 200 characters; a detail, a note or a message at 400) and
+  the whole at 6000 bytes, fences it as DATA and keeps every agent-written field on a
+  labelled line of its own, so a forged `ASSIGN` in a note is data, not a verb. That limits
+  flooding and forged lines; it does not stop the text from persuading the model. What holds
+  is that the most a persuaded manager can do is move, drop or annotate tasks, ask for a new
+  plan the human approves, or end its run — and that every command still waits for a human
+  keypress at the bar.
 
 ## What would make it stronger
 

@@ -12,7 +12,7 @@
 
 /// The form column must match SLASH_HELP in src-tauri/src/lib.rs; the test
 /// `surfaces_agree_with_the_backend` parses that file and fails if they drift.
-pub const SLASH_ROWS: [(&str, &str); 28] = [
+pub const SLASH_ROWS: [(&str, &str); 32] = [
     ("/keys", "list providers, active, key source"),
     ("/providers", "same table as /keys"),
     ("/key <id> <apikey>", "set a provider's API key"),
@@ -25,7 +25,7 @@ pub const SLASH_ROWS: [(&str, &str); 28] = [
     ("/url <id> <base_url>", "point a provider at a proxy/gateway"),
     ("/remove <id>", "remove a provider"),
     ("/route", "which provider+model each task uses"),
-    ("/route <task> <id> [model]", "route a task: command explain agent (off resets)"),
+    ("/route <task> <id> [model]", "route a task: command explain agent manager (off resets)"),
     ("/mcp add <name> <url>", "add a remote MCP server"),
     ("/mcp add <name> -- <cmd> [args]", "add a local MCP server (Tachyon will run <cmd>)"),
     ("/mcp remove <name>", "remove an MCP server"),
@@ -38,6 +38,10 @@ pub const SLASH_ROWS: [(&str, &str); 28] = [
     ("/mcp agent worktree <name> <path|off>", "run that agent's commands inside <path>, shown in full; off stops"),
     ("/mcp turn", "which agent holds the shell: its state, since when, who waits"),
     ("/mcp turn release", "end that agent's turn (refused while its command runs)"),
+    ("/manager <goal>", "plan <goal> into board tasks for the registered agents; runs nothing itself"),
+    ("/manager approve", "put the plan on the board; every command still waits for ⌘⏎"),
+    ("/manager reject", "drop the plan; nothing goes on the board"),
+    ("/manager stop", "end the run: a waiting plan is denied, unfinished tasks come off the board"),
     ("/update", "check for a newer Tachyon"),
     ("/crash", "last panics, from the local crash.log"),
     ("/help", "this list"),
@@ -146,7 +150,7 @@ pub fn list_key(key: &str, sel: Option<usize>, n: usize) -> ListOp {
 pub const LOCAL_IDS: [&str; 5] = ["ollama", "lmstudio", "llamacpp", "vllm", "jan"];
 
 /// Mirrors Task::name in src-tauri/src/lib.rs — `surfaces_agree_with_the_backend`.
-pub const TASK_IDS: [&str; 3] = ["command", "explain", "agent"];
+pub const TASK_IDS: [&str; 4] = ["command", "explain", "agent", "manager"];
 
 /// SLASH_ROWS advertises on|off|status; parse_serve also takes `on <port>`, and a port is
 /// never suggestible (`parse_serve` in mcp_server.rs).
@@ -155,6 +159,10 @@ const SERVE_WORDS: [&str; 3] = ["on", "off", "status"];
 /// The verbs `parse_agent` (mcp_server.rs) accepts, in the order SLASH_ROWS lists them.
 const AGENT_WORDS: [&str; 5] = ["add", "list", "show", "revoke", "worktree"];
 
+/// The words `parse_manager` (manager.rs) reads as commands rather than a goal —
+/// `surfaces_agree_with_the_backend`.
+pub const MANAGER_WORDS: [&str; 3] = ["approve", "reject", "stop"];
+
 /// What may be suggested for the token under the cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Slot {
@@ -162,10 +170,11 @@ pub enum Slot {
     Provider { revivable: bool },
     Model(Option<String>), // None = the active provider (/model)
     Runtime,
-    Task, // command | explain | agent
+    Task, // command | explain | agent | manager
     McpName,
     Serve,
     AgentVerb,
+    ManagerWord, // approve | reject | stop; anything else there is a goal, never suggested
     AgentName, // an agent already in the registry: show | revoke
     Nothing,   // API key, base_url, port, a NEW mcp/agent name, scopes, free text
 }
@@ -231,6 +240,7 @@ pub fn spot(input: &str) -> Spot {
         // (resolve_runtime picks the first model when it is None), so this costs nothing.
         ("local", 1) => nothing,
         ("route", 0) => at(Slot::Task, " <id>"),
+        ("manager", 0) => at(Slot::ManagerWord, ""),
         ("route", 1) => at(Slot::Provider { revivable: false }, " [model]"),
         // `/route <task> off` takes no third argument — do not fire the provider_models
         // round trip (wants_models, below) on a word that is not a provider id.
@@ -321,6 +331,7 @@ pub fn arg_rows(input: &str, cx: &Ctx) -> Vec<(String, &'static str)> {
         Slot::McpName => (cx.mcp.clone(), "mcp"),
         Slot::Serve => (SERVE_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
         Slot::AgentVerb => (AGENT_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
+        Slot::ManagerWord => (MANAGER_WORDS.iter().map(|s| (*s).to_string()).collect(), ""),
         Slot::AgentName => (cx.agents.clone(), "agent"),
     };
     let lower = typing.to_lowercase();
@@ -423,14 +434,14 @@ mod tests {
             SLASH_ROWS.iter().map(|(f, _)| f.split(' ').next().unwrap()).collect();
         verbs.sort_unstable();
         verbs.dedup();
-        // the arms of run_slash_inner in lib.rs, plus `/update` which run_slash peels off
-        // first. `/providers` is an alias the parser accepts, so it is listed like any other
+        // the arms of run_slash_inner in lib.rs, plus `/update` and `/manager` which run_slash
+        // peels off first. `/providers` is an alias the parser accepts, so it is listed like any other
         // verb — an accepted command the completer denies is worse than a duplicate row.
         assert_eq!(
             verbs,
             [
-                "/crash", "/help", "/key", "/keys", "/local", "/mcp", "/model", "/models",
-                "/providers", "/remove", "/route", "/update", "/url", "/use"
+                "/crash", "/help", "/key", "/keys", "/local", "/manager", "/mcp", "/model",
+                "/models", "/providers", "/remove", "/route", "/update", "/url", "/use"
             ]
         );
     }
@@ -583,6 +594,10 @@ mod tests {
             // a path is typed, never suggested
             ("/mcp agent worktree codex ", Slot::Nothing, ""),
             ("/mcp agent list ", Slot::Nothing, ""),
+            ("/manager ", Slot::ManagerWord, ""),
+            // a goal's words are the user's, never suggested
+            ("/manager add ", Slot::Nothing, ""),
+            ("/manager approve ", Slot::Nothing, ""),
             // a NEW name, and then its scopes: neither is ever suggested
             ("/mcp agent add ", Slot::Nothing, ""),
             ("/mcp agent add codex ", Slot::Nothing, ""),
@@ -840,6 +855,16 @@ mod tests {
         let names: Vec<&str> =
             arms.split("=> \"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
         assert_eq!(names, TASK_IDS, "Task::name and TASK_IDS have drifted");
+
+        const MANAGER: &str = include_str!("../../src-tauri/src/manager.rs");
+        let arms = between(MANAGER, "fn parse_manager(", "\n}\n");
+        let words: Vec<&str> = arms
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .map(|l| l.split('"').next().unwrap())
+            .filter(|w| !w.is_empty())
+            .collect();
+        assert_eq!(words, MANAGER_WORDS, "parse_manager and MANAGER_WORDS have drifted");
     }
 
     /// The port lives in the description column. In the form column `on [port]` would move
@@ -878,6 +903,9 @@ mod tests {
         assert_eq!(spot("/route command ").slot, Slot::Provider { revivable: false });
         assert_eq!(spot("/route command groq ").slot, Slot::Model(Some("groq".into())));
         assert_eq!(spot("/route command off ").slot, Slot::Nothing);
+        let rows: Vec<String> = arg_rows("/route m", &cx()).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(rows, ["/route manager <id>"]);
+        assert_eq!(spot("/route manager ").slot, Slot::Provider { revivable: false });
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod agent;
 mod coord;
 mod engine;
 mod local_models;
+mod manager;
 mod mcp_server;
 mod mcp_stdio;
 mod update;
@@ -903,16 +904,21 @@ struct Route {
 }
 
 /// What an ai_call is FOR. Chosen in Rust at each call site; never an IPC argument.
-// ponytail: three variants. ⌘B summarize is the same shape of work as ⌘E and is
+// ponytail: four variants. ⌘B summarize is the same shape of work as ⌘E and is
 // unmeasured — add a variant when a keyed eval shows it wants its own model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Task { Command, Explain, Agent }
+enum Task { Command, Explain, Agent, Manager }
 
 impl Task {
-    const ALL: [Task; 3] = [Task::Command, Task::Explain, Task::Agent];
+    const ALL: [Task; 4] = [Task::Command, Task::Explain, Task::Agent, Task::Manager];
 
     fn name(self) -> &'static str {
-        match self { Task::Command => "command", Task::Explain => "explain", Task::Agent => "agent" }
+        match self {
+            Task::Command => "command",
+            Task::Explain => "explain",
+            Task::Agent => "agent",
+            Task::Manager => "manager",
+        }
     }
 
     // kept here so the type owns both directions of its own string form
@@ -930,7 +936,8 @@ impl Task {
         match self {
             Task::Command => std::time::Duration::from_secs(20),
             Task::Explain => std::time::Duration::from_secs(45),
-            Task::Agent => HTTP_REQUEST_TIMEOUT,
+            // a plan or a board review is agent-sized work, not a one-liner
+            Task::Agent | Task::Manager => HTTP_REQUEST_TIMEOUT,
         }
     }
 }
@@ -2305,7 +2312,7 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/local <id> <url> <model> [key]\x1b[0m  add any local/OpenAI-compatible endpoint\r\n",
     "\x1b[36m/url <id> <base_url>\x1b[0m        point a provider at a proxy/gateway\r\n",
     "\x1b[36m/remove <id>\x1b[0m                remove a provider (/use <id> restores a built-in)\r\n",
-    "\x1b[36m/route\x1b[0m                      which provider+model each task uses (command explain agent)\r\n",
+    "\x1b[36m/route\x1b[0m                      which provider+model each task uses (command explain agent manager)\r\n",
     "\x1b[36m/route <task> <id> [model]\x1b[0m  route one task; /route <task> off resets it\r\n",
     "\x1b[36m/mcp add <name> <url>\x1b[0m       add a remote MCP server (Streamable HTTP)\r\n",
     "\x1b[36m/mcp add <name> -- <cmd> [args]\x1b[0m  add a local MCP server (stdio) \x1b[31m— Tachyon will run <cmd>\x1b[0m\r\n",
@@ -2319,6 +2326,10 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/mcp agent worktree <name> <path|off>\x1b[0m  run that agent's commands inside <path>, shown in full; off stops\r\n",
     "\x1b[36m/mcp turn\x1b[0m                   which agent holds the shell: its state, since when, who waits\r\n",
     "\x1b[36m/mcp turn release\x1b[0m           end that agent's turn (refused while its command runs)\r\n",
+    "\x1b[36m/manager <goal>\x1b[0m             plan <goal> into board tasks for the registered agents; runs nothing itself\r\n",
+    "\x1b[36m/manager approve\x1b[0m            put the plan on the board; every command still waits for \u{2318}\u{23ce}\r\n",
+    "\x1b[36m/manager reject\x1b[0m             drop the plan; nothing goes on the board\r\n",
+    "\x1b[36m/manager stop\x1b[0m               end the run: a waiting plan is denied, unfinished tasks come off the board\r\n",
     "\x1b[36m/update\x1b[0m                     check for a newer Tachyon (install: \u{2318}U / Ctrl+U)\r\n",
     "\x1b[36m/crash\x1b[0m                      last panics, from the local crash.log\r\n",
     "\x1b[36m/help\x1b[0m                       this list\r\n",
@@ -2401,8 +2412,10 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
         "route" => match rest.as_slice() {
             [] => Ok(render_routes(&load_state()?)),
             [task, spec, model @ ..] => {
-                let t = Task::parse(task)
-                    .ok_or_else(|| format!("unknown task: {task} \u{2014} command explain agent"))?;
+                // listed from Task::ALL so a new task cannot be missing from its own error
+                let t = Task::parse(task).ok_or_else(|| {
+                    format!("unknown task: {task} \u{2014} {}", Task::ALL.map(Task::name).join(" "))
+                })?;
                 if spec.eq_ignore_ascii_case("off") {
                     mutate(|s| {
                         s.clear_route(t);
@@ -2516,13 +2529,15 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
 // Never rejects: errors come back as printable red ANSI text.
 #[tauri::command(async)]
 async fn run_slash(app: AppHandle, input: String) -> String {
-    // `/update` and `/mcp serve …` need the AppHandle, which run_slash_inner (pure,
+    // `/update`, `/mcp serve …` and `/manager` need the AppHandle, which run_slash_inner (pure,
     // unit-tested) deliberately does not take — so they are peeled off here. (async fn
     // rather than the sync one this used to be: `/update` awaits an https GET, and tauri
     // spawns both shapes onto the same runtime, so /mcp list's blocking is unchanged.)
     match update::slash(&app, &input).await {
         Some(r) => r,
-        None => mcp_server::slash(&app, &input).unwrap_or_else(|| run_slash_inner(&input)),
+        None => mcp_server::slash(&app, &input)
+            .or_else(|| manager::slash(&app, &input))
+            .unwrap_or_else(|| run_slash_inner(&input)),
     }
     .unwrap_or_else(|e| format!("\r\n\x1b[31m[tachyon] {e}\x1b[0m\r\n"))
 }
@@ -2556,6 +2571,7 @@ pub fn run() {
             app.manage(PtyState::default());
             app.manage(JournalState::default());
             app.manage(AgentState::default());
+            app.manage(manager::ManagerState::default());
             mcp_server::autostart(app.handle());
             // The ONLY trigger that can install an update. Adds no IPC handler.
             // Non-fatal like mcp_server::autostart above: a menu that would not build must
@@ -2628,6 +2644,7 @@ mod tests {
         ("agent.rs", include_str!("agent.rs")),
         ("mcp_server.rs", include_str!("mcp_server.rs")),
         ("coord.rs", include_str!("coord.rs")),
+        ("manager.rs", include_str!("manager.rs")),
     ];
 
     /// The production half of every grepped file, joined. The test module is in these same
@@ -3150,7 +3167,9 @@ mod tests {
             // are slice patterns this scan does not read. `/mcp agent …` and `/mcp turn …` are
             // matched by form: their last literal word collides with a
             // `/mcp` arm (`add`, `list`) or names none here (`turn`, `release`).
-            if ["update", "serve"].contains(&verb) || form.starts_with("/mcp agent") || form.starts_with("/mcp turn") {
+            // `/manager <goal>` is peeled off too (`manager::slash`), and a goal is no arm at all;
+            // its approve/reject/stop are `parse_manager`'s arms, which this scan does read.
+            if ["update", "serve", "manager"].contains(&verb) || form.starts_with("/mcp agent") || form.starts_with("/mcp turn") {
                 continue;
             }
             let arm = format!("\"{verb}\"");
@@ -3766,7 +3785,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         );
         assert_eq!(
             run_slash_inner("/route bogus groq").unwrap_err(),
-            "unknown task: bogus \u{2014} command explain agent"
+            "unknown task: bogus \u{2014} command explain agent manager"
         );
         for cmd in ["/models", "/local", "/remove", "/url", "/route", "/update"] {
             assert!(SLASH_HELP.contains(cmd), "{cmd} missing from /help");
@@ -4326,6 +4345,18 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(!json.contains("routes") && !json.contains("hidden"), "{json}");
     }
 
+    /// A 0.2.9 file routes only the tasks it knew: `manager` is absent from the map, and that
+    /// must load and resolve to the active provider rather than read as corrupt.
+    #[test]
+    fn a_0_2_9_routes_map_without_manager_still_loads() {
+        let old = r#"{"active":"groq","providers":[{"id":"groq","kind":"openai","base_url":"u","model":"m","key":"k"},
+            {"id":"openai","kind":"openai","base_url":"u2","model":"gpt","key":""}],
+            "routes":{"agent":{"provider":"openai"}}}"#;
+        let s: ProviderState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.provider_for(Task::Agent).id, "openai");
+        assert_eq!(s.provider_for(Task::Manager).id, "groq");
+    }
+
     /// XDG_CONFIG_HOME is process-global and cargo runs tests in parallel threads, so
     /// every test that drives the real config path (load_state/mutate/providers_path)
     /// holds this for as long as the variable is set.
@@ -4368,6 +4399,8 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         let listed = run_slash_inner("/route").unwrap();
         let off = run_slash_inner("/route command off").unwrap();
         let after = run_slash_inner("/route").unwrap();
+        // the manager is routed by the same arm, no special case
+        let mgr = run_slash_inner("/route manager groq qwen/qwen3-32b").unwrap();
 
         std::env::remove_var("XDG_CONFIG_HOME");
         std::fs::remove_dir_all(&dir).ok();
@@ -4381,6 +4414,8 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         }
         assert!(off.contains("command \u{2192} active provider"), "{off}");
         assert!(!after.contains("openai/gpt-oss-120b"), "{after}");
+        assert!(after.contains("  manager"), "{after}");
+        assert!(mgr.contains("manager \u{2192} groq \u{b7} qwen/qwen3-32b"), "{mgr}");
     }
 
     /// The dispatch arms for the most-used verbs had no test through the real parser: their
@@ -4463,6 +4498,7 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         assert!(Task::Explain.deadline() < Task::Agent.deadline());
         // the agent path is provably unchanged from 0.2.5: its ceiling IS the client timeout
         assert_eq!(Task::Agent.deadline(), HTTP_REQUEST_TIMEOUT);
+        assert_eq!(Task::Manager.deadline(), HTTP_REQUEST_TIMEOUT);
     }
 
     /// A provider that accepts the connection and then says nothing — a wedged local
