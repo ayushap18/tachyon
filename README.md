@@ -287,6 +287,10 @@ Open the AI bar (⌘K) and type a `/` command — no key needed to configure:
 /mcp remove <name>                 remove an MCP server
 /mcp list                          servers, transport, full command line, and their tools
 /mcp serve on|off|status           let external agents use this terminal (on <port> to pick one)
+/mcp agent add <name> [scopes]     register one agent: its own token and scopes
+/mcp agent list                    registered agents, their scopes and last seen — never a token
+/mcp agent show <name>             that agent's client config, with its token
+/mcp agent revoke <name>           revoke one agent, from its next request
 /update                            check for a newer Tachyon (install: ⌘U / Ctrl+U)
 /crash                             last panics, from the local crash.log (never uploaded)
 /help                              this list
@@ -355,14 +359,16 @@ command, and a call whose name or arguments look destructive is flagged like `rm
 **As a server** — let Claude Code or any other MCP client use this terminal:
 
 ```
-/mcp serve on        # binds 127.0.0.1 only, mints a bearer token (on <port> to choose)
-/mcp serve status    # prints the URL and a ready-to-paste client config
+/mcp serve on            # binds 127.0.0.1 only (on <port> to choose)
+/mcp agent add codex     # one agent, one token, its own scopes — prints its client config
+/mcp serve status        # the URL and who may connect; never a token
+/mcp agent revoke codex  # refused from its next request
 /mcp serve off
 ```
 
-Off by default. It exposes `run_command`, `read_journal` and `get_context`. **`run_command` never runs
-anything on its own:** the command appears in your approval bar marked `external agent ·` and waits for
-you. Because these proposals are unsolicited and steal focus, approving one takes a deliberate **⌘⏎**
+Off by default. It exposes `run_command`, `await_decision`, `read_journal` and `get_context`. **`run_command` never runs
+anything on its own:** the command appears in your approval bar named with the agent that asked for it
+— `codex · run? ⌘⏎ approve · esc deny` — and waits for you. Because these proposals are unsolicited and steal focus, approving one takes a deliberate **⌘⏎**
 (`Ctrl+⏎` on Linux) — a stray Enter meant for your own shell decides nothing. Requests need the bearer
 token (stored `0600`), must come from localhost, and are rejected if they carry a foreign `Origin`, so
 a web page in your browser cannot drive your terminal. A token holder can **propose**, never run.
