@@ -1047,8 +1047,11 @@ mod tests {
 
         let dir = temp_dir("stress");
         let path = dir.join("tasks.json");
+        // In memory while the threads run: a board that writes tasks.json on every change is
+        // paced by the disk, and CI's could not reach the ring's 500 in 5 s. The bounds are
+        // the board's, not the disk's; the file is written once, below, and reloaded.
         let shared = Arc::new(Mutex::new(Shared {
-            board: Board::open(path.clone()),
+            board: Board::default(),
             claimer: HashMap::new(),
             peak: (0, 0, 0),
         }));
@@ -1108,6 +1111,8 @@ mod tests {
         let mut s = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
         // Non-vacuous: the run reached every ceiling it claims to hold.
         assert_eq!(s.peak, (MESSAGE_RING, MAX_ACTIVE_TASKS, MAX_TASKS), "the run never reached the bounds");
+        s.board.path = Some(path.clone());
+        s.board.save_to(&path).unwrap();
         if !s.board.tasks.iter().any(|t| t.state == TaskState::Claimed) {
             let id = s.board.tasks.iter().find(|t| t.state == TaskState::Open).expect("no open task").id.clone();
             s.board.claim_task("a0", &id).unwrap();
