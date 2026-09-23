@@ -1,0 +1,116 @@
+{
+  "about": "Scripted manager runs: a board of tasks t_1..t_<tasks> assigned to claude, one planning call already made, then one supervise pass per script step at `at` seconds into the run. `set` moves tasks on the board ([task, state, holder]) before the pass, `reply` is the model's answer if the pass asks it, `check` is the exit code of every verify run the pass makes due. `log` is every line the run prints and `report` its last word. src-tauri/src/manager.rs's `the_scripted_runs` executes this file; `npm run eval:manager:selftest` checks it covers what it must and runs that test.",
+  "runs": [
+    {
+      "name": "a worker that reports done having run nothing ends unverified",
+      "covers": ["done-having-run-nothing"],
+      "tasks": 1,
+      "budgets": {},
+      "script": [
+        { "at": 10, "set": [["t_1", "done", "claude"]], "reply": "WAIT", "check": 1 },
+        { "at": 11, "reply": "DONE" }
+      ],
+      "log": [
+        "task t_1 claimed by claude",
+        "task t_1 reported done",
+        "task t_1 failed verification: verification exited 1",
+        "task t_1 put out again as t_2"
+      ],
+      "report": "finished: 0 verified, 1 unverified, 0 dropped; 3 model calls; 0m11s elapsed; stopped by: the model said DONE"
+    },
+    {
+      "name": "a worker that never claims is put out again max_reassignments times, then dropped",
+      "covers": ["never-claimed", "budget:claim_timeout_secs"],
+      "tasks": 1,
+      "budgets": { "max_reassignments": 2, "claim_timeout_secs": 300 },
+      "script": [
+        { "at": 299 },
+        { "at": 300, "reply": "WAIT" },
+        { "at": 600, "reply": "WAIT" },
+        { "at": 900, "reply": "WAIT" },
+        { "at": 901 }
+      ],
+      "log": [
+        "task t_1 was not claimed within the claim_timeout_secs budget",
+        "task t_1 put out again as t_2",
+        "task t_2 was not claimed within the claim_timeout_secs budget",
+        "task t_2 put out again as t_3",
+        "task t_3 was not claimed within the claim_timeout_secs budget",
+        "task t_3 dropped: the max_reassignments budget (2) is spent"
+      ],
+      "report": "finished: 0 verified, 0 unverified, 1 dropped; 4 model calls; 15m01s elapsed; stopped by: completed"
+    },
+    {
+      "name": "a check that passes verifies the task and the run completes",
+      "covers": ["verified"],
+      "tasks": 1,
+      "budgets": {},
+      "script": [
+        { "at": 10, "set": [["t_1", "done", "claude"]], "reply": "WAIT", "check": 0 },
+        { "at": 11 }
+      ],
+      "log": ["task t_1 claimed by claude", "task t_1 reported done"],
+      "report": "finished: 1 verified, 0 unverified, 0 dropped; 2 model calls; 0m11s elapsed; stopped by: completed"
+    },
+    {
+      "name": "max_model_calls stops the run before the next change is read",
+      "covers": ["budget:max_model_calls"],
+      "tasks": 1,
+      "budgets": { "max_model_calls": 2 },
+      "script": [
+        { "at": 5, "set": [["t_1", "claimed", "claude"]], "reply": "WAIT" },
+        { "at": 6, "set": [["t_1", "done", "claude"]] }
+      ],
+      "log": ["task t_1 claimed by claude"],
+      "report": "finished: 0 verified, 1 unverified, 0 dropped; 2 model calls; 0m06s elapsed; stopped by: the max_model_calls budget (2) is spent"
+    },
+    {
+      "name": "wall_clock_secs stops the run",
+      "covers": ["budget:wall_clock_secs"],
+      "tasks": 1,
+      "budgets": { "wall_clock_secs": 60 },
+      "script": [
+        { "at": 30, "set": [["t_1", "claimed", "claude"]], "reply": "WAIT" },
+        { "at": 60 }
+      ],
+      "log": ["task t_1 claimed by claude"],
+      "report": "finished: 0 verified, 1 unverified, 0 dropped; 2 model calls; 1m00s elapsed; stopped by: the wall_clock_secs budget (60) is spent"
+    },
+    {
+      "name": "max_plans stops the run at a REPLAN past it",
+      "covers": ["budget:max_plans"],
+      "tasks": 1,
+      "budgets": { "max_plans": 1 },
+      "script": [{ "at": 5, "set": [["t_1", "claimed", "claude"]], "reply": "REPLAN" }],
+      "log": ["task t_1 claimed by claude"],
+      "report": "finished: 0 verified, 1 unverified, 0 dropped; 2 model calls; 0m05s elapsed; stopped by: the max_plans budget (1) is spent"
+    },
+    {
+      "name": "max_tasks stops the run at a REPLAN with no task left to plan",
+      "covers": ["budget:max_tasks"],
+      "tasks": 2,
+      "budgets": { "max_tasks": 2 },
+      "script": [{ "at": 5, "set": [["t_1", "claimed", "claude"]], "reply": "REPLAN" }],
+      "log": ["task t_1 claimed by claude"],
+      "report": "finished: 0 verified, 2 unverified, 0 dropped; 2 model calls; 0m05s elapsed; stopped by: the max_tasks budget (2) is spent"
+    },
+    {
+      "name": "max_reassignments drops a task whose check failed, and a run of dropped tasks ends",
+      "covers": ["budget:max_reassignments"],
+      "tasks": 1,
+      "budgets": { "max_reassignments": 0 },
+      "script": [
+        { "at": 5, "set": [["t_1", "done", "claude"]], "reply": "WAIT", "check": 1 },
+        { "at": 6, "reply": "WAIT" },
+        { "at": 7 }
+      ],
+      "log": [
+        "task t_1 claimed by claude",
+        "task t_1 reported done",
+        "task t_1 failed verification: verification exited 1",
+        "task t_1 dropped: the max_reassignments budget (0) is spent"
+      ],
+      "report": "finished: 0 verified, 0 unverified, 1 dropped; 3 model calls; 0m07s elapsed; stopped by: completed"
+    }
+  ]
+}

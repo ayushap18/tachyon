@@ -100,6 +100,32 @@ canvas#term {
   color: var(--err);
 }
 
+/* The pending proposal — grows upward out of #ai-bar, like #ai-list and for the same
+   reason (see below); the two are never shown together. `pre-wrap` keeps the command's
+   own spacing while wrapping it, and `anywhere` breaks a long unspaced argument (a path,
+   a base64 blob) rather than letting it scroll out of sight. */
+#ai-proposal {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  /* ponytail: 60vh fits a full 4096-character command wrapped at a normal window size, and
+     what does not fit scrolls under the wheel. Focus stays on #ai-input (it is the only
+     element that can deny), so the overflow has no keyboard scroll — if that ever matters,
+     page the block from the key handler rather than making it focusable. */
+  max-height: 60vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px 12px;
+  box-sizing: border-box;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  color: var(--fg);
+  font: 12px Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ⌘K suggestion list — grows upward out of #ai-bar. #ai-bar is position: fixed,
    so it is the containing block; bottom: 100% keeps the list strictly above the
    bar, so it can never cover the approval prompt or the readonly input. */

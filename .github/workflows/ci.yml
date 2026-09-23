@@ -13,6 +13,8 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # A hung test (a connection nobody answers) must fail the job, not sit on the 6 h default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +71,14 @@ jobs:
         run: npm run eval:selftest
       - name: Danger-gate corpus (recall / false-positive rate)
         run: npm run eval:gate
+      # The JS half of the redaction mirror: lib.rs's corpus test is the Rust half.
+      - name: Redaction corpus (JS mirror of redact)
+        run: npm run eval:redact
       - name: Agent-loop eval self-test (scripted mock model)
         run: npm run eval:agent:selftest
+      # Drives the manager's Supervisor through evals/manager-runs.json via its cargo test,
+      # so it needs the Rust toolchain above as well as node.
+      - name: Manager self-test (scripted board and model)
+        run: npm run eval:manager:selftest
       - name: Release artifact validation
         run: npm run test:release
