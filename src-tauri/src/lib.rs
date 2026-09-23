@@ -1,4 +1,5 @@
 mod agent;
+mod coord;
 mod engine;
 mod local_models;
 mod mcp_server;
@@ -1611,6 +1612,211 @@ fn scrub(msg: String, headers: &std::collections::BTreeMap<String, String>) -> S
     headers.values().filter(|v| !v.is_empty()).fold(msg, |m, v| m.replace(v.as_str(), "[redacted]"))
 }
 
+// ---- redaction on the agent-facing read path ----
+//
+// What an MCP agent reads back out of this terminal (`read_journal`, `get_context`, board
+// messages) passes through `redact`; what the human sees (term_write, the stored Block, ⌘B,
+// the approval bar) never does. The person keeps the real bytes, and the agent gets
+// `[redacted:<kind>]` wherever a known credential shape stood: a key echoed once, or pasted
+// by one agent to another, is otherwise handed to every token holder that reads it.
+// evals/redaction-corpus.json is the spec; this and evals/redact.mjs are both tested on it.
+//
+// ponytail: known shapes only, no entropy scan. A secret with no recognisable prefix and no
+// `name=` in front of it (a bare AWS secret key, a `password: x` YAML line) goes through, and
+// so does a key that has lost its prefix: folded across lines by `fold`/`base64 -w`, cut at
+// the front by Block's 8 KiB tail cap, or split by shell quoting in a command.
+// Upgrade path: an entropy pass over long [A-Za-z0-9+/=_-] runs, tuned so the corpus's
+// negatives (git SHAs, sha256sums, base64 blobs, UUIDs) still come back untouched.
+pub(crate) fn redact(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let (mut copied, mut i) = (0, 0);
+    // Byte-wise: every shape is ASCII, and `secret_at` only returns offsets next to an ASCII
+    // byte, so both slices below always land on a char boundary.
+    while i < s.len() {
+        match secret_at(s.as_bytes(), i, copied) {
+            // an empty match would not advance `i`
+            Some((start, end, kind)) if end > i => {
+                out.push_str(&s[copied..start]);
+                out.push_str(&format!("[redacted:{kind}]"));
+                (copied, i) = (end, end);
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Prefixed tokens, longest prefix first so `sk-ant-` is named before `sk-` claims it.
+const SECRET_PREFIXES: [(&str, &str); 14] = [
+    ("sk-ant-", "anthropic"),
+    ("sk-", "openai"),
+    ("gsk_", "groq"),
+    ("github_pat_", "github"),
+    ("ghp_", "github"),
+    ("gho_", "github"),
+    ("ghs_", "github"),
+    ("ghu_", "github"),
+    ("ghr_", "github"),
+    ("xoxb-", "slack"),
+    ("xoxp-", "slack"),
+    ("xoxa-", "slack"),
+    ("xapp-", "slack"),
+    ("AIza", "google"),
+];
+
+/// `name=value` where the value is the secret: the whole name, or its last `_`/`-` segments,
+/// so `GITHUB_TOKEN=` and `--api-key=` count while `max_tokens=` does not.
+const SECRET_NAMES: [(&str, &str); 8] = [
+    ("password", "password"),
+    ("passwd", "password"),
+    ("token", "token"),
+    ("secret", "secret"),
+    ("secret_key", "secret"),
+    ("secret_access_key", "secret"),
+    ("api_key", "api_key"),
+    ("apikey", "api_key"),
+];
+
+fn is_tok(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
+}
+
+/// End of the run of `ok` bytes starting at `i`.
+fn run_end(b: &[u8], i: usize, ok: impl Fn(u8) -> bool) -> usize {
+    i + b[i..].iter().take_while(|&&c| ok(c)).count()
+}
+
+fn ends_with_ci(b: &[u8], suffix: &str) -> bool {
+    b.len() >= suffix.len() && b[b.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+fn find_bytes(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    b[from..].windows(needle.len()).position(|w| w == needle).map(|p| from + p)
+}
+
+/// Whether a self-announcing shape may start at `i`: the start of a word, which is what keeps
+/// `disk-usage-2024-...` from reading as an `sk-` key. A letter in front still counts as a
+/// boundary when it is the tail of an escape, because that is how a key most often reaches a
+/// terminal glued to one: a `\n` escape in a JSON log line, `%3D` in a URL, and what
+/// strip_ansi leaves of `tput sgr0` (`ESC ( B`) and of a colon-form SGR (`ESC [38:5:1m`).
+fn word_start(b: &[u8], i: usize) -> bool {
+    match &b[..i] {
+        [] => true,
+        [.., c] if !c.is_ascii_alphanumeric() => true,
+        [.., b'\\', b'n' | b't' | b'r'] | [.., b'(', b'B'] => true,
+        [.., b'%', h, l] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => true,
+        [pre @ .., b'm'] => {
+            let params = pre.iter().rev().take_while(|c| c.is_ascii_digit() || b";:".contains(c)).count();
+            pre.len() > params && pre[pre.len() - params - 1] == b'['
+        }
+        _ => false,
+    }
+}
+
+/// The secret starting at byte `i` as `(start, end, kind)`, where `start` is `i` except for a
+/// key block whose BEGIN line is already gone (never below `floor`, the end of the last match).
+fn secret_at(b: &[u8], i: usize, floor: usize) -> Option<(usize, usize, &'static str)> {
+    let rest = &b[i..];
+    if rest[0].is_ascii_whitespace() {
+        return None;
+    }
+    // Shapes that announce themselves, and so are only looked for at the start of a word.
+    if word_start(b, i) {
+        for (prefix, kind) in SECRET_PREFIXES {
+            if rest.starts_with(prefix.as_bytes()) {
+                let end = run_end(b, i + prefix.len(), is_tok);
+                // a digit and some length: `sk-learn-and-pytorch-compatible` is prose
+                if end - i - prefix.len() >= 16 && b[i + prefix.len()..end].iter().any(u8::is_ascii_digit) {
+                    return Some((i, end, kind));
+                }
+            }
+        }
+        // AKIA is a long-lived access key id, ASIA a temporary (STS) one
+        if rest.starts_with(b"AKIA") || rest.starts_with(b"ASIA") {
+            let end = run_end(b, i + 4, |c| c.is_ascii_uppercase() || c.is_ascii_digit());
+            if end - i - 4 >= 16 {
+                return Some((i, end, "aws"));
+            }
+        }
+        if rest.starts_with(b"eyJ") {
+            let mut end = run_end(b, i, |c| is_tok(c) || c == b'.');
+            while b[end - 1] == b'.' {
+                end -= 1; // a sentence's full stop is not a fourth segment
+            }
+            let parts: Vec<&[u8]> = b[i..end].split(|&c| c == b'.').collect();
+            if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+                return Some((i, end, "jwt"));
+            }
+        }
+    }
+    // A PEM private key, BEGIN line through END line; all of the rest when the END was cut off.
+    let pem = |at: usize| {
+        let close = find_bytes(b, at, b"-----")?;
+        let header = &b[at..close];
+        (!header.contains(&b'\n') && header.windows(11).any(|w| w == b"PRIVATE KEY")).then_some(close + 5)
+    };
+    if rest.starts_with(b"-----BEGIN ") {
+        if let Some(header_end) = pem(i + 11) {
+            let end = find_bytes(b, header_end, b"-----END ").and_then(|e| pem(e + 9)).unwrap_or(b.len());
+            return Some((i, end, "private-key"));
+        }
+    }
+    // ...and an END whose BEGIN is gone: Block keeps only an output's last 8 KiB, so a key
+    // near the front of a long output survives as its base64 body alone. Take those lines too.
+    if rest.starts_with(b"-----END ") {
+        if let Some(end) = pem(i + 9) {
+            let mut start = i;
+            while start > floor && b[start - 1] == b'\n' {
+                let line_start = b[floor..start - 1].iter().rposition(|&c| c == b'\n').map_or(floor, |p| floor + p + 1);
+                let line = b[line_start..start - 1].strip_suffix(b"\r").unwrap_or(&b[line_start..start - 1]);
+                if line.is_empty() || !line.iter().all(|&c| c.is_ascii_alphanumeric() || b"+/=".contains(&c)) {
+                    break;
+                }
+                start = line_start;
+            }
+            return Some((start, end, "private-key"));
+        }
+    }
+    // The rest are a value after a name that says it is secret. The name stays; only the value
+    // goes, and `$TOKEN` / `$(cat f)` name where a secret is without being one.
+    if rest[0] == b'$' {
+        return None;
+    }
+    let pre = &b[..i];
+    let spaces = pre.iter().rev().take_while(|&&c| c == b' ').count();
+    let named = &pre[..i - spaces];
+    if ends_with_ci(named, "authorization:") {
+        return Some((i, run_end(b, i, |c| !b"\r\n\"'".contains(&c)), "authorization"));
+    }
+    if spaces > 0 && ends_with_ci(named, "bearer") && named.get(named.len().wrapping_sub(7)).map_or(true, |c| !c.is_ascii_alphanumeric()) {
+        let end = run_end(b, i, |c| is_tok(c) || b"._~+/=".contains(&c));
+        // "Bearer authentication" is prose; a token has a digit in it
+        if end - i >= 8 && b[i..end].iter().any(u8::is_ascii_digit) {
+            return Some((i, end, "bearer"));
+        }
+    }
+    let (quote, name_end) = match pre {
+        [.., b'=', q @ (b'"' | b'\'')] => (Some(*q), i - 2),
+        [.., b'='] => (None, i - 1),
+        // scheme://user:PASSWORD@host
+        [.., b':'] => {
+            let user_start = i - 1 - pre[..i - 1].iter().rev().take_while(|&&c| !b"/@: \t\r\n".contains(&c)).count();
+            let end = run_end(b, i, |c| !b"@/ \t\r\n".contains(&c));
+            return (pre[..user_start].ends_with(b"://") && b.get(end) == Some(&b'@')).then_some((i, end, "url-password"));
+        }
+        _ => return None,
+    };
+    let name_start = name_end - pre[..name_end].iter().rev().take_while(|&&c| is_tok(c)).count();
+    let name = String::from_utf8_lossy(&pre[name_start..name_end]).to_ascii_lowercase().replace('-', "_");
+    let (_, kind) = SECRET_NAMES.iter().find(|(n, _)| name == *n || name.ends_with(&format!("_{n}")))?;
+    let end = match quote {
+        Some(q) => run_end(b, i, |c| c != q && c != b'\n'),
+        None => run_end(b, i, |c| !c.is_ascii_whitespace() && !b"&;\"'`".contains(&c)),
+    };
+    Some((i, end, kind))
+}
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct McpConfig {
     servers: Vec<McpServer>,
@@ -2106,6 +2312,13 @@ const SLASH_HELP: &str = concat!(
     "\x1b[36m/mcp remove <name>\x1b[0m          remove an MCP server\r\n",
     "\x1b[36m/mcp list\x1b[0m                   list MCP servers (transport, full command line) and their tools\r\n",
     "\x1b[36m/mcp serve on|off|status\x1b[0m    let external agents use this terminal (on <port> to pick one)\r\n",
+    "\x1b[36m/mcp agent add <name> [--scopes a,b] [--worktree /abs/path]\x1b[0m  register one agent: its own token, scopes and worktree\r\n",
+    "\x1b[36m/mcp agent list\x1b[0m             registered agents, their scopes and last seen \u{2014} never a token\r\n",
+    "\x1b[36m/mcp agent show <name>\x1b[0m      that agent's client config, with its token\r\n",
+    "\x1b[36m/mcp agent revoke <name>\x1b[0m    revoke one agent, from its next request\r\n",
+    "\x1b[36m/mcp agent worktree <name> <path|off>\x1b[0m  run that agent's commands inside <path>, shown in full; off stops\r\n",
+    "\x1b[36m/mcp turn\x1b[0m                   which agent holds the shell: its state, since when, who waits\r\n",
+    "\x1b[36m/mcp turn release\x1b[0m           end that agent's turn (refused while its command runs)\r\n",
     "\x1b[36m/update\x1b[0m                     check for a newer Tachyon (install: \u{2318}U / Ctrl+U)\r\n",
     "\x1b[36m/crash\x1b[0m                      last panics, from the local crash.log\r\n",
     "\x1b[36m/help\x1b[0m                       this list\r\n",
@@ -2289,9 +2502,9 @@ fn run_slash_inner(input: &str) -> Result<String, String> {
                     }
                     Ok(out)
                 }
-                // `serve` belongs here even though run_slash peels it off: a bare /mcp and a
-                // typo like `/mcp serv` both land in this arm
-                _ => Err("usage: /mcp add|remove|list|serve".into()),
+                // `serve`, `agent` and `turn` belong here even though run_slash peels them off: a
+                // bare /mcp and a typo like `/mcp serv` both land in this arm
+                _ => Err("usage: /mcp add|remove|list|serve|agent|turn".into()),
             }
         }
         "crash" => render_crash(),
@@ -2394,6 +2607,7 @@ pub fn run() {
             mcp_names,
             mcp_list_tools,
             mcp_call,
+            mcp_server::hub_state,
             run_slash,
             keybindings
         ])
@@ -2413,6 +2627,7 @@ mod tests {
         ("lib.rs", include_str!("lib.rs")),
         ("agent.rs", include_str!("agent.rs")),
         ("mcp_server.rs", include_str!("mcp_server.rs")),
+        ("coord.rs", include_str!("coord.rs")),
     ];
 
     /// The production half of every grepped file, joined. The test module is in these same
@@ -2909,9 +3124,9 @@ mod tests {
     fn slash_usage_and_unknown_errors() {
         assert_eq!(run_slash_inner("/key groq").unwrap_err(), "usage: /key <id> <apikey>");
         assert_eq!(run_slash_inner("/foo").unwrap_err(), "unknown command: /foo — try /help");
-        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list|serve");
-        // a bare /mcp lands in the same arm, so it must name serve too
-        assert_eq!(run_slash_inner("/mcp").unwrap_err(), "usage: /mcp add|remove|list|serve");
+        assert_eq!(run_slash_inner("/mcp frobnicate").unwrap_err(), "usage: /mcp add|remove|list|serve|agent|turn");
+        // a bare /mcp lands in the same arm, so it must name the peeled-off verbs too
+        assert_eq!(run_slash_inner("/mcp").unwrap_err(), "usage: /mcp add|remove|list|serve|agent|turn");
         assert_eq!(run_slash_inner("/help").unwrap(), SLASH_HELP);
         assert_eq!(run_slash_inner("/").unwrap(), SLASH_HELP);
     }
@@ -2930,8 +3145,12 @@ mod tests {
                 .last()
                 .unwrap()
                 .trim_start_matches('/');
-            // run_slash peels these two off before run_slash_inner ever runs
-            if ["update", "serve"].contains(&verb) {
+            // run_slash peels these off before run_slash_inner ever runs; their arms are in
+            // update.rs and mcp_server.rs (`parse_serve`, `parse_agent`, `parse_turn`), which
+            // are slice patterns this scan does not read. `/mcp agent …` and `/mcp turn …` are
+            // matched by form: their last literal word collides with a
+            // `/mcp` arm (`add`, `list`) or names none here (`turn`, `release`).
+            if ["update", "serve"].contains(&verb) || form.starts_with("/mcp agent") || form.starts_with("/mcp turn") {
                 continue;
             }
             let arm = format!("\"{verb}\"");
@@ -4318,5 +4537,62 @@ mode?: \"dry-run\"|\"apply\", path: string, tags?: (string|number)[], whatever?:
         for b in [build_anthropic_body("m", "s", "u"), build_openai_body("m", "s", "u")] {
             assert_eq!(b["max_tokens"], AI_MAX_TOKENS);
         }
+    }
+
+    /// The corpus is the spec, exact to the byte, and evals/redact.mjs runs the same file: the
+    /// Rust and the JS cannot drift apart without one of the two going red.
+    #[test]
+    fn redact_meets_the_corpus() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!("../../evals/redaction-corpus.json")).unwrap();
+        let positive = corpus["positive"].as_array().unwrap();
+        let negative = corpus["negative"].as_array().unwrap();
+        assert!(positive.len() >= 20 && negative.len() >= 15, "the corpus has been gutted");
+        for case in positive {
+            let text = case["text"].as_str().unwrap();
+            assert_eq!(redact(text), case["expect"].as_str().unwrap(), "{text:?}");
+        }
+        for case in negative {
+            let text = case.as_str().unwrap();
+            assert_eq!(redact(text), text, "a negative was touched");
+        }
+    }
+
+    /// Redaction is for what an AGENT reads. Every `redact(` in the production source sits in
+    /// one of the agent read paths, so none can creep onto term_write, the stored Block, ⌘B
+    /// or the approval bar — where the human would stop seeing their own terminal's bytes —
+    /// and none of the agent paths can quietly lose it: the board's messages and tasks, a
+    /// command's result, the journal, the context, and the one agent-written string that
+    /// crosses IPC, a task title in `hub_state`. Every module, not `GREPPED`: a
+    /// new file is exactly where a stray call would land.
+    #[test]
+    fn redact_is_called_only_on_the_agent_read_paths() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        let needle = concat!("redact", "(");
+        let mut sites = Vec::new();
+        for path in files.iter().filter(|p| p.extension().is_some_and(|e| e == "rs")) {
+            let src = std::fs::read_to_string(path).unwrap();
+            let live = src.split("#[cfg(test)]").next().unwrap();
+            for (at, _) in live.match_indices(needle) {
+                // the function the call sits in: the nearest `fn ` above it
+                let decl = &live[live[..at].rfind("fn ").expect("a call outside any fn") + 3..];
+                let name = &decl[..decl.find(['(', '<']).unwrap()];
+                sites.push(format!("{}::{name}", path.file_name().unwrap().to_str().unwrap()));
+            }
+        }
+        assert_eq!(
+            sites,
+            [
+                "lib.rs::redact",
+                "mcp_server.rs::read_messages",
+                "mcp_server.rs::task_out",
+                "mcp_server.rs::run_gated",
+                "mcp_server.rs::journal_json",
+                "mcp_server.rs::journal_json",
+                "mcp_server.rs::get_context",
+                "mcp_server.rs::hub_json",
+            ]
+        );
     }
 }

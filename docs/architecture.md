@@ -197,37 +197,129 @@ returns tools plus per-server errors. `tool_result_text` turns an `isError` resu
 ## Tachyon as an MCP server
 
 `src-tauri/src/mcp_server.rs`. The reverse of the section above: external agents (Claude
-Code, any MCP client) use the live terminal, through the same approval gate as ⌘J. Off by
-default; `/mcp serve on [port] | off | status` is the only switch, and `run_slash` peels it
-off before `run_slash_inner` because starting a listener needs the `AppHandle`. If left on,
+Code, Codex, Cursor, any MCP client) use the live terminal, through the same approval gate as
+⌘J. Off by default; `/mcp serve on [port] | off | status` switches the listener and
+`/mcp agent add|list|show|revoke` owns the roster, and `run_slash` peels `/mcp serve` off
+before `run_slash_inner` because starting a listener needs the `AppHandle`. If left on,
 `autostart` brings it back at launch. Threat model: [danger-gate.md](danger-gate.md#threat-model-tachyon-as-an-mcp-server).
 
 ```
-client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ thread ─▶ handle_rpc ─▶ Backend
-                                              403 / 401, body never read                              │
-        run_command ─▶ parse_run_args ─▶ run_gated: agent_claim ─▶ agent_propose ─▶ ⏎ ─▶ pty_write_internal ─▶ wait_block
-        read_journal, get_context ─▶ read-only, no approval                       esc ─▶ isError "denied"
+client ─POST /mcp─▶ tiny_http (127.0.0.1) ─▶ admit: Host · Origin · bearer ─▶ Caller {name, scopes} ─▶ handle_rpc ─▶ Backend
+                                              403 / 401, body never read
+  run_command ─▶ parse_run_args ─▶ proposals::budget ─▶ open_gate: take_turn  ─▶ PROPOSALS record ─▶ "proposal_id p_7"
+                                                                                        │             within wait_ms ≤ 25 s
+  worker ◀──────────────────────────────────────────────────────────────────────────────┘
+     └─▶ agent_propose ─▶ ⌘⏎ ─▶ pty_write_internal ─▶ wait_block ─▶ settle(record) ─▶ the turn ends
+                          esc ─▶ settle(denied)
+  await_decision ─▶ the record: pending · the result · isError "denied"   (never the terminal)
+  read_journal (scope `journal`), get_context (scope `read`) ─▶ read-only, no approval ─▶ redact
+  post_message · read_messages · list_agents (scope `message`) ─▶ BOARD (memory only) · every success carries `unread`
+                     └─▶ redact (on the way out; the BOARD keeps what was posted)
+  create_task · claim_task · update_task · list_tasks (scope `message`) ─▶ tasks.json, written before the reply ─▶ a `system` line on the BOARD
 ```
 
+- **Identity is the bearer token, and nothing else.** Each registered agent has its own
+  64-hex token and its own scopes; `admit` folds over the whole roster and hands down a
+  `Caller {name, scopes}`. No tool takes a `from`/`as`/`agent_id` argument, so a client has
+  nowhere to assert an identity, and the name the token bought is what the approval bar shows.
+  `SCOPES` are `read | journal | propose | message`; a new agent gets `read, propose, message`,
+  so `read_journal` is off unless the user grants `journal`. `TOOL_SCOPES` is the one
+  authorization table, asked by `tools/list` and again by `tools/call` — an out-of-scope tool
+  is answered exactly like one that does not exist.
+- **Redaction is on the agent's side only.** `redact` (`lib.rs`) replaces known credential
+  shapes with `[redacted:<kind>]` in what `read_journal`, `get_context`, `run_command`'s
+  result, `read_messages` and the task tools return, and in the task titles `hub_state`
+  carries over IPC; task text may not hold a 64-hex run, a token's shape, at all. `term_write`, the stored `Block`, ⌘B and the approval bar never pass through it, so
+  the human sees their terminal's real bytes; `redact_is_called_only_on_the_agent_read_paths`
+  pins every call site. `evals/redaction-corpus.json` is the spec, run by both the Rust test
+  and `npm run eval:redact` (a JS port, also run in CI), so the two cannot drift.
 - **Transport.** Streamable HTTP with plain JSON responses, no SSE (`GET` is 405), no
   sessions. `tiny_http` — blocking and thread-based, so it needs no runtime and never touches
   the Tauri main thread or the PTY reader: one accept thread (`serve`), one short-lived
-  thread per admitted request, because a `run_command` blocks for as long as the human takes.
+  thread per admitted request, plus one worker per approved proposal, because the run outlives
+  the request that opened it. The crate is vendored at `src-tauri/vendor/tiny_http` for one
+  fix: upstream's connection pool queues a burst of new connections onto workers that are still
+  waking, and every connection past the first per worker sits unread until some unrelated
+  connection closes (17 opened at once on Linux left as few as 4 visible). Three clients
+  handshaking together is that burst. `a_burst_of_connections_all_reach_the_accept_loop` pins
+  the fix; everything else in the vendored copy is the crates.io release.
 - **`handle_rpc`** is pure: `initialize` (echoes a supported `protocolVersion`, else answers
-  with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, unknown
-  tool or bad arguments → `-32602`, a message without an `id` → `None`, which the HTTP layer
-  answers `202` with no body. The terminal sits behind the `Backend` trait — `Live(AppHandle)`
-  in the app, a stub in the tests — the module's one seam.
-- **`run_gated`** is the only road from a client to the PTY. It refuses if no shell is spawned,
-  takes the single approval slot with `agent_claim` (shared with `agent_start`; busy → fails
-  fast, never queues), holds an `AgentRunGuard`, proposes with `"external": true` (the bar
-  reads `external agent · run? …`), and re-shows any approval that arrives inside `MIN_REVIEW`.
-  After the write it waits in `wait_block` — `agent_loop`'s correlation (match on command
-  text, resync on `Lagged`, `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with
-  `agent-done` so the bar closes.
-- **Config** is `mcp-server.json`: `{enabled, port, token}`, default port 47600. The token is
-  32 bytes from `/dev/urandom`, minted on first enable and kept after that. To rotate it:
-  `/mcp serve off`, delete the file, `/mcp serve on`.
+  with the newest), `ping`, `tools/list`, `tools/call`; unknown method → `-32601`, a tool this
+  caller cannot name → `-32602`, a bad *argument* → an `isError` result the model can read and
+  correct, a message without an `id` → `None`, which the HTTP layer answers `202` with no body.
+  The terminal sits behind the `Backend` trait — `Live(AppHandle)` in the app, a stub in the
+  tests — the module's one seam.
+- **No client's HTTP call waits on a human.** `run_command` returns within its `wait_ms` with
+  either the finished result or `proposal_id p_…`, and `await_decision` polls that id: the
+  verdict lives in the record, so it is idempotent, collectable long after the call that asked
+  for it returned, and refused for any id that is not this caller's — an id belonging to
+  another agent answers exactly like one that never existed. `PROPOSALS` is a 64-record ring;
+  an evicted id is an unknown id.
+- **`open_gate` + `run_gated`** are the only road from a client to the PTY. `open_gate` runs on
+  the request's own thread — it refuses if no shell is spawned, takes the turn with
+  `take_turn` (queued for up to `wait_ms`; the grant claims the approval slot with
+  `agent_claim`, shared with `agent_start`), and records the proposal under that turn's ticket.
+  The record going terminal is what ends the turn.
+  `run_gated` then runs on the worker: it proposes with `"external": true` and the agent's
+  name (the bar reads `codex · run? ⌘⏎ approve · esc deny`), waits in `wait_block` after the
+  write — `agent_loop`'s correlation (match on command text, resync on `Lagged`,
+  `AGENT_STEP_TIMEOUT`) plus an abort check — and always ends with `agent-done` so the bar
+  closes, then settles the record, which is what releases the slot.
+- **The turn.** One agent holds the shell at a time. `coord::TurnLock` is a pure state
+  machine over an injected clock: it holds no guard, no handle and no mutex. Every operation
+  returns `Event`s, and `apply` in `mcp_server.rs` turns them into taking and dropping the
+  approval slot's guard in `TURN_GUARD`, so a holder exists exactly when `AgentState.running`
+  is claimed. Waiters queue first in, first out, 8 at most (`QUEUE_MAX`). A waiter that has not
+  asked again for 90 s (`WAITER_SILENCE`) loses its place. `request_turn` holds the turn across
+  commands until `release_turn`. `run_command` takes it for one command when the caller does
+  not already hold it. `/mcp turn` shows the holder, and `/mcp turn release` is the human's way
+  to end a turn. The holder moves through these states (the wire name is what `hub_state`,
+  `/mcp turn` and a busy payload's `holder_state` say):
+
+  | Holder state | Wire name | Entered when | Left when | Lease clock |
+  |---|---|---|---|---|
+  | `Idle` | `idle` | granted; or its command's Block arrived | a proposal goes up → `AwaitingHuman`; `release_turn`, `/mcp turn release`, ⌘J's `preempt_if_idle` or the lease → the turn ends and the next waiter is granted | runs: 60 s of silence (`LEASE_IDLE`) or 10 min of idle in total (`MAX_TURN`) ends the turn |
+  | `AwaitingHuman` | `awaiting_human` | `open_gate` shows a proposal on the bar | ⌘⏎ → `Running`; Esc or `/mcp turn release` → denied, and the turn ends | frozen: there is no approval timeout |
+  | `Running` | `running` | approved, just before the PTY write | its Block, with the shell back in the foreground (`wait_end`) → `Idle`, and a turn `run_command` took for itself ends; no Block inside `AGENT_STEP_TIMEOUT` → `Unknown` | frozen; every release is refused |
+  | `Unknown` | `command_still_running` | `wait_end` gave up before the exit marker, or the Block came while another process held the foreground | its Block and the foreground → `Idle`; `release_turn` or `/mcp turn release` → the turn ends while the command may still be running | frozen; the lock never grants it away |
+
+- **Budgets, before the bar (`proposals::budget`).** Checked in `call_tool`, above the
+  `Backend`, so a refusal never reaches a terminal and never emits `agent-propose`: 30 s of
+  quiet for everyone after any denial (with `retry_after_ms`, and the denied agent told not to
+  re-send), one live proposal per agent, four across the hub.
+- **Client timeouts.** `MAX_WAIT_MS` is **25 s**, clamped server-side — every tool call must
+  come back well inside the tightest client default below. Each of these is
+  **UNVERIFIED**: they come from vendor docs and community reports, not from a measurement
+  against Tachyon, and are replaced when a real client of each is measured.
+  `every_client_handshake_returns_inside_its_own_timeout` replays the handshakes.
+
+  | Client | Tool-call timeout | Where it is set |
+  |---|---|---|
+  | Claude Code | ~5 min idle (HTTP) — UNVERIFIED | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, per-server `timeout` in `.mcp.json` |
+  | Codex CLI | 60 s — UNVERIFIED | `tool_timeout_sec` in `~/.codex/config.toml` |
+  | Cursor | ~60 s, hardcoded — UNVERIFIED | not settable |
+  | Gemini CLI | 600 000 ms — UNVERIFIED | `timeout` in `~/.gemini/settings.json` |
+  | Cline | 60 s — UNVERIFIED | per-server `timeout` (seconds) in the MCP UI |
+
+- **Rate limits** (`rate_check`, memory only, per agent per class, token buckets):
+  `post_message` 60 at once refilled at 1/s (60/min); `create_task`/`claim_task`/`update_task`
+  30 refilled at 1 per 2 s (30/min); `read_messages`/`list_tasks`/`list_agents` share one
+  bucket of 4 refilled at 2/s (20 per 10 s). Checked in `call_tool` after scope, before the
+  arguments; a refusal is an `isError` result carrying `retry_after_ms`, never a protocol
+  error. `run_command` is paced by SEC-7 instead, and the M1 read tools are not metered.
+- **Handler threads.** At most `max(16, 4 × agents)` alive at once (`handler_cap`), and no one
+  agent past its share, `cap / agents`. Past either, the accept loop answers an admitted
+  request `503` without a handler, so a client that opens connections and never finishes a body
+  can pin neither threads without limit nor another agent's share. A refused request whose body
+  tiny_http would drain on drop (over 1024 bytes, or `Expect: 100-continue`) is dropped on a
+  thread of its own (`refuse`), so a half-sent body, even a stranger's, never stalls the loop.
+- **Config** is `mcp-server.json`: `{enabled, port, agents: [{name, token, scopes, worktree}]}`,
+  default port 47600. Each token is 32 bytes from `/dev/urandom`, minted by `/mcp agent add`
+  and kept after that; `/mcp agent show <name>` is the only thing that prints one, and only
+  while the listener is up. To rotate one: `/mcp agent revoke <name>`, then add it again. A
+  0.2.9 file's single `token` is migrated by `migrate` (pure, idempotent, on the read path
+  only) into an agent named `default` with every scope, byte-identical, so the client already
+  configured with it keeps working.
 
 ## Self-update (`update.rs`)
 
@@ -268,7 +360,8 @@ and only when the signing secrets are set. Threat model: [danger-gate.md](danger
 | `providers.json` | provider list, active id, hidden built-ins, per-task `routes`, **plaintext API keys** (env-var keys are never written) | `/key`, `/use`, `/model`, `/local`, `/url`, `/remove`, `/route` |
 | `mcp.json` | MCP servers: name + `url` (optional `headers`, **plaintext**) or `command` + `args` | `/mcp add`, `/mcp remove`; `headers` by hand |
 | `keybindings.json` | `{action id: chord}` overrides; hand-edited | nothing — read-only to the app |
-| `mcp-server.json` | MCP server mode: enabled, port, **plaintext bearer token** | `/mcp serve on`, `/mcp serve off` |
+| `mcp-server.json` | MCP server mode: enabled, port, `agents` — per-agent name, scopes, worktree and **plaintext bearer token** | `/mcp serve on`, `/mcp serve off`, `/mcp agent add`, `/mcp agent revoke` |
+| `tasks.json` | the task board: `{version: 1, tasks: [{id, title, detail, creator, assignee, state, holder, claims, note, proposals}]}` — no secrets, and messages are never written here | the board tools (`create_task`, `claim_task`, `update_task`), before each ack |
 | `settings.json` | `{theme, opacity}` — read only by `run()`, to colour the window before the webview boots | `term_set_theme`, on every settings change |
 
 All reads go through `read_config`: a missing file is `Ok(None)`; a file that does not parse
@@ -277,6 +370,12 @@ the next write. All writes go through `write_config`: temp file in the same dire
 `chmod 0600`, then `rename`, so a reader sees the old file or the new one. Appearance and
 font settings live in the webview's `localStorage`, which stays authoritative; only the
 `{theme, opacity}` mirror below is on disk.
+
+`tasks.json` is version 1 and frozen: an unknown `version` is an `Err` like any other
+unreadable config, and on load every `claimed` task is re-opened with its `claims` count
+untouched — the process that held it is gone, but a crash must not burn one of the three
+times a task is handed out. A file that will not load is never replaced: the task tools
+refuse with the reason until it is fixed, and the message board carries on.
 
 Keybindings: the backend's `keybindings` command is `read_config` on `keybindings.json` and
 returns the raw `{id: chord}` map — it validates nothing. `ui/src/keymap.rs` owns both
