@@ -4471,9 +4471,17 @@ mod tests {
         // holding the shell with no guard.
         // (R11 is about turns: ⌘J's claim is `running` with no holder, by design.)
         let busy: Value = serde_json::from_str(&take_turn("r11c", &claim, Duration::ZERO).unwrap_err()).unwrap();
-        assert_eq!((busy["holder"].clone(), busy["holder_state"].clone()), (Value::Null, json!("builtin_agent")));
-        assert!(turn().holder().is_none(), "⌘J holds the slot: a grant with no guard was left holding the shell");
-        assert!(TURN_GUARD.lock().unwrap().is_none());
+        // The payload is built inside the lock's critical section, so it is the one reading
+        // of "handed back" that no other thread can disturb: no holder, r11c at the head.
+        assert_eq!(
+            (busy["holder"].clone(), busy["holder_state"].clone(), busy["position"].clone()),
+            (Value::Null, json!("builtin_agent"), json!(1)),
+            "⌘J holds the slot: a grant with no guard was left holding the shell"
+        );
+        // Re-read outside it, the lock is process-global: a handler thread another test left
+        // behind may `touch` it and grant the queued r11c with ITS claim, which is legitimate.
+        // What must hold either way is R11 itself, and that ⌘J's claim was not touched.
+        assert_eq!(turn().holder().is_some(), TURN_GUARD.lock().unwrap().is_some(), "a holder without a guard, or a guard without a holder");
         assert!(slot.running.load(SeqCst), "the failed grant released ⌘J's claim");
         slot.running.store(false, SeqCst); // ⌘J's own guard, dropping
 
