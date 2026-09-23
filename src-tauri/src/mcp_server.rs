@@ -4080,32 +4080,42 @@ mod tests {
         let auth = format!("Bearer {TOKEN}");
         // Over 1024 bytes promised, because tiny_http reads a body that small itself before the
         // accept loop ever sees the request; a larger one is read by `handle`, where it parks.
-        let held: Vec<std::net::TcpStream> = (0..16)
-            .map(|_| {
-                let mut s = std::net::TcpStream::connect(addr).unwrap();
-                write!(s, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n").unwrap();
-                s
-            })
-            .collect();
+        let hold = || {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            write!(s, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n").unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+            s
+        };
+        let mut held: Vec<std::net::TcpStream> = (0..16).map(|_| hold()).collect();
         // The 16 reach the accept loop in their own time, so poll for the moment they have.
+        // And a poll in flight when one of them lands takes the last place for that instant,
+        // so the HELD request is the one refused: it hears a 503 on its socket (a parked one
+        // hears nothing), and a fresh hold takes its place until all 16 are the ones parked.
         let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
-        let until = |want: u16| {
+        let until = |want: u16, held: Option<&mut Vec<std::net::TcpStream>>| {
+            let mut held = held;
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while post(&url, Some(&auth), None, &ping).0 != want {
                 if std::time::Instant::now() > deadline {
                     return false;
                 }
+                for s in held.iter_mut().flat_map(|h| h.iter_mut()) {
+                    let parked = matches!(s.peek(&mut [0u8; 1]), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+                    if !parked {
+                        *s = hold();
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             true
         };
-        assert!(until(503), "16 connections held and the 17th was never refused");
+        assert!(until(503, Some(&mut held)), "16 connections held and the 17th was never refused");
         assert_eq!(post(&url, Some(&auth), None, &run_call(1)).0, 503);
         assert_eq!(stub.attempts.load(SeqCst), 0, "a refused connection reached the terminal");
         assert!(proposals::pending().is_none(), "a refused connection raised a proposal");
         // hanging up gives every place back
         drop(held);
-        assert!(until(200), "the closed connections never gave their threads back");
+        assert!(until(200, None), "the closed connections never gave their threads back");
         server.unblock();
     }
 
